@@ -3,7 +3,7 @@
 Code and notebooks for density matrix renormalization group (DMRG) and related tensor-network simulations. Scripts implement DMRG/cooling routines, circuit utilities, and experiment helpers; notebooks capture exploratory runs and diagnostics.
 
 ## Layout
-- `algo_dmrg.py`, `algo_boundary.py`, `algo_cooling.py`: core DMRG and boundary/cooling routines.
+- `dmrg_fit.py`, `boundary_sweeps.py`, `algo_cooling.py`: core DMRG and boundary/cooling routines.
 - `dmrg.py`, `svd.py`: runnable scripts for DMRG workflows and SVD-based variants.
 - `circuits.py`: circuit construction and Qiskit helpers.
 - `quf.py`, `register_.py`: utilities (partitioning, contractions, registration) used across scripts.
