@@ -1,173 +1,156 @@
-"""Boundary-based tensor-network norm evaluation.
-
-This module provides a class-based API to build ``norm = p.conj() | p`` and
-contract it using boundary-MPS sweeps.
-"""
+"""Boundary-based tensor-network norm evaluation."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
 from uuid import uuid4
 import warnings
 
-import numpy as np
-
-from boundary_states import BdyMPO, add_diagonalu_tags
+from boundary_states import add_diagonalu_tags
 from boundary_sweeps import CompBdy
-from dmrg_helpers import backend_numpy
 
 
 _TAG_X = re.compile(r"^X\d+$")
 _TAG_Y = re.compile(r"^Y\d+$")
 _TAG_DU = re.compile(r"^Du\d+$")
 
+__all__ = [
+    "prepare_boundary_inputs",
+    "ContractBoundary",
+]
 
-@dataclass
-class BoundaryNormRunner:  # pylint: disable=too-many-instance-attributes
-    """Compute tensor-network norm by boundary sweeps.
+
+def _validate_tensor_network_tags(p, add_diag_to_p):
+    """Validate lattice tags and update diagonal-tag behavior when needed."""
+    tags = set(getattr(p, "tags", ()))
+
+    if not any(_TAG_X.match(tag) for tag in tags) or not any(_TAG_Y.match(tag) for tag in tags):
+        raise ValueError("Input network must contain X* and Y* lattice tags.")
+
+    if not add_diag_to_p and not any(_TAG_DU.match(tag) for tag in tags):
+        warnings.warn(
+            "Input network has no Du* tags. Enabling diagonal tagging automatically.",
+            RuntimeWarning,
+        )
+        return True
+    return add_diag_to_p
+
+
+def _normalize_retag_for_direction(direction, re_tag):
+    """Normalize ``re_tag`` for direction-specific requirements."""
+    direction_key = direction.lower() if isinstance(direction, str) else ""
+    if direction_key.startswith("diag"):
+        if not re_tag:
+            warnings.warn(
+                "direction='diag*' requires re_tag=True. Overriding re_tag to True.",
+                RuntimeWarning,
+            )
+            re_tag = True
+
+    return re_tag
+
+
+def prepare_boundary_inputs(
+    ket=None,
+    *,
+    bra=None,
+    add_diag_to_p=True,
+):
+    """Prepare tagged ``ket``/``bra`` networks and build ``norm``.
 
     Parameters
     ----------
-    to_backend : callable | None
-        Array converter applied to ``norm`` tensors. If ``None``, defaults to
-        ``backend_numpy(np.complex128)``.
-    opt : str or optimizer
-        Contraction optimizer passed to boundary routines.
-    chi : int
-        Boundary MPS bond dimension.
-    seed : int
-        Random seed used by boundary-state initialization.
-    single_layer : bool
-        Forwarded to ``BdyMPO``.
-    flat : bool
-        Forwarded to ``BdyMPO`` / ``CompBdy``.
-    dmrg_run : str
-        Boundary fitting mode (e.g. ``"eff"``, ``"global"``).
-    n_iter : int
-        Number of fitting iterations.
-    re_tag : bool
-        Forwarded to ``CompBdy.run``.
-    pbar : bool
-        Show progress bars during boundary sweeps.
-    stop_grad_ : bool
-        Forwarded to ``CompBdy.run``.
-    fidel_ : bool
-        Forwarded to ``CompBdy.run``.
-    visual_ : bool
-        Forwarded to ``CompBdy.run``.
-    re_update : bool
-        Forwarded to ``CompBdy.run``.
-    max_seperation : int
-        Forwarded to ``CompBdy.run``.
-    direction : str
-        Sweep direction (e.g. ``"y"``, ``"x"``, ``"diag"`` variants).
-    eq_norms : bool | float
-        Forwarded to ``CompBdy`` and ``CompBdy.run``.
+    ket : qtn.TensorNetwork | None
+        Input ket network.
+    bra : qtn.TensorNetwork | None
+        Optional bra network. If ``None``, ``ket.copy().conj()`` is used.
     add_diag_to_p : bool
-        Add ``Du*``/``du*`` diagonal tags to input ``p`` before norm build.
+        Add diagonal ``Du*``/``du*`` tags to ``ket`` when constructing input.
+
+    Returns
+    -------
+    tuple[qtn.TensorNetwork, qtn.TensorNetwork]
+        ``(ket_tagged, norm_tagged)``
     """
+    if ket is None:
+        raise ValueError("Provide ket.")
 
-    to_backend: object = None
-    opt: object = "auto-hq"
-    chi: int = 20
-    seed: int = 1
-    single_layer: bool = False
-    flat: bool = False
-    dmrg_run: str = "eff"
-    n_iter: int = 2
-    re_tag: bool = False
-    pbar: bool = True
-    stop_grad_: bool = False
-    fidel_: bool = False
-    visual_: bool = False
-    re_update: bool = True
-    max_seperation: int = 0
-    direction: str = "y"
-    eq_norms: object = False
-    add_diag_to_p: bool = True
+    add_diag_to_p = _validate_tensor_network_tags(ket, add_diag_to_p)
 
-    def _validate_and_prepare_input(self, p):
-        tags = set(getattr(p, "tags", ()))
+    ket_tagged = ket.copy()
+    bra_tagged = ket.copy().conj() if bra is None else bra.copy().conj()
+    if add_diag_to_p:
+        ket_tagged = add_diagonalu_tags(ket_tagged)
+        bra_tagged = add_diagonalu_tags(bra_tagged)
 
-        if not any(_TAG_X.match(tag) for tag in tags) or not any(_TAG_Y.match(tag) for tag in tags):
-            raise ValueError("Input network must contain X* and Y* lattice tags.")
+    shared_inner = set(ket_tagged.inner_inds()) & set(bra_tagged.inner_inds())
+    bra_tagged.reindex_({idx: f"r{uuid4().hex}" for idx in shared_inner})
+    ket_tagged.add_tag("KET")
+    bra_tagged.add_tag("BRA")
+    norm_tagged = bra_tagged | ket_tagged
+    return ket_tagged, norm_tagged
 
-        if not self.add_diag_to_p and not any(_TAG_DU.match(tag) for tag in tags):
-            warnings.warn(
-                "Input network has no Du* tags. Enabling diagonal tagging automatically.",
-                RuntimeWarning,
-            )
-            self.add_diag_to_p = True
 
-    def run(self, p):
-        """Run boundary norm evaluation for input tensor network ``p``.
+def ContractBoundary(
+    *,
+    norm,
+    mps_boundaries,
+    opt="auto-hq",
+    flat=False,
+    dmrg_run="eff",
+    n_iter=2,
+    re_tag=False,
+    pbar=True,
+    fidel_=False,
+    visual_=False,
+    re_update=True,
+    max_separation=0,
+    max_seperation=0,
+    direction="y",
+    eq_norms=False,
+):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,invalid-name
+    """Compute tensor-network norm via boundary sweeps.
 
-        Parameters
-        ----------
-        p : qtn.TensorNetwork
-            Input PEPS-like tensor network.
+    This function expects a prebuilt double-layer ``norm`` network and a
+    boundary-state dictionary ``mps_boundaries``.
 
-        Returns
-        -------
-        tuple
-            ``(cost, norm, bdy_mpo, comp_bdy)``
-        """
-        self._validate_and_prepare_input(p)
+    Returns
+    -------
+    complex | float
+        Boundary contraction cost scalar.
+    """
+    if norm is None:
+        raise ValueError("norm must not be None.")
+    if not isinstance(mps_boundaries, dict):
+        raise TypeError("mps_boundaries must be a dictionary of boundary states.")
 
-        to_backend = self.to_backend
-        if to_backend is None:
-            warnings.warn(
-                "No backend caster provided. Using backend_numpy(np.complex128).",
-                RuntimeWarning,
-            )
-            to_backend = backend_numpy(dtype=np.complex128)
-
-        ket = p.copy()
-        bra = p.copy().conj()
-        if self.add_diag_to_p:
-            ket = add_diagonalu_tags(ket)
-            bra = add_diagonalu_tags(bra)
-
-        bra.reindex_({idx: f"r{uuid4().hex}" for idx in ket.inner_inds()})
-        ket.add_tag("KET")
-        bra.add_tag("BRA")
-
-        norm = bra | ket
-        norm.apply_to_arrays(to_backend)
-
-        bdy_mpo = BdyMPO(
-            tn_flat=ket,
-            tn_double=norm,
-            opt=self.opt,
-            chi=self.chi,
-            flat=self.flat,
-            to_backend=to_backend,
-            seed=self.seed,
-            single_layer=self.single_layer,
+    if max_seperation not in (0, max_separation):
+        warnings.warn(
+            "Both max_separation and max_seperation were set. Using max_seperation.",
+            RuntimeWarning,
         )
-        comp_bdy = CompBdy(
-            norm,
-            bdy_mpo.mps_b,
-            opt=self.opt,
-            eq_norms=self.eq_norms,
-            n_iter=self.n_iter,
-            flat=self.flat,
-            re_update=self.re_update,
-            dmrg_run=self.dmrg_run,
-            max_seperation=self.max_seperation,
-        )
+    max_sep_value = max_seperation if max_seperation != 0 else max_separation
 
-        cost = comp_bdy.run(
-            n_iter=self.n_iter,
-            re_tag=self.re_tag,
-            pbar=self.pbar,
-            stop_grad_=self.stop_grad_,
-            fidel_=self.fidel_,
-            visual_=self.visual_,
-            re_update=self.re_update,
-            max_seperation=self.max_seperation,
-            direction=self.direction,
-            eq_norms=self.eq_norms,
-        )
-        return cost, norm, bdy_mpo, comp_bdy
+    re_tag = _normalize_retag_for_direction(direction, re_tag)
+    norm_tagged = norm.copy()
+
+    comp_bdy = CompBdy(
+        norm_tagged,
+        mps_boundaries,
+        opt=opt,
+        dmrg_run=dmrg_run,
+    )
+
+    cost = comp_bdy.run(
+        n_iter=n_iter,
+        re_tag=re_tag,
+        pbar=pbar,
+        fidel_=fidel_,
+        visual_=visual_,
+        flat=flat,
+        re_update=re_update,
+        max_separation=max_sep_value,
+        direction=direction,
+        eq_norms=eq_norms,
+    )
+    return cost

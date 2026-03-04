@@ -1,27 +1,19 @@
 """Boundary-MPS construction and fitting utilities for DMRG-like PEPS contractions."""
 
-
 import logging
 import re
+import warnings
 from dataclasses import dataclass
-
-import numpy as np
 
 from tqdm import tqdm
 
-import autoray as ar
-import jax
-
-from boundary_states import BdyMPO
+from boundary_states import BdyMPS
 from dmrg_fit import FIT
 from dmrg_helpers import fidel_mps, opt_
 
-ar.register_function("torch", "stop_gradient", lambda x: x.detach())  # type: ignore[attr-defined]
-ar.register_function("jax", "stop_gradient", jax.lax.stop_gradient)  # type: ignore[attr-defined]
-
 logger = logging.getLogger(__name__)
 
-__all__ = ["BdyMPO", "CompBdy", "fidel_mps", "opt_", "stop_grad"]
+__all__ = ["BdyMPS", "CompBdy", "fidel_mps", "opt_"]
 
 
 @dataclass(frozen=True)
@@ -34,21 +26,6 @@ class DirectionSpec:
     left_steps: int
     right_steps: int
     left_index: int
-
-
-def stop_grad(x):
-    """Stop gradients for the active autoray backend."""
-    return ar.do("stop_gradient", x)
-
-
-def backend_numpy(dtype=np.float64):
-    """Return a NumPy array caster for backend conversion."""
-
-    def to_backend(x, dtype=dtype):
-        return np.array(x, dtype=dtype)
-
-    return to_backend
-
 
 
 def max_tag_number(tags, tag_format):
@@ -71,30 +48,31 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     def __init__(
         self,
         norm,
-        mpo_b,
+        mps_boundaries,
+        *,
         opt="auto-hq",
-        eq_norms=False,
-        n_iter=4,
-        flat=False,
-        re_update=True,
         dmrg_run="eff",
-        max_seperation=0,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        if not isinstance(mps_boundaries, dict):
+            raise TypeError("mps_boundaries must be a dictionary of boundary states.")
+
         self.norm = norm
-        self.mpo_b = mpo_b
+        self.mps_boundaries = mps_boundaries
         self.opt = opt
-        self.eq_norms = eq_norms
-        self.n_iter = n_iter
-        self.flat = flat
-        self.re_update = re_update
         self.dmrg_run = dmrg_run
+
+        # Runtime sweep options are configured per call in run/move methods.
+        self.eq_norms = False
+        self.n_iter = 4
+        self.flat = False
+        self.re_update = True
         self.re_tag = False
         self.visual_ = False
         self.fidel_ = False
-        self.stop_grad_ = False
         self.pbar = False
-        self.max_seperation = max_seperation
+        self.max_seperation = 0
         self.direction = "y"
+
         self.warning_enabled = True
         self._warned_flat_initial_slice = False
         self.y_left = 0
@@ -103,6 +81,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.x_right = 0
         self.d_left = 0
         self.d_right = 0
+
         # Extract lattice sizes from tags.
         max_y = max_tag_number(list(norm.tags), "Y{}")
         max_x = max_tag_number(list(norm.tags), "X{}")
@@ -177,35 +156,42 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     def _apply_runtime_overrides(
         self,
         *,
-        mpo_b=None,
-        re_tag=None,
-        visual_=None,
-        flat=None,
-        fidel_=None,
-        stop_grad_=None,
-        pbar=None,
-        n_iter=None,
-        eq_norms=None,
+        mps_boundaries=None,
+        re_tag=False,
+        visual_=False,
+        flat=False,
+        fidel_=False,
+        pbar=False,
+        n_iter=4,
+        eq_norms=False,
+        re_update=True,
     ):  # pylint: disable=too-many-arguments
-        """Apply optional runtime overrides for run/move methods."""
-        if mpo_b is not None:
-            self.mpo_b = mpo_b
-        if re_tag is not None:
-            self.re_tag = re_tag
-        if visual_ is not None:
-            self.visual_ = visual_
-        if flat is not None:
-            self.flat = flat
-        if fidel_ is not None:
-            self.fidel_ = fidel_
-        if stop_grad_ is not None:
-            self.stop_grad_ = stop_grad_
-        if pbar is not None:
-            self.pbar = pbar
-        if n_iter is not None:
-            self.n_iter = n_iter
-        if eq_norms is not None:
-            self.eq_norms = eq_norms
+        """Apply run-time options explicitly for a single public call."""
+        if mps_boundaries is not None:
+            if not isinstance(mps_boundaries, dict):
+                raise TypeError("mps_boundaries must be a dictionary of boundary states.")
+            self.mps_boundaries = mps_boundaries
+
+        self.re_tag = re_tag
+        self.visual_ = visual_
+        self.flat = flat
+        self.fidel_ = fidel_
+        self.pbar = pbar
+        self.n_iter = n_iter
+        self.eq_norms = eq_norms
+        self.re_update = re_update
+
+    @staticmethod
+    def _resolve_max_separation(max_separation, max_seperation):
+        """Return canonical max-separation value, accepting legacy spelling."""
+        if max_seperation is None:
+            return max_separation
+        if max_separation not in (0, max_seperation):
+            warnings.warn(
+                "Both max_separation and max_seperation were set. Using max_seperation.",
+                RuntimeWarning,
+            )
+        return max_seperation
 
     def _update_separation(self):
         """Update left/right sweep extents from ``max_seperation``."""
@@ -237,19 +223,19 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             raise ValueError("max_seperation must be 0 or 1.")
 
     def _cut_idx_and_key(self, side, step_idx, cut_tag_id):
-        """Return ``(cut_idx, mpo_key, axis_len)`` for sweep side/step."""
+        """Return ``(cut_idx, boundary_key, axis_len)`` for sweep side/step."""
         axis_len = self._axis_length_from_cut_tag(cut_tag_id)
         if side == "right":
             cut_idx = axis_len - step_idx - 1
-            mpo_key = f"{cut_tag_id.format(step_idx)}_r"
+            boundary_key = f"{cut_tag_id.format(step_idx)}_r"
         else:
             cut_idx = step_idx
-            mpo_key = f"{cut_tag_id.format(step_idx)}_l"
-        return cut_idx, mpo_key, axis_len
+            boundary_key = f"{cut_tag_id.format(step_idx)}_l"
+        return cut_idx, boundary_key, axis_len
 
     @staticmethod
-    def _previous_mpo_key(side, step_idx, cut_tag_id):
-        """Return previous MPO boundary key for a given side and step."""
+    def _previous_boundary_key(side, step_idx, cut_tag_id):
+        """Return previous boundary key for a given side and step."""
         suffix = "_r" if side == "right" else "_l"
         return f"{cut_tag_id.format(step_idx - 1)}{suffix}"
 
@@ -309,7 +295,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         previous = None
 
         for step_idx in range(steps):
-            cut_idx, mpo_key, axis_len = self._cut_idx_and_key(
+            cut_idx, boundary_key, axis_len = self._cut_idx_and_key(
                 side,
                 step_idx,
                 cut_tag_id,
@@ -320,7 +306,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 if self.warning_enabled and not self._warned_flat_initial_slice:
                     logger.warning(
                         "flat=True skips fitting for initial boundary slice (%s).",
-                        mpo_key,
+                        boundary_key,
                     )
                     self._warned_flat_initial_slice = True
                 previous = tn_slice
@@ -333,7 +319,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Missing previous boundary MPS during fitting.")
                 tn = tn_slice | previous
 
-            boundary_mps = self.mpo_b[mpo_key]
+            boundary_mps = self.mps_boundaries[boundary_key]
             if previous is not None and step_idx > 0:
                 boundary_mps.exponent = complex(previous.exponent).real
 
@@ -344,7 +330,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 site_tag_id=site_tag_id,
                 opt=self.opt,
                 re_tag=self.re_tag,
-                stop_grad_=self.stop_grad_,
             )
             self._maybe_visualize_fit(tn, boundary_mps, fit, site_tag_id, axis_len)
             self._run_fit_solver(fit, boundary_mps)
@@ -362,7 +347,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
             previous = fit.p
             if self.re_update:
-                self.mpo_b[mpo_key] = fit.p.copy()
+                self.mps_boundaries[boundary_key] = fit.p.copy()
 
         return previous
 
@@ -374,20 +359,21 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         site_tag_id,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         """Fit a single boundary step for one side and return updated MPS."""
-        fidelity = -1.0
         previous = None
 
-        cut_idx, mpo_key, axis_len = self._cut_idx_and_key(side, step_, cut_tag_id)
+        cut_idx, boundary_key, axis_len = self._cut_idx_and_key(side, step_, cut_tag_id)
         tn_slice = self.norm.select(cut_tag_id.format(cut_idx), "any")
 
         if step_ > 0:
-            previous = self.mpo_b.get(self._previous_mpo_key(side, step_, cut_tag_id))
+            previous = self.mps_boundaries.get(
+                self._previous_boundary_key(side, step_, cut_tag_id)
+            )
 
         if step_ == 0 and self.flat:
             if self.warning_enabled and not self._warned_flat_initial_slice:
                 logger.warning(
                     "flat=True skips fitting for initial boundary slice (%s).",
-                    mpo_key,
+                    boundary_key,
                 )
                 self._warned_flat_initial_slice = True
             return tn_slice
@@ -399,7 +385,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 raise ValueError("Missing previous boundary MPS during fitting.")
             tn = tn_slice | previous
 
-        boundary_mps = self.mpo_b[mpo_key]
+        boundary_mps = self.mps_boundaries[boundary_key]
         if previous is not None and step_ > 0:
             boundary_mps.exponent = complex(previous.exponent).real
 
@@ -410,7 +396,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             site_tag_id=site_tag_id,
             opt=self.opt,
             re_tag=self.re_tag,
-            stop_grad_=self.stop_grad_,
         )
         self._maybe_visualize_fit(tn, boundary_mps, fit, site_tag_id, axis_len)
         self._run_fit_solver(fit, boundary_mps)
@@ -418,12 +403,11 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         if self.eq_norms:
             fit.p.equalize_norms_(value=self.eq_norms)
         if self.fidel_:
-            fidelity = fidel_mps(tn, fit.p)
-        _ = fidelity
+            _ = fidel_mps(tn, fit.p)
 
         previous = fit.p
         if self.re_update:
-            self.mpo_b[mpo_key] = fit.p.copy()
+            self.mps_boundaries[boundary_key] = fit.p.copy()
 
         return previous
 
@@ -449,34 +433,32 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self,
         *,
         re_update=True,
-        max_seperation=0,
-        mpo_b=None,
-        re_tag=None,
-        visual_=None,
-        flat=None,
-        fidel_=None,
-        stop_grad_=None,
-        pbar=None,
-        n_iter=None,
-        eq_norms=None,
+        max_separation=0,
+        max_seperation=None,
+        mps_boundaries=None,
+        re_tag=False,
+        visual_=False,
+        flat=False,
+        fidel_=False,
+        pbar=False,
+        n_iter=4,
+        eq_norms=False,
         direction="y",
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Run two-sided boundary sweeps and contract the final network."""
-        if re_update is not None:
-            self.re_update = re_update
-        if max_seperation is not None:
-            self.max_seperation = max_seperation
-            self._update_separation()
+        self.max_seperation = self._resolve_max_separation(max_separation, max_seperation)
+        self._update_separation()
+        self._warned_flat_initial_slice = False
         self._apply_runtime_overrides(
-            mpo_b=mpo_b,
+            mps_boundaries=mps_boundaries,
             re_tag=re_tag,
             visual_=visual_,
             flat=flat,
             fidel_=fidel_,
-            stop_grad_=stop_grad_,
             pbar=pbar,
             n_iter=n_iter,
             eq_norms=eq_norms,
+            re_update=re_update,
         )
 
         self.direction = direction
@@ -511,31 +493,31 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     def move_bdy(
         self,
         *,
-        mpo_b=None,
-        re_tag=None,
-        visual_=None,
-        flat=None,
-        fidel_=None,
-        stop_grad_=False,
-        pbar=None,
-        n_iter=None,
-        eq_norms=None,
+        mps_boundaries=None,
+        re_tag=False,
+        visual_=False,
+        flat=False,
+        fidel_=False,
+        pbar=False,
+        n_iter=4,
+        eq_norms=False,
         direction="y_left",
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Sweep and update stored boundary MPSs for a selected side/direction."""
-        self.re_update = True
+        self._warned_flat_initial_slice = False
         self._apply_runtime_overrides(
-            mpo_b=mpo_b,
+            mps_boundaries=mps_boundaries,
             re_tag=re_tag,
             visual_=visual_,
             flat=flat,
             fidel_=fidel_,
-            stop_grad_=stop_grad_,
             pbar=pbar,
             n_iter=n_iter,
             eq_norms=eq_norms,
+            re_update=True,
         )
 
+        self.direction = direction
         cut_tag_id, site_tag_id, n_steps = self._direction_tags(direction)
         move_left, move_right = self._direction_sides(direction)
         if not (move_left or move_right):
@@ -571,31 +553,31 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self,
         *,
         pos=0,
-        mpo_b=None,
-        re_tag=None,
-        visual_=None,
-        flat=None,
-        fidel_=None,
-        stop_grad_=False,
-        pbar=None,
-        n_iter=None,
-        eq_norms=None,
+        mps_boundaries=None,
+        re_tag=False,
+        visual_=False,
+        flat=False,
+        fidel_=False,
+        pbar=False,
+        n_iter=4,
+        eq_norms=False,
         direction="y_left",
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Fit and update one boundary step at position ``pos``."""
-        self.re_update = True
+        self._warned_flat_initial_slice = False
         self._apply_runtime_overrides(
-            mpo_b=mpo_b,
+            mps_boundaries=mps_boundaries,
             re_tag=re_tag,
             visual_=visual_,
             flat=flat,
             fidel_=fidel_,
-            stop_grad_=stop_grad_,
             pbar=pbar,
             n_iter=n_iter,
             eq_norms=eq_norms,
+            re_update=True,
         )
 
+        self.direction = direction
         cut_tag_id, site_tag_id, n_steps = self._direction_tags(direction)
         if not isinstance(pos, int):
             raise TypeError("pos must be an integer")

@@ -38,7 +38,7 @@ def add_diagonalu_tags(p):
 
 
 
-class BdyMPO:
+class BdyMPS:
     """Build and store boundary MPS environments for PEPS contractions.
 
     This class initializes left/right boundary states for horizontal,
