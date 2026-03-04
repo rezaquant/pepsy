@@ -19,8 +19,8 @@ from itertools import permutations
 from more_itertools import distinct_permutations 
 from tqdm.contrib.itertools import product
 from itertools import islice
-from quimb.tensor.tensor_2d import *
-from quimb.tensor.tensor_1d import maybe_factor_gate_into_tensor
+from quimb.tensor.tn2d.core import *
+# from quimb.tensor.gating import maybe_factor_gate_into_tensor
 import collections
 from quimb.utils import frequencies 
 from math import pi, log2, log10
@@ -57,6 +57,35 @@ from quimb.tensor.belief_propagation.bp_common import (
     combine_local_contractions,
     create_lazy_community_edge_map,
 )
+
+
+
+def add_diagonalu_tags(p, ):
+    def diagonals_sum(Lx, Ly):
+        """
+        Diagonals with constant (x + y).
+        Returns: dict {D: [(x,y), ...]}
+        where D = x + y
+        """
+        diags = {d: [] for d in range(Lx + Ly - 1)}
+        
+        for x in range(Lx):
+            for y in range(Ly):
+                d = x + y
+                diags[d].append((x, y))
+        
+        return diags
+
+
+    for d, l in diagonals_sum(p.Lx, p.Ly).items():
+        for count, cor in enumerate(l):
+            p[cor].add_tag(f"Du{d}")
+            p[cor].add_tag(f"du{count}")
+
+    return p
+
+
+
 
 
 def circ_hydro(Lx=14, Ly=4, steps = 14, dt = 0.25):
