@@ -1,6 +1,6 @@
 # Pepsy Library
 
-![Pepsy icon](assets/pepsy-icon.svg)
+<img src="assets/pepsy-icon.svg" alt="pepsy icon" width="220" />
 
 `pepsy` is a Python package for boundary-MPS based PEPS norm contraction and related DMRG fitting workflows.
 

@@ -58,5 +58,5 @@
   <circle cx="294" cy="218" r="16" fill="#FBBF24"/>
 
   <!-- wordmark -->
-  <text x="256" y="436" text-anchor="middle" font-family="Verdana, DejaVu Sans, sans-serif" font-size="44" font-weight="700" fill="white" letter-spacing="2">PEPSY</text>
+  <text x="256" y="436" text-anchor="middle" font-family="Verdana, DejaVu Sans, sans-serif" font-size="44" font-weight="700" fill="white" letter-spacing="2">pepsy</text>
 </svg>
