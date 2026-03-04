@@ -2,12 +2,10 @@
 
 import importlib.util
 import warnings
+from typing import Any
 
 import numpy as np
 import cotengra as ctg
-import jax
-import jax.numpy as jnp
-import torch
 
 __all__ = [
     "backend_torch",
@@ -18,8 +16,18 @@ __all__ = [
 ]
 
 
-def backend_torch(device="cpu", dtype=torch.float64, requires_grad=False):
+def backend_torch(device="cpu", dtype=None, requires_grad=False):
     """Return a converter that materializes arrays as torch tensors."""
+    try:
+        import torch  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:  # pragma: no cover - depends on optional dependency
+        raise ImportError(
+            "backend_torch requires the optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch]"
+        ) from exc
+
+    if dtype is None:
+        dtype = torch.float64
 
     def to_backend(x, device=device, dtype=dtype, requires_grad=requires_grad):
         return torch.tensor(x, dtype=dtype, device=device, requires_grad=requires_grad)
@@ -38,8 +46,19 @@ def backend_numpy(dtype=np.float64):
 
 
 
-def backend_jax(dtype=jnp.float64, device=None):
+def backend_jax(dtype=None, device=None):
     """Return a converter that places arrays onto a specific JAX device."""
+    try:
+        import jax  # pylint: disable=import-outside-toplevel
+        import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:  # pragma: no cover - depends on optional dependency
+        raise ImportError(
+            "backend_jax requires optional dependencies 'jax' and 'jaxlib'. "
+            "Install them with: pip install pepsy[jax]"
+        ) from exc
+
+    if dtype is None:
+        dtype = jnp.float64
     if device is None:
         device = jax.devices("cpu")[0]
 
@@ -73,7 +92,7 @@ def opt_(progbar=True):
 
 def fidel_mps(psi, psi_fix):
     """Compute normalized MPS fidelity |<psi|psi_fix>|^2/(||psi||^2||psi_fix||^2)."""
-    opt = opt_(progbar=False)
+    opt: Any = opt_(progbar=False)
     val_0 = abs((psi.H & psi).contract(all, optimize=opt))
     val_1 = abs((psi.H & psi_fix).contract(all, optimize=opt))
     val_ref = abs((psi_fix.H & psi_fix).contract(all, optimize=opt))

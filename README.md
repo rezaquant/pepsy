@@ -3,7 +3,7 @@
 Code and notebooks for density matrix renormalization group (DMRG) and related
 tensor-network simulations, with boundary-MPS based PEPS norm contraction.
 
-Current repository version: `0.0.0` (see `VERSION`).
+Current package version: `0.0.0` (see `pepsy/VERSION`).
 
 ## Layout
 - `pepsy/`: installable package.
@@ -13,7 +13,7 @@ Current repository version: `0.0.0` (see `VERSION`).
   - `dmrg_fit.py`, `dmrg_helpers.py`: fitting and backend helper utilities.
 - top-level `boundary_*.py`, `dmrg_fit.py`, `dmrg_helpers.py`, `tn_norm.py`:
   compatibility wrappers that re-export from `pepsy.*`.
-- `peps_norm_.ipynb`, `peps_boundary_states.ipynb`: active notebooks.
+- `example/peps_norm_.ipynb`, `example/peps_boundary_states.ipynb`: active notebooks.
 - `cash/`: local contraction cache/artifacts.
 
 ## Setup
@@ -22,9 +22,22 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e .
+# Optional backends:
+# pip install -e .[torch]
+# pip install -e .[jax]
+```
+
+## Quick Usage
+```python
+import pepsy
+from pepsy import BdyMPS, CompBdy, ContractBoundary, prepare_boundary_inputs
+
+print(pepsy.__version__)
 ```
 
 ## Notes
 - `.gitattributes` treats notebooks as binary to avoid noisy diffs; use `nbdiff` or screenshots for review.
 - `.gitignore` excludes checkpoints, caches, `cash/`, and `nohup.out`. Keep transient data there or outside the repo.
 - Large generated data should stay out of version control or use Git LFS if required.
+- Top-level modules (for example `boundary_states.py`) are compatibility wrappers.
+  New code should import from `pepsy.*`.
