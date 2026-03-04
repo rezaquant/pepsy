@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pepsy"
+version = "0.0.0"
+description = "Boundary-MPS tools for PEPS norm contraction and DMRG fitting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "numpy",
+  "quimb",
+  "cotengra",
+  "autoray",
+  "tqdm",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pepsy*"]

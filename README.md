@@ -1,22 +1,27 @@
-# DMRG Experiments
+# Pepsy Library
 
-Code and notebooks for density matrix renormalization group (DMRG) and related tensor-network simulations. Scripts implement DMRG/cooling routines, circuit utilities, and experiment helpers; notebooks capture exploratory runs and diagnostics.
+Code and notebooks for density matrix renormalization group (DMRG) and related
+tensor-network simulations, with boundary-MPS based PEPS norm contraction.
+
+Current repository version: `0.0.0` (see `VERSION`).
 
 ## Layout
-- `dmrg_fit.py`, `boundary_sweeps.py`, `algo_cooling.py`: core DMRG and boundary/cooling routines.
-- `dmrg.py`, `svd.py`: runnable scripts for DMRG workflows and SVD-based variants.
-- `circuits.py`: circuit construction and Qiskit helpers.
-- `quf.py`, `register_.py`: utilities (partitioning, contractions, registration) used across scripts.
-- `dmrg*.ipynb`, `mps_*.ipynb`, `plot.ipynb`, `prac.ipynb`: experiments and visualizations.
-- `cash/`: local cache/artifacts (ignored).
-- `store/`, `z2_exact/`: reference data and helper modules.
+- `pepsy/`: installable package.
+  - `boundary_states.py`: boundary-state initialization (`BdyMPS`).
+  - `boundary_sweeps.py`: boundary sweep/contraction driver (`CompBdy`).
+  - `boundary_norm.py`: high-level norm preparation and contraction API.
+  - `dmrg_fit.py`, `dmrg_helpers.py`: fitting and backend helper utilities.
+- top-level `boundary_*.py`, `dmrg_fit.py`, `dmrg_helpers.py`, `tn_norm.py`:
+  compatibility wrappers that re-export from `pepsy.*`.
+- `peps_norm_.ipynb`, `peps_boundary_states.ipynb`: active notebooks.
+- `cash/`: local contraction cache/artifacts.
 
 ## Setup
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# For GPU JAX/PyTorch, install vendor wheels as needed.
+pip install -e .
 ```
 
 ## Notes
