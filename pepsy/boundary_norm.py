@@ -3,16 +3,12 @@
 from __future__ import annotations
 
 import re
-from uuid import uuid4
-import warnings
 
-from .boundary_states import add_diagonalu_tags
 from .boundary_sweeps import CompBdy
 
 
 _TAG_X = re.compile(r"^X\d+$")
 _TAG_Y = re.compile(r"^Y\d+$")
-_TAG_DU = re.compile(r"^Du\d+$")
 
 __all__ = [
     "prepare_boundary_inputs",
@@ -20,41 +16,24 @@ __all__ = [
 ]
 
 
-def _validate_tensor_network_tags(p, add_diag_to_p):
-    """Validate lattice tags and update diagonal-tag behavior when needed."""
+def _validate_tensor_network_tags(p):
+    """Validate lattice tags."""
     tags = set(getattr(p, "tags", ()))
 
     if not any(_TAG_X.match(tag) for tag in tags) or not any(_TAG_Y.match(tag) for tag in tags):
         raise ValueError("Input network must contain X* and Y* lattice tags.")
 
-    if not add_diag_to_p and not any(_TAG_DU.match(tag) for tag in tags):
-        warnings.warn(
-            "Input network has no Du* tags. Enabling diagonal tagging automatically.",
-            RuntimeWarning,
-        )
-        return True
-    return add_diag_to_p
-
 
 def _normalize_retag_for_direction(direction, re_tag):
-    """Normalize ``re_tag`` for direction-specific requirements."""
-    direction_key = direction.lower() if isinstance(direction, str) else ""
-    if direction_key.startswith("diag"):
-        if not re_tag:
-            warnings.warn(
-                "direction='diag*' requires re_tag=True. Overriding re_tag to True.",
-                RuntimeWarning,
-            )
-            re_tag = True
-
-    return re_tag
+    """Normalize ``re_tag`` for sweep calls."""
+    _ = direction
+    return bool(re_tag)
 
 
 def prepare_boundary_inputs(
     ket=None,
     *,
     bra=None,
-    add_diag_to_p=True,
 ):
     """Prepare tagged ``ket``/``bra`` networks and build ``norm``.
 
@@ -64,27 +43,51 @@ def prepare_boundary_inputs(
         Input ket network.
     bra : qtn.TensorNetwork | None
         Optional bra network. If ``None``, ``ket.copy().conj()`` is used.
-    add_diag_to_p : bool
-        Add diagonal ``Du*``/``du*`` tags to ``ket`` when constructing input.
 
     Returns
     -------
     tuple[qtn.TensorNetwork, qtn.TensorNetwork]
         ``(ket_tagged, norm_tagged)``
+
+    Notes
+    -----
+    When ``bra`` is ``None``: shared internal ket/bra indices are renamed on the
+    auto-generated bra side as ``<original>_*``.
+
+    When ``bra`` is provided: no reindexing is performed; only bra/ket internal
+    index names are required to be disjoint (outer-index overlap is allowed).
     """
     if ket is None:
         raise ValueError("Provide ket.")
 
-    add_diag_to_p = _validate_tensor_network_tags(ket, add_diag_to_p)
+    _validate_tensor_network_tags(ket)
 
     ket_tagged = ket.copy()
-    bra_tagged = ket.copy().conj() if bra is None else bra.copy().conj()
-    if add_diag_to_p:
-        ket_tagged = add_diagonalu_tags(ket_tagged)
-        bra_tagged = add_diagonalu_tags(bra_tagged)
+    auto_bra = bra is None
+    bra_tagged = ket.copy().conj() if auto_bra else bra.copy().conj()
 
-    shared_inner = set(ket_tagged.inner_inds()) & set(bra_tagged.inner_inds())
-    bra_tagged.reindex_({idx: f"r{uuid4().hex}" for idx in shared_inner})
+    if auto_bra:
+        shared_inner = set(ket_tagged.inner_inds()) & set(bra_tagged.inner_inds())
+        reindex_map = {idx: f"{idx}_*" for idx in shared_inner}
+        final_collisions = set(reindex_map.values()) & (
+            set(ket_tagged.ind_map) | (set(bra_tagged.ind_map) - shared_inner)
+        )
+        if final_collisions:
+            sample = ", ".join(sorted(final_collisions)[:8])
+            raise ValueError(
+                "Automatic bra reindex idx -> idx_* collides with existing indices. "
+                f"Collisions found: {sample}"
+            )
+        bra_tagged.reindex_(reindex_map)
+    else:
+        collisions = set(ket_tagged.inner_inds()) & set(bra_tagged.inner_inds())
+        if collisions:
+            sample = ", ".join(sorted(collisions)[:8])
+            raise ValueError(
+                "Provided bra must have internal index names disjoint from ket. "
+                f"Internal collisions found: {sample}"
+            )
+
     ket_tagged.add_tag("KET")
     bra_tagged.add_tag("BRA")
     norm_tagged = bra_tagged | ket_tagged
@@ -99,13 +102,12 @@ def ContractBoundary(
     flat=False,
     dmrg_run="eff",
     n_iter=2,
-    re_tag=False,
+    re_tag=True,
     pbar=True,
     fidel_=False,
     visual_=False,
     re_update=True,
     max_separation=0,
-    max_seperation=0,
     direction="y",
     eq_norms=False,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,invalid-name
@@ -123,13 +125,6 @@ def ContractBoundary(
         raise ValueError("norm must not be None.")
     if not isinstance(mps_boundaries, dict):
         raise TypeError("mps_boundaries must be a dictionary of boundary states.")
-
-    if max_seperation not in (0, max_separation):
-        warnings.warn(
-            "Both max_separation and max_seperation were set. Using max_seperation.",
-            RuntimeWarning,
-        )
-    max_sep_value = max_seperation if max_seperation != 0 else max_separation
 
     re_tag = _normalize_retag_for_direction(direction, re_tag)
     norm_tagged = norm.copy()
@@ -149,7 +144,7 @@ def ContractBoundary(
         visual_=visual_,
         flat=flat,
         re_update=re_update,
-        max_separation=max_sep_value,
+        max_separation=max_separation,
         direction=direction,
         eq_norms=eq_norms,
     )

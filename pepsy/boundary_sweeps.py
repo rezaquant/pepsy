@@ -2,18 +2,20 @@
 
 import logging
 import re
-import warnings
 from dataclasses import dataclass
 
 from tqdm import tqdm
 
 from .boundary_states import BdyMPS
+from .core import build_optimizer, fidel_mps
 from .dmrg_fit import FIT
-from .dmrg_helpers import fidel_mps, opt_
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["BdyMPS", "CompBdy", "fidel_mps", "opt_"]
+__all__ = ["BdyMPS", "CompBdy", "fidel_mps", "build_optimizer", "opt_"]
+
+# Backward-compatible alias.
+opt_ = build_optimizer
 
 
 @dataclass(frozen=True)
@@ -43,7 +45,7 @@ def max_tag_number(tags, tag_format):
 
 
 class CompBdy:  # pylint: disable=too-many-instance-attributes
-    """Boundary MPS fitting driver used for y/x/diagonal contraction sweeps."""
+    """Boundary MPS fitting driver used for y/x contraction sweeps."""
 
     def __init__(
         self,
@@ -70,7 +72,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.visual_ = False
         self.fidel_ = False
         self.pbar = False
-        self.max_seperation = 0
+        self.max_separation = 0
         self.direction = "y"
 
         self.warning_enabled = True
@@ -79,8 +81,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.y_right = 0
         self.x_left = 0
         self.x_right = 0
-        self.d_left = 0
-        self.d_right = 0
 
         # Extract lattice sizes from tags.
         max_y = max_tag_number(list(norm.tags), "Y{}")
@@ -95,9 +95,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
     @staticmethod
     def _direction_base(direction):
-        """Return canonical base direction: ``y``, ``x``, or ``diag``."""
-        if direction.startswith("diag"):
-            return "diag"
+        """Return canonical base direction: ``y`` or ``x``."""
         if direction.startswith("y"):
             return "y"
         if direction.startswith("x"):
@@ -110,8 +108,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             return self.Ly
         if cut_tag_id == "X{}":
             return self.Lx
-        if cut_tag_id == "Du{}":
-            return self.Ly + self.Lx - 1
         raise ValueError(f"Unsupported cut_tag_id: {cut_tag_id}")
 
     def _direction_tags(self, direction):
@@ -121,7 +117,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             return "Y{}", "X{}", self.Ly - 1
         if base == "x":
             return "X{}", "Y{}", self.Lx - 1
-        return "Du{}", "du{}", self.Ly + self.Lx - 2
+        raise ValueError(f"Unsupported direction: {direction}")
 
     def _run_direction_spec(self, direction):
         """Return run-time sweep tags and left/right extents."""
@@ -144,14 +140,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 right_steps=self.x_right,
                 left_index=self.x_left,
             )
-        return DirectionSpec(
-            cut_tag_id="Du{}",
-            site_tag_id="du{}",
-            n_steps=self.d_left + self.d_right,
-            left_steps=self.d_left,
-            right_steps=self.d_right,
-            left_index=self.d_left,
-        )
+        raise ValueError(f"Unsupported direction: {direction}")
 
     def _apply_runtime_overrides(
         self,
@@ -181,32 +170,15 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.eq_norms = eq_norms
         self.re_update = re_update
 
-    @staticmethod
-    def _resolve_max_separation(max_separation, max_seperation):
-        """Return canonical max-separation value, accepting legacy spelling."""
-        if max_seperation is None:
-            return max_separation
-        if max_separation not in (0, max_seperation):
-            warnings.warn(
-                "Both max_separation and max_seperation were set. Using max_seperation.",
-                RuntimeWarning,
-            )
-        return max_seperation
-
     def _update_separation(self):
-        """Update left/right sweep extents from ``max_seperation``."""
-        if self.max_seperation == 0:
+        """Update left/right sweep extents from ``max_separation``."""
+        if self.max_separation == 0:
             self.y_left = self.Ly // 2
             self.y_right = self.Ly - (self.Ly // 2)
 
             self.x_left = self.Lx // 2
             self.x_right = self.Lx - (self.Lx // 2)
-
-            # diagonal
-            l_d = self.Lx + self.Ly - 1
-            self.d_left = l_d // 2
-            self.d_right = l_d - l_d // 2
-        elif self.max_seperation == 1:
+        elif self.max_separation == 1:
             # y dir
             self.y_left = (self.Ly // 2) - 1
             self.y_right = self.Ly - (self.Ly // 2)
@@ -214,13 +186,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             # x dir
             self.x_left = (self.Lx // 2) - 1
             self.x_right = self.Lx - (self.Lx // 2)
-
-            # diagonal
-            l_d = self.Lx + self.Ly - 1
-            self.d_left = (l_d // 2) - 1
-            self.d_right = l_d - (l_d // 2)
         else:
-            raise ValueError("max_seperation must be 0 or 1.")
+            raise ValueError("max_separation must be 0 or 1.")
 
     def _cut_idx_and_key(self, side, step_idx, cut_tag_id):
         """Return ``(cut_idx, boundary_key, axis_len)`` for sweep side/step."""
@@ -241,14 +208,15 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
     def _run_fit_solver(self, fit, boundary_mps):
         """Run selected fitting backend with explicit validation."""
+        verbose = bool(self.fidel_)
         if boundary_mps.L == 1:
-            fit.run(n_iter=self.n_iter)
+            fit.run(n_iter=self.n_iter, verbose=verbose)
             return
         if self.dmrg_run == "eff":
-            fit.run_eff(n_iter=self.n_iter)
+            fit.run_eff(n_iter=self.n_iter, verbose=verbose)
             return
         if self.dmrg_run == "global":
-            fit.run(n_iter=self.n_iter)
+            fit.run(n_iter=self.n_iter, verbose=verbose)
             return
         raise ValueError(f"Unsupported dmrg_run mode: {self.dmrg_run}")
 
@@ -421,7 +389,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         """Build final TN by combining left/right fitted boundaries."""
         if p_previous_r is None:
             raise ValueError("Boundary contraction failed: missing right boundary MPS.")
-        if self.max_seperation == 0:
+        if self.max_separation == 0:
             return p_previous_r if p_previous_l is None else (p_previous_r | p_previous_l)
 
         center = self.norm.select(spec.cut_tag_id.format(spec.left_index), "any")
@@ -434,7 +402,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         *,
         re_update=True,
         max_separation=0,
-        max_seperation=None,
         mps_boundaries=None,
         re_tag=False,
         visual_=False,
@@ -442,11 +409,11 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         fidel_=False,
         pbar=False,
         n_iter=4,
-        eq_norms=False,
+        eq_norms=True,
         direction="y",
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Run two-sided boundary sweeps and contract the final network."""
-        self.max_seperation = self._resolve_max_separation(max_separation, max_seperation)
+        self.max_separation = max_separation
         self._update_separation()
         self._warned_flat_initial_slice = False
         self._apply_runtime_overrides(

@@ -11,12 +11,13 @@ from typing import Any, Dict, List, Optional, Sequence
 import autoray as ar
 import quimb.tensor as qtn
 
-from .dmrg_helpers import fidel_mps, opt_
+from .core import build_optimizer, fidel_mps
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "FIT",
+    "build_optimizer",
     "opt_",
     "fidel_mps",
     "energy_global",
@@ -24,6 +25,9 @@ __all__ = [
     "internal_inds",
     "canonize_mps",
 ]
+
+# Backward-compatible alias.
+opt_ = build_optimizer
 
 
 def energy_global(MPO_origin, mps_a, opt="auto-hq"):  # pylint: disable=invalid-name
@@ -298,7 +302,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             self._deep_tag()
 
 
-    def run(self, n_iter=6, verbose=True):
+    def run(self, n_iter=6, verbose=False):
         """Run basic left-to-right local fitting sweeps.
 
         Parameters
@@ -459,7 +463,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             env_left[site_tag_id.format(site)] = t.contract(all, optimize=opt)
 
 
-    def run_eff(self, n_iter=6, verbose=True):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
+    def run_eff(self, n_iter=6, verbose=False):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run environment-based fitting sweeps with cached left/right blocks.
 
         This method avoids rebuilding full contractions at each site by
@@ -552,7 +556,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
 
     def run_gate(
-        self, n_iter=6, verbose=True
+        self, n_iter=6, verbose=False
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run fitting restricted to ``range_int`` with gate-style sweeps.
 

@@ -11,7 +11,7 @@ Current package version: `0.0.0` (from `pepsy/VERSION`).
   - `boundary_states.py`: boundary state initialization (`BdyMPS`)
   - `boundary_sweeps.py`: sweep/contraction runner (`CompBdy`)
   - `boundary_norm.py`: input preparation + contraction (`prepare_boundary_inputs`, `ContractBoundary`)
-  - `dmrg_fit.py`, `dmrg_helpers.py`, `linalg_registrations.py`
+  - `dmrg_fit.py`, `core.py`, `linalg_registrations.py`
 - `example/`: example notebooks
 - `tests/`: package tests
 

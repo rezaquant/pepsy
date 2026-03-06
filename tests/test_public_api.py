@@ -15,5 +15,4 @@ def test_core_symbols_exported():
     assert "CompBdy" in pepsy.__all__
     assert "ContractBoundary" in pepsy.__all__
     assert "prepare_boundary_inputs" in pepsy.__all__
-    assert "add_diagonalu_tags" in pepsy.__all__
     assert "make_numpy_array_caster" in pepsy.__all__

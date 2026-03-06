@@ -10,3 +10,5 @@ __pycache__/
 cash/
 store/
 nohup.out
+
+*.egg-info/

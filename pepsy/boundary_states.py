@@ -8,6 +8,7 @@ import quimb.tensor as qtn
 
 logger = logging.getLogger(__name__)
 
+
 def make_numpy_array_caster(dtype=np.float64):
     """Return a callable that casts arrays to a target NumPy dtype."""
 
@@ -17,32 +18,11 @@ def make_numpy_array_caster(dtype=np.float64):
     return to_backend
 
 
-def add_diagonalu_tags(p):
-    """Add anti-diagonal tags ``Du*``/``du*`` to a PEPS-like lattice object."""
-
-    def diagonals_sum(lx, ly):
-        """Return coordinates grouped by constant anti-diagonal index ``x + y``."""
-        diags = {d: [] for d in range(lx + ly - 1)}
-        for x_pos in range(lx):
-            for y_pos in range(ly):
-                diag_id = x_pos + y_pos
-                diags[diag_id].append((x_pos, y_pos))
-        return diags
-
-    for diag_id, coords in diagonals_sum(p.Lx, p.Ly).items():
-        for count, coord in enumerate(coords):
-            p[coord].add_tag(f"Du{diag_id}")
-            p[coord].add_tag(f"du{count}")
-
-    return p
-
-
-
 class BdyMPS:
     """Build and store boundary MPS environments for PEPS contractions.
 
-    This class initializes left/right boundary states for horizontal,
-    vertical, and diagonal cuts. Boundaries are built from network slices (MPO),
+    This class initializes left/right boundary states for horizontal and
+    vertical cuts. Boundaries are built from network slices (MPO),
     randomized, compressed to a maximum bond dimension, and normalized.
 
     2D PEPS example (Lx=5, Ly=4)
@@ -64,8 +44,6 @@ class BdyMPS:
       vertical sweep (left/right boundaries across Y cuts).
     - ``cut_tag_id="X{}"``, ``site_tag_id="Y{}"``:
       horizontal sweep (left/right boundaries across X cuts).
-    - ``cut_tag_id="Du{}"``, ``site_tag_id="du{}"``:
-      diagonal sweep over anti-diagonals of the 2D PEPS.
 
     Boundary keys on the grid (important)
     -------------------------------------
@@ -109,19 +87,12 @@ class BdyMPS:
 
         right mapping: X0_r -> X4, X1_r -> X3, X2_r -> X2, X3_r -> X1
 
-    Diagonal keys (Du):
-        Du0 (bottom-left) ... Du7 (top-right)
-        left keys:  Du0_l ... Du6_l
-        right keys: Du0_r -> Du7, Du1_r -> Du6, ..., Du6_r -> Du1
-
     Parameters
     ----------
     tn_flat : qtn.TensorNetwork | None
         Flattened tensor network used when ``flat=True``.
     tn_double : qtn.TensorNetwork | None
         Double-layer tensor network used when ``flat=False``.
-    opt : cotengra or str, default="auto-hq"
-        Reserved optimization label kept for API compatibility.
     chi : int
         Maximum bond dimension for generated boundary MPS tensors.
     flat : bool
@@ -146,15 +117,12 @@ class BdyMPS:
         ("right", "X{}", "Y{}"),
         ("left", "Y{}", "X{}"),
         ("right", "Y{}", "X{}"),
-        ("left", "du{}", "Du{}"),
-        ("right", "du{}", "Du{}"),
     )
 
     def __init__(
         self,
         tn_flat=None,
         tn_double=None,
-        opt="auto-hq",
         chi=8,
         flat=False,
         to_backend=None,
@@ -163,7 +131,6 @@ class BdyMPS:
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
         if chi < 1:
             raise ValueError("chi must be >= 1")
-        _ = opt
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None")
 
@@ -218,6 +185,18 @@ class BdyMPS:
         lx, _ = self._infer_lattice_shape(None, self.norm)
         return lx
 
+    @property
+    def avg_mps_norm(self):
+        """Return the mean of ``mps.norm()`` across all stored boundaries."""
+        if not self.mps_b:
+            raise ValueError("No boundary MPS available to compute avg_mps_norm.")
+
+        norms = [mps.norm() for mps in self.mps_b.values()]
+        total = norms[0]
+        for value in norms[1:]:
+            total = total + value
+        return total / len(norms)
+
     @staticmethod
     def _normalize_boundary_direction(direction):
         """Normalize direction aliases to boundary key prefixes."""
@@ -233,16 +212,12 @@ class BdyMPS:
             "cols": "X",
             "column": "X",
             "columns": "X",
-            "d": "Du",
-            "diag": "Du",
-            "diagonal": "Du",
-            "du": "Du",
         }
         key = direction.lower()
         if key in mapping:
             return mapping[key]
 
-        raise ValueError("direction must be one of: 'y', 'x', 'diag'")
+        raise ValueError("direction must be one of: 'y', 'x'")
 
     @staticmethod
     def _normalize_boundary_side(side):
@@ -291,7 +266,7 @@ class BdyMPS:
     @staticmethod
     def _boundary_key_metadata(key):
         """Parse and return metadata for a boundary key."""
-        match = re.match(r"^(Y|X|Du)(\d+)_(l|r)$", key)
+        match = re.match(r"^(Y|X)(\d+)_(l|r)$", key)
         if not match:
             return {
                 "key": key,
@@ -303,7 +278,7 @@ class BdyMPS:
             }
 
         prefix, step_txt, suffix = match.groups()
-        direction = {"Y": "y", "X": "x", "Du": "diag"}[prefix]
+        direction = {"Y": "y", "X": "x"}[prefix]
         side = "left" if suffix == "l" else "right"
         return {
             "key": key,
@@ -323,7 +298,6 @@ class BdyMPS:
         axis_length = {
             "Y": self.ly,
             "X": self.lx,
-            "Du": self.lx + self.ly - 1,
         }[meta["prefix"]]
         cut_index = (
             meta["step"] if meta["suffix"] == "l" else (axis_length - 1 - meta["step"])
@@ -337,8 +311,6 @@ class BdyMPS:
             return y_pos == cut_index
         if prefix == "X":
             return x_pos == cut_index
-        if prefix == "Du":
-            return (x_pos + y_pos) == cut_index
         return False
 
     @staticmethod
@@ -354,11 +326,6 @@ class BdyMPS:
         if prefix == "X" and x_pos == cut_index:
             return "v" if suffix == "l" else "^"
         return "|"
-
-    @staticmethod
-    def _has_diag_connector(prefix, cut_index, x_pos, y_pos):
-        """Return whether a diagonal marker should be drawn between rows."""
-        return prefix == "Du" and (x_pos + y_pos) == cut_index
 
     def _build_grid_row(self, meta, cut_index, lx, y_pos):
         """Build a single PEPS row with highlighted cut markers."""
@@ -391,10 +358,6 @@ class BdyMPS:
                 cut_index,
                 x_pos,
             )
-
-        for x_pos in range(lx - 1):
-            if self._has_diag_connector(prefix, cut_index, x_pos, y_pos):
-                conn_chars[3 * x_pos + 1] = "↖" if suffix == "l" else "↘"
         return "".join(conn_chars)
 
     def _render_peps_grid_lines(self, key):
@@ -472,17 +435,11 @@ class BdyMPS:
         """Normalize user key aliases to canonical keys used in ``self.mps_b``."""
         if not isinstance(key, str):
             raise TypeError("key must be a string")
-        match = re.match(r"^(du|d|x|y)(\d+)_([lr])$", key.strip(), flags=re.IGNORECASE)
+        match = re.match(r"^(x|y)(\d+)_([lr])$", key.strip(), flags=re.IGNORECASE)
         if not match:
             return key
         prefix, step, side = match.groups()
-        prefix_lower = prefix.lower()
-        if prefix_lower in {"du", "d"}:
-            canon_prefix = "Du"
-        elif prefix_lower == "x":
-            canon_prefix = "X"
-        else:
-            canon_prefix = "Y"
+        canon_prefix = "X" if prefix.lower() == "x" else "Y"
         return f"{canon_prefix}{step}_{side.lower()}"
 
     @staticmethod
@@ -569,9 +526,9 @@ class BdyMPS:
         Parameters
         ----------
         key : str | None, default=None
-            Explicit boundary key such as ``Y0_l`` or ``Du2_r``.
+            Explicit boundary key such as ``Y0_l`` or ``X2_r``.
         direction : str | None, default=None
-            Boundary direction alias (``y``, ``x``, ``diag``). Used when
+            Boundary direction alias (``y``, ``x``). Used when
             ``key`` is not provided.
         side : str, default="left"
             Side alias (``left``/``l`` or ``right``/``r``).
@@ -586,12 +543,11 @@ class BdyMPS:
 
         Returns
         -------
-        qtn.MatrixProductState
-            The selected boundary MPS object.
+        None
+            This method prints a text view and does not return an MPS.
         """
         selected_key = self._resolve_selected_key(key, direction, side, step)
 
-        mps = self.mps_b[selected_key]
         output_lines = self._compose_show_lines(
             selected_key,
             max_width,
@@ -600,7 +556,7 @@ class BdyMPS:
         )
         for line in output_lines:
             print(line)
-        return mps
+        return None
 
     def show_all(self, direction=None, side=None, max_width=None):
         """Display all matching boundary keys."""
@@ -658,8 +614,6 @@ class BdyMPS:
             return self.ly
         if site_tag_id == "Y{}":
             return self.lx
-        if site_tag_id == "du{}":
-            return self.lx + self.ly - 1
         raise ValueError(f"Unsupported site_tag_id: {site_tag_id}")
 
     def _get_default_site_count(self, site_tag_id):
@@ -667,8 +621,6 @@ class BdyMPS:
             return self.lx
         if site_tag_id == "Y{}":
             return self.ly
-        if site_tag_id == "du{}":
-            return None
         raise ValueError(f"Unsupported site_tag_id: {site_tag_id}")
 
     @staticmethod
@@ -851,15 +803,10 @@ class BdyMPS:
                 prev = boundaries[self._previous_boundary_key(cut_tag_id, step, suffix)]
                 mps_net = tn | prev
 
-            if site_tag_id == "du{}":
-                mps_count = len([tag for tag in tn.tags if tag.startswith("du")])
-            else:
-                mps_count = default_count
-
             boundaries[key] = self._build_multi_layer_boundary_mps(
                 mps_net,
                 site_tag_id,
-                mps_count,
+                default_count,
             )
 
         return boundaries
