@@ -21,71 +21,17 @@ def make_numpy_array_caster(dtype=np.float64):
 class BdyMPS:
     """Build and store boundary MPS environments for PEPS contractions.
 
-    This class initializes left/right boundary states for horizontal and
-    vertical cuts. Boundaries are built from network slices (MPO),
-    randomized, compressed to a maximum bond dimension, and normalized.
+    The class precomputes left/right boundaries for both sweep axes:
 
-    2D PEPS example (Lx=5, Ly=4)
-    ----------------------------
-    Site tags are arranged on a rectangular grid:
+    - Y-cuts with site tags ``X{}``
+    - X-cuts with site tags ``Y{}``
 
-        Y3  o--o--o--o--o
-            |  |  |  |  |
-        Y2  o--o--o--o--o
-            |  |  |  |  |
-        Y1  o--o--o--o--o
-            |  |  |  |  |
-        Y0  o--o--o--o--o
-            X0 X1 X2 X3 X4
+    Boundary entries are stored in ``mps_b`` with keys:
 
-    Cut conventions used by this class
-    ----------------------------------
-    - ``cut_tag_id="Y{}"``, ``site_tag_id="X{}"``:
-      vertical sweep (left/right boundaries across Y cuts).
-    - ``cut_tag_id="X{}"``, ``site_tag_id="Y{}"``:
-      horizontal sweep (left/right boundaries across X cuts).
+    - ``Y{i}_l`` and ``Y{i}_r``
+    - ``X{i}_l`` and ``X{i}_r``
 
-    Boundary keys on the grid (important)
-    -------------------------------------
-    Keys are stored as ``"{cut_tag}_{side}"`` (for example, ``Y0_l``).
-    The numeric part in the key is the *sweep step index*.
-
-    Consistent key rule for any cut tag ``T`` with axis length ``L``:
-    - left sweep:  ``T{i}_l -> T{i}``
-    - right sweep: ``T{i}_r -> T{L-1-i}``
-
-    Y-cut example (rows, ``Ly=4``):
-
-        Y3  o--o--o--o--o
-            |  |  |  |  |
-            =  =  =  =  =    <- Y0_r and Y3_l
-            |  |  |  |  |
-        Y2  o--o--o--o--o
-            |  |  |  |  |
-            =  =  =  =  =    <- Y1_r and Y2_l
-            |  |  |  |  |
-        Y1  o--o--o--o--o
-            |  |  |  |  |
-            =  =  =  =  =    <- Y2_r and Y0_l
-            |  |  |  |  |
-        Y0  o--o--o--o--o
-            X0 X1 X2 X3 X4
-            left keys: Y0_l, Y1_l, Y2_l
-
-    X-cut example (column cuts, ``Lx=5``):
-
-        Y3  o--|--o--|--o--|--o--|--o
-            |  |  |  |  |  |  |  |  |
-        Y2  o--|--o--|--o--|--o--|--o
-            |  |  |  |  |  |  |  |  |
-        Y1  o--|--o--|--o--|--o--|--o
-            |  |  |  |  |  |  |  |  |
-        Y0  o--|--o--|--o--|--o--|--o
-            X0    X1    X2    X3    X4
-             ^     ^     ^     ^
-             X0_l, X1_l, X2_l, X3_l
-
-        right mapping: X0_r -> X4, X1_r -> X3, X2_r -> X2, X3_r -> X1
+    where ``i`` is the sweep-step index.
 
     Parameters
     ----------
@@ -135,7 +81,7 @@ class BdyMPS:
             raise TypeError("to_backend must be callable or None")
 
         self.seed = seed
-        self.chi = chi
+        self._chi_target = int(chi)
         self.flat = flat
         self.to_backend = (lambda x: x) if to_backend is None else to_backend
         self.numpy_backend = make_numpy_array_caster(dtype="complex128")
@@ -144,16 +90,16 @@ class BdyMPS:
         if flat:
             if tn_flat is None:
                 raise ValueError("tn_flat is required when flat=True")
-            self.norm = tn_flat.copy()
+            self._tn_norm = tn_flat.copy()
             tn_ref = tn_flat
         else:
             if tn_double is None:
                 raise ValueError("tn_double is required when flat=False")
-            self.norm = tn_double.copy()
+            self._tn_norm = tn_double.copy()
             tn_ref = tn_flat if tn_flat is not None else tn_double
 
         # Validate that lattice dimensions can be resolved early.
-        self._infer_lattice_shape(tn_ref, self.norm)
+        self._infer_lattice_shape(tn_ref, self._tn_norm)
 
         self.mps_b = self._initialize_all_boundaries(single_layer=single_layer)
 
@@ -176,26 +122,127 @@ class BdyMPS:
     @property
     def ly(self):
         """Lattice size along the vertical axis."""
-        _, ly = self._infer_lattice_shape(None, self.norm)
+        _, ly = self._infer_lattice_shape(None, self._tn_norm)
         return ly
 
     @property
     def lx(self):
         """Lattice size along the horizontal axis."""
-        lx, _ = self._infer_lattice_shape(None, self.norm)
+        lx, _ = self._infer_lattice_shape(None, self._tn_norm)
         return lx
 
     @property
-    def avg_mps_norm(self):
+    def tn_norm(self):
+        """Return the internal tensor network used to build boundaries."""
+        return self._tn_norm
+
+    @property
+    def chi(self):
+        """Return the current largest bond dimension across all boundary MPS."""
+        if not getattr(self, "mps_b", None):
+            return int(self._chi_target)
+        return max(int(mps.max_bond()) for mps in self.mps_b.values())
+
+    @chi.setter
+    def chi(self, value):
+        if not isinstance(value, (int, np.integer)):
+            raise TypeError("chi must be an integer")
+        value = int(value)
+        if value < 1:
+            raise ValueError("chi must be >= 1")
+        self._chi_target = value
+
+    @property
+    def norm(self):
         """Return the mean of ``mps.norm()`` across all stored boundaries."""
         if not self.mps_b:
-            raise ValueError("No boundary MPS available to compute avg_mps_norm.")
+            raise ValueError("No boundary MPS available to compute norm.")
 
         norms = [mps.norm() for mps in self.mps_b.values()]
         total = norms[0]
         for value in norms[1:]:
             total = total + value
         return total / len(norms)
+
+    @property
+    def avg_mps_norm(self):
+        """Backward-compatible alias for :attr:`norm`."""
+        return self.norm
+
+    def expand_bnd(self, chi, rand_strength=0.0, inplace=True):
+        """Retune all stored boundary MPS bond dimensions to ``chi``.
+
+        Behavior per boundary MPS:
+
+        - if ``chi`` is larger than current ``max_bond()``, expand bonds
+          with ``expand_bond_dimension(..., rand_strength=rand_strength)`` and
+          re-canonicalize using ``left_canonicalize_(normalize=False)``
+          without truncation.
+        - if ``chi`` is smaller than current ``max_bond()``, compress with
+          ``compress("left", max_bond=chi)``.
+        - if equal, leave the boundary unchanged.
+
+        Parameters
+        ----------
+        chi : int
+            Target bond dimension.
+        rand_strength : float, default=0.0
+            Randomization strength used during bond expansion.
+        inplace : bool, default=True
+            If ``True``, update existing boundary MPS objects in place.
+            If ``False``, retune copies and replace ``self.mps_b``.
+
+        Returns
+        -------
+        BdyMPS
+            ``self`` for chaining.
+        """
+        if not isinstance(chi, (int, np.integer)):
+            raise TypeError("chi must be an integer")
+        chi = int(chi)
+        if chi < 1:
+            raise ValueError("chi must be >= 1")
+        if not self.mps_b:
+            raise ValueError("No boundary MPS available to retune.")
+
+        target = self.mps_b if inplace else {key: mps.copy() for key, mps in self.mps_b.items()}
+        for key, mps in target.items():
+            current_bond = int(mps.max_bond())
+            if chi > current_bond:
+                maybe_new = mps.expand_bond_dimension(
+                    chi,
+                    rand_strength=rand_strength,
+                    inplace=True,
+                )
+                tuned = mps if maybe_new is None else maybe_new
+                maybe_can = tuned.left_canonicalize_(normalize=False)
+                tuned = tuned if maybe_can is None else maybe_can
+                target[key] = tuned
+            elif chi < current_bond:
+                maybe_comp = mps.compress("left", max_bond=chi)
+                tuned = mps if maybe_comp is None else maybe_comp
+                target[key] = tuned
+
+        if not inplace:
+            self.mps_b = target
+        self._chi_target = chi
+        return self
+
+    def normalize(self):
+        """Normalize all stored boundary MPS in place.
+
+        Returns
+        -------
+        BdyMPS
+            ``self`` for chaining.
+        """
+        if not self.mps_b:
+            raise ValueError("No boundary MPS available to normalize.")
+
+        for mps in self.mps_b.values():
+            mps.normalize()
+
+        return self
 
     @staticmethod
     def _normalize_boundary_direction(direction):
@@ -635,7 +682,7 @@ class BdyMPS:
         mps.apply_to_arrays(self.numpy_backend)
         mps.randomize(seed=self.seed, inplace=True)
         mps.apply_to_arrays(self.to_backend)
-        mps.compress("left", max_bond=self.chi)
+        mps.compress("left", max_bond=self._chi_target)
         mps.normalize()
         return mps
 
@@ -701,7 +748,7 @@ class BdyMPS:
                 size=ind_sizes[reindex_map[f"k{pos}"]],
             )
             if pos < (mps_length - 1):
-                tensors[pos].new_bond(tensors[pos + 1], size=self.chi)
+                tensors[pos].new_bond(tensors[pos + 1], size=self._chi_target)
 
         mps = qtn.TensorNetwork(tensors)
         mps.reindex_(reindex_map)
@@ -733,7 +780,7 @@ class BdyMPS:
                 tensors[pos].new_ind(idx, size=size)
             tensors[pos].add_tag(site_tag_id.format(pos))
             if pos < (mps_length - 1):
-                tensors[pos].new_bond(tensors[pos + 1], size=self.chi)
+                tensors[pos].new_bond(tensors[pos + 1], size=self._chi_target)
 
         mps = qtn.TensorNetwork(tensors)
         mps.view_as_(
@@ -758,7 +805,7 @@ class BdyMPS:
         for step in range(length - 1):
             cut_pos = step if side == "left" else (length - 1 - step)
             key = f"{cut_tag_id.format(step)}_{suffix}"
-            tn = self.norm.select(cut_tag_id.format(cut_pos), "any").copy()
+            tn = self._tn_norm.select(cut_tag_id.format(cut_pos), "any").copy()
 
             if self.flat and step == 0:
                 boundaries[key] = self._flat_first_step_boundary(tn, site_tag_id)
@@ -791,7 +838,7 @@ class BdyMPS:
         for step in range(length - 1):
             cut_pos = step if side == "left" else (length - 1 - step)
             key = f"{cut_tag_id.format(step)}_{suffix}"
-            tn = self.norm.select(cut_tag_id.format(cut_pos), "any").copy()
+            tn = self._tn_norm.select(cut_tag_id.format(cut_pos), "any").copy()
 
             if self.flat and step == 0:
                 boundaries[key] = self._flat_first_step_boundary(tn, site_tag_id)
