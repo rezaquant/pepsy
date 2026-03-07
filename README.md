@@ -13,6 +13,7 @@ Current package version: `0.0.1` (from `pepsy/VERSION`).
   - `boundary_norm.py`: input preparation + contraction (`prepare_boundary_inputs`, `ContractBoundary`)
   - `dmrg_fit.py`, `core.py`, `linalg_registrations.py`
 - `example/`: example notebooks
+- `docs/`: Sphinx documentation source
 - `tests/`: package tests
 
 ## Install
@@ -33,6 +34,25 @@ from pepsy import BdyMPS, CompBdy, ContractBoundary, prepare_boundary_inputs
 
 print(pepsy.__version__)
 ```
+
+## Documentation
+Build docs locally:
+
+```bash
+pip install -e .[docs]
+sphinx-build -W -b html docs docs/_build/html
+```
+
+Main docs sections:
+
+- `getting_started`
+- `tutorials/`
+- `howto/`
+- `api/`
+
+Guided notebook example:
+
+- `example/norm.ipynb`
 
 ## Notes
 - `.gitattributes` marks notebooks as binary to avoid noisy diffs.

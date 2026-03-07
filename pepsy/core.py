@@ -130,7 +130,7 @@ copt_ = build_compressed_optimizer
 
 
 def fidel_mps(psi, psi_fix):
-    """Compute normalized MPS fidelity |<psi|psi_fix>|^2/(||psi||^2||psi_fix||^2)."""
+    """Compute normalized MPS overlap fidelity."""
     opt: Any = build_optimizer(progbar=False)
     val_0 = abs((psi.H & psi).contract(all, optimize=opt))
     val_1 = abs((psi.H & psi_fix).contract(all, optimize=opt))

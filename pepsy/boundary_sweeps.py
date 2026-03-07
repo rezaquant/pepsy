@@ -46,7 +46,14 @@ def max_tag_number(tags, tag_format):
 
 
 class CompBdy:  # pylint: disable=too-many-instance-attributes
-    """Boundary MPS fitting driver used for y/x contraction sweeps."""
+    """Boundary MPS fitting driver for x/y contraction sweeps.
+
+    Notes
+    -----
+    - This class mutates ``self.mps_boundaries`` when ``re_update=True``.
+    - Per-step fidelity values are exposed via ``self.fidel`` and reset at
+      the start of each :meth:`run` call.
+    """
 
     def __init__(
         self,
@@ -94,6 +101,15 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.Ly = 1 + max_y  # pylint: disable=invalid-name
         self.Lx = 1 + max_x  # pylint: disable=invalid-name
         self._update_separation()
+
+    @property
+    def fidelity(self):
+        """Alias for ``self.fidel``."""
+        return self.fidel
+
+    def _reset_fidelity_history(self):
+        """Reset stored fidelity values for a fresh public call."""
+        self.fidel = []
 
     @staticmethod
     def _direction_base(direction):
@@ -417,9 +433,41 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         eq_norms=True,
         direction="y",
     ):  # pylint: disable=too-many-arguments,too-many-locals
-        """Run two-sided boundary sweeps and contract the final network."""
+        """Run two-sided boundary sweeps and contract the final network.
+
+        Parameters
+        ----------
+        re_update : bool, default=True
+            Write fitted boundary MPS values back to ``self.mps_boundaries``.
+        max_separation : int, default=0
+            Separation mode (currently ``0`` or ``1``).
+        mps_boundaries : dict | None, default=None
+            Optional replacement boundary dictionary for this call.
+        re_tag : bool, default=False
+            Forwarded to fit backend.
+        visual_ : bool, default=False
+            Enable intermediate tensor-network drawings.
+        flat : bool, default=False
+            Skip first-step fitting and use raw slice directly.
+        fidel_ : bool, default=False
+            If ``True``, compute and store per-step fidelity values in
+            ``self.fidel``.
+        pbar : bool, default=False
+            Show progress bar.
+        n_iter : int, default=4
+            Number of local fit iterations for each step.
+        eq_norms : bool, default=True
+            Forwarded normalization option for fitted MPS tensors.
+        direction : str, default="y"
+            Sweep selector.
+
+        Returns
+        -------
+        complex | float
+            Final contracted scalar.
+        """
         # Fidelity history is run-local and resets for each run() call.
-        self.fidel = []
+        self._reset_fidelity_history()
         self.max_separation = max_separation
         self._update_separation()
         self._warned_flat_initial_slice = False
@@ -478,6 +526,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         direction="y_left",
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Sweep and update stored boundary MPSs for a selected side/direction."""
+        self._reset_fidelity_history()
         self._warned_flat_initial_slice = False
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,
@@ -538,6 +587,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         direction="y_left",
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Fit and update one boundary step at position ``pos``."""
+        self._reset_fidelity_history()
         self._warned_flat_initial_slice = False
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,

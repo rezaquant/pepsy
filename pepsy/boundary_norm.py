@@ -20,17 +20,17 @@ __all__ = [
 
 @dataclass(frozen=True)
 class BoundaryContractResult:
-    """Structured boundary-contraction output with optional fidelity history."""
+    """Structured output for :func:`ContractBoundary`."""
 
     cost: complex | float
-    fidel: list
+    fidel: list[float]
     direction: str
     n_iter: int
     max_separation: int
 
 
 def _validate_tensor_network_tags(p):
-    """Validate lattice tags."""
+    """Ensure PEPS lattice tags are present for shape inference."""
     tags = set(getattr(p, "tags", ()))
 
     if not any(_TAG_X.match(tag) for tag in tags) or not any(_TAG_Y.match(tag) for tag in tags):
@@ -38,9 +38,10 @@ def _validate_tensor_network_tags(p):
 
 
 def _normalize_retag_for_direction(direction, re_tag):
-    """Normalize ``re_tag`` for sweep calls."""
+    """Normalize ``re_tag`` flag for direction-specific calls."""
     _ = direction
     return bool(re_tag)
+
 
 
 def prepare_boundary_inputs(
@@ -123,18 +124,46 @@ def ContractBoundary(
     max_separation=0,
     direction="y",
     eq_norms=False,
-    return_info=False,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,invalid-name
     """Compute tensor-network norm via boundary sweeps.
 
-    This function expects a prebuilt double-layer ``norm`` network and a
-    boundary-state dictionary ``mps_boundaries``.
+    Parameters
+    ----------
+    norm : qtn.TensorNetwork
+        Prebuilt double-layer network, usually from
+        :func:`prepare_boundary_inputs`.
+    mps_boundaries : dict[str, qtn.MatrixProductState]
+        Boundary dictionary, usually from :class:`pepsy.boundary_states.BdyMPS`.
+    opt : str | object, default="auto-hq"
+        Contraction optimizer passed through to :class:`pepsy.boundary_sweeps.CompBdy`.
+    flat : bool, default=False
+        Forwarded to sweep backend.
+    dmrg_run : {"eff", "global"}, default="eff"
+        Fit backend mode.
+    n_iter : int, default=2
+        Number of local fit iterations per step.
+    re_tag : bool, default=True
+        Forwarded to fitting backend.
+    pbar : bool, default=True
+        Show progress bars.
+    fidel_ : bool, default=False
+        If ``True``, collect per-step fidelity values in ``result.fidel``.
+    visual_ : bool, default=False
+        Enable intermediate visualization in fitting backend.
+    re_update : bool, default=True
+        Whether to write fitted boundaries back into ``mps_boundaries``.
+    max_separation : int, default=0
+        Sweep separation mode.
+    direction : str, default="y"
+        Sweep selector.
+    eq_norms : bool, default=False
+        Forwarded normalization option for local fit outputs.
 
     Returns
     -------
-    complex | float | BoundaryContractResult
-        Boundary contraction cost scalar, or structured result when
-        ``return_info=True``.
+    BoundaryContractResult
+        Structured boundary contraction result including ``cost`` and
+        fidelity history ``fidel``.
     """
     if norm is None:
         raise ValueError("norm must not be None.")
@@ -163,8 +192,7 @@ def ContractBoundary(
         direction=direction,
         eq_norms=eq_norms,
     )
-    if not return_info:
-        return cost
+ 
 
     return BoundaryContractResult(
         cost=cost,

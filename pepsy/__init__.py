@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from .version import __version__
 
 if TYPE_CHECKING:
-    from . import boundary_norm, boundary_states, boundary_sweeps
+    from . import boundary_norm, boundary_states, boundary_sweeps, core, dmrg_fit
     from .boundary_norm import BoundaryContractResult, ContractBoundary, prepare_boundary_inputs
     from .boundary_states import BdyMPS, make_numpy_array_caster
     from .boundary_sweeps import CompBdy
@@ -22,12 +22,14 @@ __all__ = [
     "boundary_norm",
     "boundary_states",
     "boundary_sweeps",
+    "core",
+    "dmrg_fit",
 ]
 
 
 def __getattr__(name):
     """Lazily import public API symbols and common submodules."""
-    if name in ("boundary_norm", "boundary_states", "boundary_sweeps"):
+    if name in ("boundary_norm", "boundary_states", "boundary_sweeps", "core", "dmrg_fit"):
         return import_module(f".{name}", __name__)
 
     if name in ("ContractBoundary", "prepare_boundary_inputs", "BoundaryContractResult"):

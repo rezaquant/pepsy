@@ -1,0 +1,62 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pepsy icon">
+  <defs>
+    <linearGradient id="bg" x1="64" y1="64" x2="448" y2="448" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0EA5A4"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="cut" x1="138" y1="370" x2="370" y2="138" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#F97316"/>
+    </linearGradient>
+    <filter id="shadow" x="0" y="0" width="512" height="512" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <rect x="48" y="48" width="416" height="416" rx="96" fill="url(#bg)" filter="url(#shadow)"/>
+
+  <!-- 4x4 tensor grid links -->
+  <g stroke="white" stroke-opacity="0.45" stroke-width="10" stroke-linecap="round">
+    <line x1="140" y1="140" x2="372" y2="140"/>
+    <line x1="140" y1="218" x2="372" y2="218"/>
+    <line x1="140" y1="294" x2="372" y2="294"/>
+    <line x1="140" y1="372" x2="372" y2="372"/>
+
+    <line x1="140" y1="140" x2="140" y2="372"/>
+    <line x1="218" y1="140" x2="218" y2="372"/>
+    <line x1="294" y1="140" x2="294" y2="372"/>
+    <line x1="372" y1="140" x2="372" y2="372"/>
+  </g>
+
+  <!-- diagonal contraction/cut mark -->
+  <line x1="132" y1="380" x2="380" y2="132" stroke="url(#cut)" stroke-width="18" stroke-linecap="round"/>
+
+  <!-- tensor nodes -->
+  <g fill="white">
+    <circle cx="140" cy="140" r="12"/>
+    <circle cx="218" cy="140" r="12"/>
+    <circle cx="294" cy="140" r="12"/>
+    <circle cx="372" cy="140" r="12"/>
+
+    <circle cx="140" cy="218" r="12"/>
+    <circle cx="218" cy="218" r="12"/>
+    <circle cx="294" cy="218" r="12"/>
+    <circle cx="372" cy="218" r="12"/>
+
+    <circle cx="140" cy="294" r="12"/>
+    <circle cx="218" cy="294" r="12"/>
+    <circle cx="294" cy="294" r="12"/>
+    <circle cx="372" cy="294" r="12"/>
+
+    <circle cx="140" cy="372" r="12"/>
+    <circle cx="218" cy="372" r="12"/>
+    <circle cx="294" cy="372" r="12"/>
+    <circle cx="372" cy="372" r="12"/>
+  </g>
+
+  <!-- emphasis node -->
+  <circle cx="294" cy="218" r="16" fill="#FBBF24"/>
+
+  <!-- wordmark -->
+  <text x="256" y="436" text-anchor="middle" font-family="Verdana, DejaVu Sans, sans-serif" font-size="44" font-weight="700" fill="white" letter-spacing="2">pepsy</text>
+</svg>
