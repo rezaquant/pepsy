@@ -76,3 +76,107 @@ def test_bdymps_avg_mps_norm_matches_manual_mean():
     values = list(bdy.mps_b.values())
     manual_avg = sum(mps.norm() for mps in values) / len(values)
     assert bdy.avg_mps_norm == manual_avg
+
+
+def test_compbdy_fidelity_history_resets_each_run(monkeypatch):
+    """CompBdy.run should rebuild self.fidel per run when fidel_=True."""
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=23, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.prepare_boundary_inputs(ket=ket)
+    bdy = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_tagged,
+        chi=8,
+        single_layer=False,
+    )
+    comp = pepsy.CompBdy(norm_tagged, bdy.mps_b)
+
+    monkeypatch.setattr(pepsy.boundary_sweeps, "fidel_mps", lambda _tn, _p: 0.5)
+    monkeypatch.setattr(
+        pepsy.boundary_sweeps.CompBdy,
+        "_run_fit_solver",
+        lambda self, fit, boundary_mps: None,
+    )
+
+    comp.run(direction="y", fidel_=True, pbar=False, n_iter=1, max_separation=0)
+    assert comp.fidel == [0.5, 0.5]
+
+    comp.fidel.append(9.0)
+    comp.run(direction="y", fidel_=True, pbar=False, n_iter=1, max_separation=0)
+    assert comp.fidel == [0.5, 0.5]
+
+
+def test_compbdy_run_eff_does_not_use_fit_verbose_fidelity(monkeypatch):
+    """CompBdy should keep FIT.run_eff verbose=False even when fidel_=True."""
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=29, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.prepare_boundary_inputs(ket=ket)
+    bdy = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_tagged,
+        chi=8,
+        single_layer=False,
+    )
+    comp = pepsy.CompBdy(norm_tagged, bdy.mps_b, dmrg_run="eff")
+
+    run_eff_verbose_args = []
+
+    def fake_run_eff(self, n_iter=6, verbose=False):
+        run_eff_verbose_args.append(verbose)
+
+    monkeypatch.setattr(pepsy.boundary_sweeps.FIT, "run_eff", fake_run_eff)
+    monkeypatch.setattr(pepsy.boundary_sweeps, "fidel_mps", lambda _tn, _p: 0.5)
+
+    comp.run(direction="y", fidel_=True, pbar=False, n_iter=1, max_separation=0)
+
+    assert run_eff_verbose_args
+    assert all(arg is False for arg in run_eff_verbose_args)
+    assert comp.fidel == [0.5, 0.5]
+
+
+class _DummyNorm:
+    """Minimal norm-like object with copy() for ContractBoundary tests."""
+
+    def copy(self):
+        return self
+
+
+def test_contract_boundary_default_returns_cost(monkeypatch):
+    """ContractBoundary should keep scalar return by default."""
+
+    class _FakeCompBdy:
+        def __init__(self, *_args, **_kwargs):
+            self.fidel = [0.3, 0.4]
+
+        def run(self, **_kwargs):
+            return 12.5
+
+    monkeypatch.setattr(pepsy.boundary_norm, "CompBdy", _FakeCompBdy)
+    out = pepsy.ContractBoundary(norm=_DummyNorm(), mps_boundaries={})
+    assert out == 12.5
+
+
+def test_contract_boundary_return_info_includes_fidelity(monkeypatch):
+    """ContractBoundary return_info=True should return structured fidelity history."""
+
+    class _FakeCompBdy:
+        def __init__(self, *_args, **_kwargs):
+            self.fidel = [0.3, 0.4]
+
+        def run(self, **_kwargs):
+            return 12.5
+
+    monkeypatch.setattr(pepsy.boundary_norm, "CompBdy", _FakeCompBdy)
+    out = pepsy.ContractBoundary(
+        norm=_DummyNorm(),
+        mps_boundaries={},
+        direction="x",
+        n_iter=3,
+        max_separation=1,
+        return_info=True,
+    )
+
+    assert isinstance(out, pepsy.BoundaryContractResult)
+    assert out.cost == 12.5
+    assert out.fidel == [0.3, 0.4]
+    assert out.direction == "x"
+    assert out.n_iter == 3
+    assert out.max_separation == 1

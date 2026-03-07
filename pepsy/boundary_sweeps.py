@@ -4,6 +4,7 @@ import logging
 import re
 from dataclasses import dataclass
 
+import numpy as np
 from tqdm import tqdm
 
 from .boundary_states import BdyMPS
@@ -71,6 +72,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.re_tag = False
         self.visual_ = False
         self.fidel_ = False
+        self.fidel = []
         self.pbar = False
         self.max_separation = 0
         self.direction = "y"
@@ -208,7 +210,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
     def _run_fit_solver(self, fit, boundary_mps):
         """Run selected fitting backend with explicit validation."""
-        verbose = bool(self.fidel_)
+        # Fidelity is tracked externally by CompBdy via self.fidel.
+        verbose = False
         if boundary_mps.L == 1:
             fit.run(n_iter=self.n_iter, verbose=verbose)
             return
@@ -259,7 +262,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         site_tag_id,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         """Sweep one side boundary for ``steps`` and fit at each position."""
-        fidelity = -1.0
         previous = None
 
         for step_idx in range(steps):
@@ -304,12 +306,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
             if self.eq_norms:
                 fit.p.equalize_norms_(value=self.eq_norms)
-            if self.pbar and self.fidel_:
+            if self.fidel_:
                 fidelity = fidel_mps(tn, fit.p)
+                self.fidel.append(fidelity)
 
             if progress_bar is not None:
                 if self.fidel_:
-                    progress_bar.set_postfix({"F": complex(fidelity).real})
+                    prod_fidelity = np.prod(self.fidel)
+                    progress_bar.set_postfix({"F": complex(prod_fidelity).real})
                     progress_bar.refresh()
                 progress_bar.update(1)
 
@@ -371,7 +375,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         if self.eq_norms:
             fit.p.equalize_norms_(value=self.eq_norms)
         if self.fidel_:
-            _ = fidel_mps(tn, fit.p)
+            fidelity = fidel_mps(tn, fit.p)
+            self.fidel.append(fidelity)
 
         previous = fit.p
         if self.re_update:
@@ -413,6 +418,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         direction="y",
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Run two-sided boundary sweeps and contract the final network."""
+        # Fidelity history is run-local and resets for each run() call.
+        self.fidel = []
         self.max_separation = max_separation
         self._update_separation()
         self._warned_flat_initial_slice = False

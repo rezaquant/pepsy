@@ -4,7 +4,7 @@
 
 `pepsy` is a Python package for boundary-MPS based PEPS norm contraction and related DMRG fitting workflows.
 
-Current package version: `0.0.0` (from `pepsy/VERSION`).
+Current package version: `0.0.1` (from `pepsy/VERSION`).
 
 ## Package Layout
 - `pepsy/`: installable library code

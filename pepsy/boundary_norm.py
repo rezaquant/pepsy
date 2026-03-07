@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from .boundary_sweeps import CompBdy
 
@@ -12,8 +13,20 @@ _TAG_Y = re.compile(r"^Y\d+$")
 
 __all__ = [
     "prepare_boundary_inputs",
+    "BoundaryContractResult",
     "ContractBoundary",
 ]
+
+
+@dataclass(frozen=True)
+class BoundaryContractResult:
+    """Structured boundary-contraction output with optional fidelity history."""
+
+    cost: complex | float
+    fidel: list
+    direction: str
+    n_iter: int
+    max_separation: int
 
 
 def _validate_tensor_network_tags(p):
@@ -110,6 +123,7 @@ def ContractBoundary(
     max_separation=0,
     direction="y",
     eq_norms=False,
+    return_info=False,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,invalid-name
     """Compute tensor-network norm via boundary sweeps.
 
@@ -118,8 +132,9 @@ def ContractBoundary(
 
     Returns
     -------
-    complex | float
-        Boundary contraction cost scalar.
+    complex | float | BoundaryContractResult
+        Boundary contraction cost scalar, or structured result when
+        ``return_info=True``.
     """
     if norm is None:
         raise ValueError("norm must not be None.")
@@ -148,4 +163,13 @@ def ContractBoundary(
         direction=direction,
         eq_norms=eq_norms,
     )
-    return cost
+    if not return_info:
+        return cost
+
+    return BoundaryContractResult(
+        cost=cost,
+        fidel=list(comp_bdy.fidel),
+        direction=direction,
+        n_iter=n_iter,
+        max_separation=max_separation,
+    )
