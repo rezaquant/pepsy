@@ -41,11 +41,19 @@ html_static_path = ["_static"]
 html_css_files = ["custom.css"]
 html_title = f"pepsy {version}"
 html_logo = "_static/pepsy-icon.svg"
+html_sidebars = {
+    "**": ["search-field", "sidebar-nav-bs"],
+}
 
 html_theme_options = {
+    "navbar_align": "left",
+    "collapse_navigation": False,
+    "navigation_depth": 4,
+    "show_nav_level": 2,
     "show_toc_level": 2,
     "navigation_with_keys": True,
     "show_prev_next": False,
+    "secondary_sidebar_items": [],
     "icon_links": [
         {
             "name": "GitHub",

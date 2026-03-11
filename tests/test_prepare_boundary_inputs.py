@@ -62,6 +62,24 @@ def test_bdymps_initializes_xy_boundaries():
     assert all(key[0] in {"X", "Y"} for key in keys)
 
 
+def test_bdymps_flat_overrides_single_layer_with_warning():
+    """flat=True should warn and force single_layer=False."""
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=18, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.prepare_boundary_inputs(ket=ket)
+
+    with pytest.warns(UserWarning, match="flat=True is incompatible"):
+        bdy = pepsy.BdyMPS(
+            tn_flat=ket_tagged,
+            tn_double=norm_tagged,
+            chi=8,
+            single_layer=True,
+            flat=True,
+        )
+
+    assert bdy.flat is True
+    assert bdy.mps_b
+
+
 def test_bdymps_norm_matches_manual_mean():
     """norm should equal manual mean over all boundary MPS norms."""
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=19, dtype="complex128")
@@ -356,7 +374,225 @@ def test_compbdy_move_step_resets_and_updates_fidelity(monkeypatch):
     assert comp.fidel == [0.77]
     assert comp.fidelity == [0.77]
 
-    comp.fidel.append(9.0)
-    comp.move_step_bdy(pos=0, direction="y_left", fidel_=True)
-    assert comp.fidel == [0.77]
-    assert comp.fidelity == [0.77]
+
+class _DummyNormWithTags:
+    """Minimal norm-like object exposing X/Y tags for CompBdy init."""
+
+    tags = {"X0", "X1", "X2", "Y0", "Y1", "Y2"}
+
+
+class _DummyFinalTN:
+    """Minimal contractable object for patched CompBdy.run tests."""
+
+    @staticmethod
+    def contract(*_args, **_kwargs):
+        return 1.0, 0
+
+
+class _FakeTqdm:
+    """Capture tqdm totals/updates without terminal output."""
+
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        _ = args
+        self.total = kwargs.get("total")
+        self.n = 0
+        self.postfix_calls = []
+        _FakeTqdm.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _ = (exc_type, exc, tb)
+        return False
+
+    def set_postfix(self, *args, **kwargs):
+        if args:
+            self.postfix_calls.append(dict(args[0]))
+        elif kwargs:
+            self.postfix_calls.append(dict(kwargs))
+        return None
+
+    def refresh(self):
+        return None
+
+    def update(self, n=1):
+        self.n += n
+
+
+def _fake_fit_one_side_with_flat_skip(self, _side, steps, progress_bar, _cut_tag_id, _site_tag_id):
+    """Mimic update-count behavior of _fit_one_side for progress accounting tests."""
+    for step_idx in range(steps):
+        if step_idx == 0 and self.flat:
+            continue
+        if progress_bar is not None:
+            progress_bar.update(1)
+    return None
+
+
+def test_compbdy_run_progress_total_accounts_for_flat_skip(monkeypatch):
+    """run() tqdm total should match actual fit updates when flat=True."""
+    comp = pepsy.CompBdy(_DummyNormWithTags(), {})
+    _FakeTqdm.instances = []
+
+    monkeypatch.setattr(pepsy.boundary_sweeps, "tqdm", _FakeTqdm)
+    monkeypatch.setattr(
+        pepsy.boundary_sweeps.CompBdy,
+        "_fit_one_side",
+        _fake_fit_one_side_with_flat_skip,
+    )
+    monkeypatch.setattr(
+        pepsy.boundary_sweeps.CompBdy,
+        "_build_final_boundary_network",
+        lambda self, spec, p_previous_l, p_previous_r: _DummyFinalTN(),
+    )
+
+    _ = comp.run(direction="y", flat=True, pbar=True, max_separation=0)
+
+    # Ly=3 -> y_left=1, y_right=2 at max_separation=0 => effective updates: 0 + 1 = 1.
+    assert _FakeTqdm.instances
+    pbar = _FakeTqdm.instances[-1]
+    assert pbar.total == 1
+    assert pbar.n == 1
+
+
+def test_compbdy_move_bdy_progress_total_accounts_for_flat_skip(monkeypatch):
+    """move_bdy() tqdm total should match actual fit updates when flat=True."""
+    comp = pepsy.CompBdy(_DummyNormWithTags(), {})
+    _FakeTqdm.instances = []
+
+    monkeypatch.setattr(pepsy.boundary_sweeps, "tqdm", _FakeTqdm)
+    monkeypatch.setattr(
+        pepsy.boundary_sweeps.CompBdy,
+        "_fit_one_side",
+        _fake_fit_one_side_with_flat_skip,
+    )
+
+    comp.move_bdy(direction="y_left", flat=True, pbar=True)
+
+    # Ly=3 -> n_steps=Ly-1=2, flat skip removes first fit update => total 1.
+    assert _FakeTqdm.instances
+    pbar = _FakeTqdm.instances[-1]
+    assert pbar.total == 1
+    assert pbar.n == 1
+
+
+def test_compbdy_move_step_pbar_shows_current_fidelity(monkeypatch):
+    """move_step_bdy should expose current step fidelity and chi in tqdm postfix."""
+    comp = pepsy.CompBdy(_DummyNormWithTags(), {})
+    _FakeTqdm.instances = []
+
+    class _DummyMPS:
+        @staticmethod
+        def max_bond():
+            return 13
+
+    def fake_fit_one_step(self, side, step_, cut_tag_id, site_tag_id):
+        _ = (side, step_, cut_tag_id, site_tag_id)
+        if self.fidel_:
+            self.fidel.append(0.77)
+        return _DummyMPS()
+
+    monkeypatch.setattr(pepsy.boundary_sweeps, "tqdm", _FakeTqdm)
+    monkeypatch.setattr(pepsy.boundary_sweeps.CompBdy, "_fit_one_step", fake_fit_one_step)
+
+    comp.move_step_bdy(pos=1, direction="y_left", fidel_=True, pbar=True)
+
+    assert _FakeTqdm.instances
+    pbar = _FakeTqdm.instances[-1]
+    assert pbar.total == 1
+    assert pbar.n == 1
+    assert pbar.postfix_calls
+    last = pbar.postfix_calls[-1]
+    assert last["pos"] == 1
+    assert last["chi"] == 13
+    assert abs(last["F"] - 0.77) < 1e-12
+
+
+def test_normalize_returns_dict_with_boundary_and_contract_result(monkeypatch):
+    """normalize should return state/cost and include built boundary object."""
+    captured = {}
+
+    class _FakeBdy:
+        def __init__(self):
+            self.mps_b = {"Y0_l": object()}
+
+    def fake_bdymps(**kwargs):
+        captured["bdy_kwargs"] = kwargs
+        return _FakeBdy()
+
+    def fake_contract_boundary(**kwargs):
+        captured["contract_kwargs"] = kwargs
+        return pepsy.BoundaryContractResult(
+            cost=4.0,
+            fidel=[],
+            direction=kwargs["direction"],
+            n_iter=kwargs["n_iter"],
+            max_separation=kwargs["max_separation"],
+        )
+
+    monkeypatch.setattr(pepsy.boundary_states, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary_norm, "ContractBoundary", fake_contract_boundary)
+
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=131, dtype="complex128")
+    out = pepsy.normalize(
+        ket,
+        chi=8,
+        n_iter=1,
+        pbar=False,
+    )
+
+    assert set(out) == {"state", "cost", "cost_scalar", "bdy", "contract_result"}
+    assert out["cost"] == 4.0
+    assert out["cost_scalar"] == 4.0 + 0.0j
+    assert out["bdy"].mps_b is captured["contract_kwargs"]["mps_boundaries"]
+    assert isinstance(out["contract_result"], pepsy.BoundaryContractResult)
+    assert "tn_double" in captured["bdy_kwargs"]
+
+
+def test_normalize_uses_provided_bdy_without_constructing_new_one(monkeypatch):
+    """normalize should reuse provided bdy and skip BdyMPS construction."""
+    class _ProvidedBdy:
+        def __init__(self):
+            self.mps_b = {"Y0_l": object()}
+
+    provided = _ProvidedBdy()
+    captured = {}
+
+    def fail_bdymps(**kwargs):
+        _ = kwargs
+        raise AssertionError("BdyMPS constructor should not be called when bdy is provided.")
+
+    def fake_contract_boundary(**kwargs):
+        captured["contract_kwargs"] = kwargs
+        return pepsy.BoundaryContractResult(
+            cost=9.0,
+            fidel=[],
+            direction=kwargs["direction"],
+            n_iter=kwargs["n_iter"],
+            max_separation=kwargs["max_separation"],
+        )
+
+    monkeypatch.setattr(pepsy.boundary_states, "BdyMPS", fail_bdymps)
+    monkeypatch.setattr(pepsy.boundary_norm, "ContractBoundary", fake_contract_boundary)
+
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=137, dtype="complex128")
+    out = pepsy.normalize(
+        ket,
+        bdy=provided,
+        n_iter=1,
+        pbar=False,
+    )
+
+    assert out["bdy"] is provided
+    assert captured["contract_kwargs"]["mps_boundaries"] is provided.mps_b
+    assert out["cost"] == 9.0
+
+
+def test_normalize_requires_chi_when_bdy_not_provided():
+    """normalize should require chi if caller does not pass bdy."""
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=139, dtype="complex128")
+    with pytest.raises(ValueError, match="Provide chi when bdy is not supplied."):
+        pepsy.normalize(ket)

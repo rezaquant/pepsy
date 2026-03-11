@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass
 
+from .boundary_states import BdyMPS
 from .boundary_sweeps import CompBdy
+from .core import get_default_array_backend
 
 
 _TAG_X = re.compile(r"^X\d+$")
 _TAG_Y = re.compile(r"^Y\d+$")
+_PHYS_OUTER = re.compile(r"^k\d+(?:,\d+)*$")
 
 __all__ = [
     "prepare_boundary_inputs",
     "BoundaryContractResult",
     "ContractBoundary",
+    "normalize",
 ]
 
 
@@ -43,6 +48,22 @@ def _normalize_retag_for_direction(direction, re_tag):
     return bool(re_tag)
 
 
+def _warn_nonstandard_physical_outer_inds(tn, role):
+    """Warn when outer physical indices don't match ``k<int>[,<int>...]``."""
+    bad = [
+        idx
+        for idx in tn.outer_inds()
+        if not (isinstance(idx, str) and _PHYS_OUTER.fullmatch(idx))
+    ]
+    if bad:
+        sample = ", ".join(sorted(bad)[:8])
+        warnings.warn(
+            f"{role} outer indices expected format k<int>[,<int>...]. "
+            f"Found non-matching indices: {sample}",
+            stacklevel=3,
+        )
+
+
 
 def prepare_boundary_inputs(
     ket=None,
@@ -65,6 +86,9 @@ def prepare_boundary_inputs(
 
     Notes
     -----
+    ``ket`` is tagged in-place (no copy). The returned ``ket_tagged`` is the same
+    object as ``ket``.
+
     When ``bra`` is ``None``: shared internal ket/bra indices are renamed on the
     auto-generated bra side as ``<original>_*``.
 
@@ -76,7 +100,7 @@ def prepare_boundary_inputs(
 
     _validate_tensor_network_tags(ket)
 
-    ket_tagged = ket.copy()
+    ket_tagged = ket
     auto_bra = bra is None
     bra_tagged = ket.copy().conj() if auto_bra else bra.copy().conj()
 
@@ -101,6 +125,10 @@ def prepare_boundary_inputs(
                 "Provided bra must have internal index names disjoint from ket. "
                 f"Internal collisions found: {sample}"
             )
+
+    _warn_nonstandard_physical_outer_inds(ket_tagged, "ket")
+    if not auto_bra:
+        _warn_nonstandard_physical_outer_inds(bra_tagged, "bra")
 
     ket_tagged.add_tag("KET")
     bra_tagged.add_tag("BRA")
@@ -201,3 +229,113 @@ def ContractBoundary(
         n_iter=n_iter,
         max_separation=max_separation,
     )
+
+
+def normalize(
+    p,
+    *,
+    chi=None,
+    bdy=None,
+    opt="auto-hq",
+    n_iter=5,
+    direction="y",
+    max_separation=0,
+    pbar=False,
+    fidel_=False,
+    dmrg_run="eff",
+    single_layer=False,
+    to_backend=None,
+):
+    """Normalize a PEPS state with boundary contraction.
+
+    This performs:
+    ``prepare_boundary_inputs -> BdyMPS -> ContractBoundary`` and returns a
+    dictionary containing normalized state, cost, and boundary objects.
+
+    Parameters
+    ----------
+    p : qtn.TensorNetwork
+        Input PEPS state.
+    chi : int | None, default=None
+        Boundary MPS bond dimension used when ``bdy`` is not provided.
+    bdy : pepsy.boundary_states.BdyMPS | None, default=None
+        Pre-built boundary object. If provided, ``normalize`` reuses it and
+        skips creating a new :class:`pepsy.boundary_states.BdyMPS`.
+    opt : str | object, default="auto-hq"
+        Contraction optimizer.
+    n_iter : int, default=5
+        Number of local fit iterations per boundary step.
+    direction : str, default="y"
+        Sweep direction passed to :func:`ContractBoundary`.
+    max_separation : int, default=0
+        Sweep separation mode.
+    pbar : bool, default=False
+        Show progress bar.
+    fidel_ : bool, default=False
+        Track fidelity history during boundary contraction.
+    dmrg_run : {"eff", "global"}, default="eff"
+        Boundary fitting backend mode.
+    single_layer : bool, default=False
+        Boundary initializer mode for :class:`pepsy.boundary_states.BdyMPS`.
+    to_backend : callable | None, default=None
+        Optional array caster applied to the double-layer norm network. If
+        ``None``, uses :func:`pepsy.core.get_default_array_backend` when set.
+
+    Returns
+    -------
+    dict[str, object]
+        Dictionary with:
+
+        - ``state``: normalized PEPS state
+        - ``cost``: raw boundary contraction cost
+        - ``cost_scalar``: scalar used for normalization
+        - ``bdy``: constructed :class:`pepsy.boundary_states.BdyMPS`
+        - ``contract_result``: :class:`BoundaryContractResult`
+    """
+    if p is None:
+        raise ValueError("p must not be None.")
+
+    ket_tagged, norm_tagged = prepare_boundary_inputs(ket=p, bra=None)
+    backend = to_backend if to_backend is not None else get_default_array_backend()
+    if backend is not None:
+        norm_tagged.apply_to_arrays(backend)
+
+    if bdy is None:
+        if chi is None:
+            raise ValueError("Provide chi when bdy is not supplied.")
+
+        bdy = BdyMPS(
+            tn_double=norm_tagged,
+            chi=chi,
+            single_layer=single_layer,
+            to_backend=backend,
+        )
+    elif not hasattr(bdy, "mps_b"):
+        raise TypeError("bdy must expose attribute 'mps_b'.")
+
+    result = ContractBoundary(
+        norm=norm_tagged,
+        mps_boundaries=bdy.mps_b,
+        opt=opt,
+        dmrg_run=dmrg_run,
+        n_iter=n_iter,
+        pbar=pbar,
+        direction=direction,
+        max_separation=max_separation,
+        fidel_=fidel_,
+    )
+    cost = result.cost
+    try:
+        cost_scalar = complex(cost)
+    except TypeError:
+        cost_scalar = cost
+
+    if abs(cost_scalar) == 0:
+        raise ZeroDivisionError("Boundary norm cost is zero; cannot normalize state.")
+    return {
+        "state": ket_tagged / (cost_scalar**0.5),
+        "cost": cost,
+        "cost_scalar": cost_scalar,
+        "bdy": bdy,
+        "contract_result": result,
+    }

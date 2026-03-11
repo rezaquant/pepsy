@@ -1,8 +1,57 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,500;8..60,700&family=JetBrains+Mono:wght@400;500&display=swap");
+
 :root {
   --pst-color-primary: #0b6e4f;
   --pst-color-secondary: #094f3b;
   --pst-color-link: #0b6e4f;
   --pst-color-inline-code: #4b2e83;
+  --pepsy-font-sans: "IBM Plex Sans", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --pepsy-font-serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --pepsy-font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+body {
+  font-family: var(--pepsy-font-sans);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--pepsy-font-serif);
+  letter-spacing: 0.01em;
+}
+
+code, pre, kbd, samp {
+  font-family: var(--pepsy-font-mono);
+}
+
+.bd-page-width {
+  max-width: 1700px;
+}
+
+.bd-sidebar-primary {
+  border-right: 1px solid #d9e8e1;
+  background: linear-gradient(180deg, #f8fcfa 0%, #edf6f1 100%);
+}
+
+.bd-sidebar-primary .sidebar-header-items {
+  border-bottom: 1px solid #d9e8e1;
+  padding-bottom: 0.45rem;
+}
+
+.bd-sidebar-primary .sidebar-primary-item {
+  font-size: 0.95rem;
+}
+
+.bd-sidebar-primary .sidebar-primary-item a {
+  border-radius: 0.35rem;
+}
+
+.bd-sidebar-primary .sidebar-primary-item a.current {
+  background: #dfeee7;
+  font-weight: 600;
+}
+
+.bd-content .toc-entry a {
+  font-size: 0.92rem;
 }
 
 .bd-main .bd-content .bd-article-container {

@@ -2,9 +2,13 @@
 
 import logging
 import re
+import sys
+import warnings
 
 import numpy as np
 import quimb.tensor as qtn
+
+from .core import get_default_array_backend
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +49,8 @@ class BdyMPS:
         If ``True``, initialize the first boundary slice directly from a
         flattened tensor network.
     to_backend : callable | None
-        Function applied to tensor arrays before storage. If ``None``, identity
-        mapping is used.
+        Function applied to tensor arrays before storage. If ``None``, uses
+        :func:`pepsy.core.get_default_array_backend` when set, otherwise identity.
     seed : int
         Random seed used during boundary randomization.
     single_layer : bool
@@ -83,7 +87,8 @@ class BdyMPS:
         self.seed = seed
         self._chi_target = int(chi)
         self.flat = flat
-        self.to_backend = (lambda x: x) if to_backend is None else to_backend
+        backend = to_backend if to_backend is not None else get_default_array_backend()
+        self.to_backend = (lambda x: x) if backend is None else backend
         self.numpy_backend = make_numpy_array_caster(dtype="complex128")
 
         tn_ref = None
@@ -100,6 +105,15 @@ class BdyMPS:
 
         # Validate that lattice dimensions can be resolved early.
         self._infer_lattice_shape(tn_ref, self._tn_norm)
+
+        if self.flat and single_layer:
+            warnings.warn(
+                "flat=True is incompatible with single_layer=True; "
+                "using single_layer=False.",
+                UserWarning,
+                stacklevel=2,
+            )
+            single_layer = False
 
         self.mps_b = self._initialize_all_boundaries(single_layer=single_layer)
 
@@ -163,11 +177,6 @@ class BdyMPS:
         for value in norms[1:]:
             total = total + value
         return total / len(norms)
-
-    @property
-    def avg_mps_norm(self):
-        """Backward-compatible alias for :attr:`norm`."""
-        return self.norm
 
     def expand_bnd(self, chi, rand_strength=0.0, inplace=True):
         """Retune all stored boundary MPS bond dimensions to ``chi``.
@@ -510,6 +519,94 @@ class BdyMPS:
                 wrapped.append("")
         return wrapped
 
+    @staticmethod
+    def _resolve_show_color(color):
+        """Resolve color mode for ``show`` output."""
+        if color == "auto":
+            return bool(getattr(sys.stdout, "isatty", lambda: False)())
+        if isinstance(color, bool):
+            return color
+        raise TypeError("color must be bool or 'auto'")
+
+    @staticmethod
+    def _ansi_wrap(text, code, enabled):
+        """Wrap text with ANSI style code when enabled."""
+        if not enabled:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+    @classmethod
+    def _colorize_symbols(cls, line, enabled, *, grid_arrows=False):
+        """Apply ANSI colors to key structural symbols."""
+        if not enabled:
+            return line
+
+        replacements = [
+            ("◆", "31"),  # highlighted cut node
+            ("●", "31"),  # highlighted cut node (plain style)
+            ("▶", "31"),
+            ("◀", "31"),
+            ("▼", "1;35"),
+            ("▲", "1;35"),
+            ("○", "36"),
+            ("o", "36"),
+        ]
+        if grid_arrows:
+            replacements.extend(((">", "31"), ("<", "31")))
+        else:
+            replacements.extend(((">", "1;32"), ("<", "1;34")))
+
+        out = line
+        for symbol, code in replacements:
+            out = out.replace(symbol, cls._ansi_wrap(symbol, code, enabled))
+        return out
+
+    @classmethod
+    def _style_show_line(cls, line, *, color_enabled, fancy):
+        """Render one show line with optional fancy symbols and ANSI colors."""
+        is_grid_title = line.startswith("grid cut=")
+        is_grid_row = re.match(r"^Y\d+\s+", line) is not None
+        is_x_axis = re.match(r"^\s+X\d+", line) is not None
+        stripped = line.strip()
+        is_conn_row = line.startswith("    ") and bool(stripped) and set(stripped) <= {
+            "|",
+            "v",
+            "^",
+            " ",
+        }
+
+        out = line
+        if fancy and (is_grid_row or is_conn_row):
+            out = out.replace("--", "──").replace(">>", "> ").replace("<<", " <")
+            out = out.replace("|", "│").replace("v", "▼").replace("^", "▲")
+            out = out.replace("o", "○")
+
+        if color_enabled:
+            if is_grid_title:
+                return cls._ansi_wrap(out, "1;36", True)
+            if is_grid_row:
+                match = re.match(r"^(Y\d+\s+)(.*)$", out)
+                if match:
+                    prefix, body = match.groups()
+                    return cls._ansi_wrap(prefix, "1;33", True) + cls._colorize_symbols(
+                        body,
+                        True,
+                        grid_arrows=True,
+                    )
+            if is_x_axis:
+                return cls._ansi_wrap(out, "1;33", True)
+            return cls._colorize_symbols(out, True)
+
+        return out
+
+    @classmethod
+    def _style_show_lines(cls, lines, *, color=True, fancy=True):
+        """Apply styling to ``show`` output lines."""
+        color_enabled = cls._resolve_show_color(color)
+        return [
+            cls._style_show_line(line, color_enabled=color_enabled, fancy=fancy) for line in lines
+        ]
+
     def _resolve_selected_key(self, key, direction, side, step):
         """Resolve and validate selected boundary key from key or direction."""
         if key is not None and direction is not None:
@@ -567,6 +664,8 @@ class BdyMPS:
         max_width=None,
         show_key=False,
         show_grid=True,
+        color=True,
+        fancy=True,
     ):  # pylint: disable=too-many-arguments
         """Display boundary view text (grid and MPS structure).
 
@@ -587,6 +686,10 @@ class BdyMPS:
             If ``True``, include selected key metadata line.
         show_grid : bool, default=True
             If ``True``, include 2D PEPS grid lines with the selected cut.
+        color : bool | {"auto"}, default=True
+            If enabled, apply ANSI colors to highlighted symbols and labels.
+        fancy : bool, default=True
+            If enabled, use a fancier unicode symbol set for grid display.
 
         Returns
         -------
@@ -601,11 +704,12 @@ class BdyMPS:
             show_key,
             show_grid,
         )
-        for line in output_lines:
+        styled_lines = self._style_show_lines(output_lines, color=color, fancy=fancy)
+        for line in styled_lines:
             print(line)
         return None
 
-    def show_all(self, direction=None, side=None, max_width=None):
+    def show_all(self, direction=None, side=None, max_width=None, color=True, fancy=True):
         """Display all matching boundary keys."""
         keys = self.available_boundary_keys(direction=direction, side=side)
         for idx, key_name in enumerate(keys):
@@ -614,6 +718,8 @@ class BdyMPS:
                 max_width=max_width,
                 show_key=False,
                 show_grid=True,
+                color=color,
+                fancy=fancy,
             )
             if idx < len(keys) - 1:
                 print()

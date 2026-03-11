@@ -1,6 +1,5 @@
 """Boundary-MPS construction and fitting utilities for DMRG-like PEPS contractions."""
 
-import logging
 import re
 from dataclasses import dataclass
 
@@ -10,8 +9,6 @@ from tqdm import tqdm
 from .boundary_states import BdyMPS
 from .core import build_optimizer, fidel_mps
 from .dmrg_fit import FIT
-
-logger = logging.getLogger(__name__)
 
 __all__ = ["BdyMPS", "CompBdy", "fidel_mps", "build_optimizer", "opt_"]
 
@@ -84,8 +81,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.max_separation = 0
         self.direction = "y"
 
-        self.warning_enabled = True
-        self._warned_flat_initial_slice = False
         self.y_left = 0
         self.y_right = 0
         self.x_left = 0
@@ -207,6 +202,20 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         else:
             raise ValueError("max_separation must be 0 or 1.")
 
+    def _effective_fit_steps(self, steps):
+        """Return number of fitting updates after accounting for ``flat`` skip."""
+        if not isinstance(steps, int):
+            raise TypeError("steps must be an integer")
+        if steps < 0:
+            raise ValueError("steps must be >= 0")
+        if self.flat and steps > 0:
+            return steps - 1
+        return steps
+
+    def _is_skipped_flat_step(self, step_idx):
+        """Return whether a step is skipped due to ``flat=True`` first-slice rule."""
+        return self.flat and step_idx == 0
+
     def _cut_idx_and_key(self, side, step_idx, cut_tag_id):
         """Return ``(cut_idx, boundary_key, axis_len)`` for sweep side/step."""
         axis_len = self._axis_length_from_cut_tag(cut_tag_id)
@@ -289,12 +298,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             tn_slice = self.norm.select(cut_tag_id.format(cut_idx), "any")
 
             if step_idx == 0 and self.flat:
-                if self.warning_enabled and not self._warned_flat_initial_slice:
-                    logger.warning(
-                        "flat=True skips fitting for initial boundary slice (%s).",
-                        boundary_key,
-                    )
-                    self._warned_flat_initial_slice = True
                 previous = tn_slice
                 continue
 
@@ -327,10 +330,12 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 self.fidel.append(fidelity)
 
             if progress_bar is not None:
+                postfix = {"chi": int(fit.p.max_bond())}
                 if self.fidel_:
                     prod_fidelity = np.prod(self.fidel)
-                    progress_bar.set_postfix({"F": complex(prod_fidelity).real})
-                    progress_bar.refresh()
+                    postfix["F"] = complex(prod_fidelity).real
+                progress_bar.set_postfix(postfix)
+                progress_bar.refresh()
                 progress_bar.update(1)
 
             previous = fit.p
@@ -358,12 +363,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             )
 
         if step_ == 0 and self.flat:
-            if self.warning_enabled and not self._warned_flat_initial_slice:
-                logger.warning(
-                    "flat=True skips fitting for initial boundary slice (%s).",
-                    boundary_key,
-                )
-                self._warned_flat_initial_slice = True
             return tn_slice
 
         if step_ == 0:
@@ -470,7 +469,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self._reset_fidelity_history()
         self.max_separation = max_separation
         self._update_separation()
-        self._warned_flat_initial_slice = False
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,
             re_tag=re_tag,
@@ -485,8 +483,12 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
         self.direction = direction
         spec = self._run_direction_spec(direction)
+        total_updates = (
+            self._effective_fit_steps(spec.left_steps)
+            + self._effective_fit_steps(spec.right_steps)
+        )
         with tqdm(
-            total=spec.n_steps,
+            total=total_updates,
             desc="bdy_dmrg:",
             leave=True,
             position=0,
@@ -527,7 +529,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Sweep and update stored boundary MPSs for a selected side/direction."""
         self._reset_fidelity_history()
-        self._warned_flat_initial_slice = False
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,
             re_tag=re_tag,
@@ -545,7 +546,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         move_left, move_right = self._direction_sides(direction)
         if not (move_left or move_right):
             raise ValueError(f"direction must include 'left' or 'right', got: {direction}")
-        total_updates = n_steps * (int(move_left) + int(move_right))
+        total_updates = (
+            (self._effective_fit_steps(n_steps) if move_left else 0)
+            + (self._effective_fit_steps(n_steps) if move_right else 0)
+        )
 
         with tqdm(
             total=total_updates,
@@ -588,7 +592,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Fit and update one boundary step at position ``pos``."""
         self._reset_fidelity_history()
-        self._warned_flat_initial_slice = False
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,
             re_tag=re_tag,
@@ -612,17 +615,38 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         if not (move_left or move_right):
             raise ValueError(f"direction must include 'left' or 'right', got: {direction}")
 
+        sides = []
         if move_left:
-            self._fit_one_step(
-                "left",
-                pos,
-                cut_tag_id=cut_tag_id,
-                site_tag_id=site_tag_id,
-            )
+            sides.append("left")
         if move_right:
-            self._fit_one_step(
-                "right",
-                pos,
-                cut_tag_id=cut_tag_id,
-                site_tag_id=site_tag_id,
-            )
+            sides.append("right")
+
+        step_does_fit = not self._is_skipped_flat_step(pos)
+        total_updates = len(sides) if step_does_fit else 0
+
+        with tqdm(
+            total=total_updates,
+            desc="move_step:",
+            leave=True,
+            position=0,
+            colour="CYAN",
+            disable=not self.pbar,
+        ) as progress_bar:
+            for side in sides:
+                updated = self._fit_one_step(
+                    side,
+                    pos,
+                    cut_tag_id=cut_tag_id,
+                    site_tag_id=site_tag_id,
+                )
+
+                if progress_bar is not None and step_does_fit:
+                    postfix = {"pos": int(pos)}
+                    if hasattr(updated, "max_bond"):
+                        postfix["chi"] = int(updated.max_bond())
+                    if self.fidel_ and self.fidel:
+                        postfix["F"] = complex(self.fidel[-1]).real
+                    if postfix:
+                        progress_bar.set_postfix(postfix)
+                        progress_bar.refresh()
+                    progress_bar.update(1)
