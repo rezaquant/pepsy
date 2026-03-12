@@ -533,7 +533,7 @@ def test_normalize_returns_dict_with_boundary_and_contract_result(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_states, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary_norm, "BdyMPS", fake_bdymps)
     monkeypatch.setattr(pepsy.boundary_norm, "ContractBoundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=131, dtype="complex128")
@@ -575,7 +575,7 @@ def test_normalize_uses_provided_bdy_without_constructing_new_one(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_states, "BdyMPS", fail_bdymps)
+    monkeypatch.setattr(pepsy.boundary_norm, "BdyMPS", fail_bdymps)
     monkeypatch.setattr(pepsy.boundary_norm, "ContractBoundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=137, dtype="complex128")

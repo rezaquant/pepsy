@@ -756,8 +756,8 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     if global_progress is None:
                         return
                     global_progress.update(1)
-                    fidelity_now, _loss_now = self.metrics()
-                    postfix = {"F": float(fidelity_now)}
+                    _fidelity_now, loss_now = self.metrics()
+                    postfix = {"loss": float(loss_now)}
                     chi_now = _current_chi()
                     if chi_now is not None:
                         postfix["chi"] = chi_now
