@@ -164,7 +164,7 @@ Common compression controls can be passed directly:
 gibbs.prepare(
     beta=0.4,
     n_steps=8,
-    mode="dmrg",             # "direct", "mpo", "dmrg1", "dmrg2", ...
+    mode="dmrg",             # opt-in FIT; default is "direct"
     chi=128,
     contraction_opt="auto",
     n_iter=4,

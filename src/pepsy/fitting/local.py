@@ -2064,7 +2064,16 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if max_bond is None or stop <= start:
             return None
         try:
-            physical_dims = [int(psi.phys_dim(site)) for site in range(start, stop + 1)]
+            if hasattr(psi, "upper_ind") and hasattr(psi, "lower_ind"):
+                # An operator site has two physical legs. Its vectorized
+                # Hilbert--Schmidt space has dimension d_upper * d_lower.
+                physical_dims = [
+                    int(psi.ind_size(psi.upper_ind(site)))
+                    * int(psi.ind_size(psi.lower_ind(site)))
+                    for site in range(start, stop + 1)
+                ]
+            else:
+                physical_dims = [int(psi.phys_dim(site)) for site in range(start, stop + 1)]
             left_rank = (
                 int(psi.bond_size(start - 1, start)) if start > 0 else 1
             )

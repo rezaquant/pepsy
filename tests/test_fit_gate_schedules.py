@@ -14,8 +14,10 @@ import pepsy as py
     ("dmrg2", [2, 2, 1, 1, 1, 1, 1, 1]),
     ("dmrg3", [3, 3, 2, 1, 1, 1, 1, 1]),
 ])
-def test_named_schedule_and_canonical_handoff(monkeypatch, mode, expected):
-    state = qtn.MPS_rand_state(6, 2, dtype="complex128", seed=714)
+@pytest.mark.parametrize("operator", [False, True])
+def test_named_schedule_and_canonical_handoff(monkeypatch, mode, expected, operator):
+    state = (qtn.MPO_rand(6, 2, dtype="complex128", seed=714) if operator
+             else qtn.MPS_rand_state(6, 2, dtype="complex128", seed=714))
     blocks = []
     original = py.FIT._start_timing_record
 
@@ -24,12 +26,13 @@ def test_named_schedule_and_canonical_handoff(monkeypatch, mode, expected):
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(py.FIT, "_start_timing_record", observe)
-    opt = py.MpsOptimizer(state, [(qu.CNOT(), (1, 4))], chi=4, mode=mode)
+    optimizer = py.MpoOptimizer if operator else py.MpsOptimizer
+    opt = optimizer(state, [(qu.CNOT(), (1, 4))], chi=4, mode=mode)
     opt.run(progbar=False, fit_rtol=None)
     assert blocks == expected
     d = opt.get_fit_diagnostics()
     assert d["guess_method"] == "src"
-    assert d["fallback"] is False
+    assert not d.get("fallback", False)
     assert d["adaptive_sweeps"] == sum(b > 1 for b in expected)
     center = d["center_site"]
     np.testing.assert_allclose(

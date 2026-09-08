@@ -11,6 +11,12 @@ specifies what acts on the ket and bra legs:
 * ``(None, B)``                  → apply ``B†`` on bra only;
 * ``(G, B)``                     → apply ``G`` on ket and ``B†`` on bra.
 
+Raw dense payloads follow the existing tensor-index orientation: the four
+actions above are respectively ``G.T @ O @ G.conj()``, ``G.T @ O``,
+``O @ B.conj()``, and ``G.T @ O @ B.conj()``. To evolve by a conventional
+matrix ``A O A†``, supply ``A.T``. Channel events instead accept standard
+Kraus matrices and deterministically form ``sum K O K†``.
+
 Three execution backends are supported, all returning the same kind of MPO
 but differing in *how* local gate updates are compressed back to bond ``chi``:
 
@@ -20,12 +26,13 @@ but differing in *how* local gate updates are compressed back to bond ``chi``:
 * ``mode="dmrg1"``, ``"dmrg2"``, or ``"dmrg3"`` — named DMRG schedules
   sharing the same local MPO/FIT kernel: two-site growth for exactly two
   sweeps (``dmrg1``) or a configurable warm-up (``dmrg2``), three-site
-  warm-up (``dmrg3``), then one-site refinement. ``dmrg1`` latches into its
+  warm-up plus a two-site transition (``dmrg3``), then one-site refinement.
+  ``dmrg1`` latches into its
   one-site phase after the attainable MPO bond ranks are saturated. Generic
   ``dmrg`` follows the same adaptive block-to-one-site handoff;
 * ``mode="svd"``  — apply the gate with ``reduce-split`` then canonicalize +
   left-compress to ``chi``;
-* ``mode="mpo"``  — use Quimb's native dagger-aware
+* ``mode="direct"`` (default; ``"mpo"``/``"quimb"`` aliases) — use Quimb's native dagger-aware
   ``gate_sandwich_with_auto_swap`` path for bare/default two-site dense gates,
   and :func:`pepsy.operators.gates.gate_nonlocal_opt` for explicit ket/bra
   pairs and multi-site layers.
@@ -47,7 +54,10 @@ from __future__ import annotations
 import math
 import threading
 import time
+import warnings
+import weakref
 from copy import deepcopy
+from functools import wraps
 from dataclasses import dataclass, field
 from numbers import Integral
 
@@ -67,6 +77,41 @@ from ...fitting.local import FIT
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
 
 __all__ = ["MpoChannelEvent", "MpoOptimizer"]
+
+
+def _replay_policy(method):
+    """Scope optional validation and immutable geometry caches to one replay."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        check = kwargs.get("finite_check", False)
+        legacy = kwargs.get("fit_finite_check")
+        if legacy is not None:
+            if "finite_check" in kwargs and check != legacy:
+                raise ValueError("finite_check and fit_finite_check disagree.")
+            check = legacy
+        if check not in (None, False, True) and not callable(check):
+            raise TypeError("finite_check must be bool, callable, or None.")
+        kwargs["finite_check"] = check
+        previous_check = self._finite_check_enabled
+        previous_cache = self._replay_rank_cache
+        previous_kinds = self._replay_array_kinds
+        self._finite_check_enabled = check not in (None, False)
+        self._replay_rank_cache = {}
+        self._replay_array_kinds = weakref.WeakKeyDictionary()
+        try:
+            if self._finite_check_enabled:
+                warnings.warn(
+                    "MpoOptimizer finite_check is enabled: this optional diagnostic "
+                    "is off by default. Tensor/norm checks add work and can "
+                    "synchronize devices; use finite_check=False to avoid it.",
+                    RuntimeWarning, stacklevel=2,
+                )
+            return method(self, *args, **kwargs)
+        finally:
+            self._finite_check_enabled = previous_check
+            self._replay_rank_cache = previous_cache
+            self._replay_array_kinds = previous_kinds
+    return wrapped
 
 
 # Keep this list aligned with MpsOptimizer's Quimb compression surface. These
@@ -363,8 +408,9 @@ class MpoOptimizer:
         ``chi`` with an empty gate queue.
     chi : int
         Working bond dimension used by all compression backends.
-    mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo", "quimb-<method>"}, default="dmrg"
-        Execution backend for local updates (see module docstring). Bare
+    mode : str, default="direct"
+        Compression algorithm for operator evolution. ``"mpo"`` and
+        ``"quimb"`` remain silent aliases for ``"direct"``. Bare
         Quimb compression methods such as ``"src"`` are accepted as aliases
         for ``"quimb-src"``. The dense Quimb path supports arbitrary
         one-dimensional gate supports; ``"svd"`` and ``"dmrg"`` retain
@@ -470,6 +516,8 @@ class MpoOptimizer:
     def _normalize_mode(cls, mode):
         """Lower-case and validate ``mode`` against :attr:`_ALLOWED_MODES`."""
         mode_norm = str(mode).strip().lower()
+        if mode_norm in {"mpo", "quimb"}:
+            mode_norm = "direct"
         # Keep one maintained DMRG/FIT implementation while retaining the
         # requested named schedule separately in ``_dmrg_mode_alias``.
         if mode_norm == "fit" or mode_norm in cls._DMRG_MODE_ALIASES:
@@ -556,7 +604,7 @@ class MpoOptimizer:
         mpo,
         gates=None,
         chi=None,
-        mode="dmrg",
+        mode="direct",
         ind_id_k="k{}",
         ind_id_b="b{}",
         contraction_opt=None,
@@ -575,6 +623,9 @@ class MpoOptimizer:
                 )
 
         self.inplace = bool(inplace)
+        self._finite_check_enabled = False
+        self._replay_rank_cache = None
+        self._replay_array_kinds = None
         # Work on a copy by default so the user's input MPO stays unchanged.
         self.p = mpo if self.inplace else mpo.copy()
         self._stream_plan = _prepare_mpo_stream(gates)
@@ -899,16 +950,18 @@ class MpoOptimizer:
             semantics=semantics,
         )
 
-    def _current_orthog(self, p=None):
+    def _current_orthog(self, p=None, *, info=None):
         """Return cached ``(min_site, max_site)`` orthogonality span.
 
         Accepts cached entries shaped as ``"calc"`` / ``None`` (recompute),
         ``int`` (single site), or 1- and 2-tuples.  The canonical form
-        returned and stored back into ``self.info_c['cur_orthog']`` is always
-        a 2-tuple with ``min <= max``.
+        returned span is always a 2-tuple with ``min <= max``. Only the live
+        MPO uses ``self.info_c``; disposable targets have independent metadata.
         """
-        cur = self.info_c.get("cur_orthog", "calc")
         state = self.p if p is None else p
+        if info is None:
+            info = self.info_c if state is self.p else {}
+        cur = info.get("cur_orthog", "calc")
         if cur == "calc" or cur is None:
             lo, hi = state.calc_current_orthog_center()
             cur = (int(lo), int(hi))
@@ -921,7 +974,7 @@ class MpoOptimizer:
         else:
             raise ValueError("cur_orthog must be an int, (int,), or (int, int).")
 
-        self.info_c["cur_orthog"] = cur
+        info["cur_orthog"] = cur
         return cur
 
     def _init_canonicalization(self):
@@ -948,6 +1001,8 @@ class MpoOptimizer:
 
     def set_mpo(self, mpo):
         """Assign a new MPO and reset canonicalization metadata."""
+        if self._replay_rank_cache is not None:
+            self._replay_rank_cache.clear()
         self.p = mpo if self.inplace else mpo.copy()
         if not isinstance(self.chi, Integral) or self.chi < 1:
             raise ValueError("chi must be a positive integer.")
@@ -976,6 +1031,8 @@ class MpoOptimizer:
 
     def set_mode(self, mode):
         """Set execution mode."""
+        if self._replay_rank_cache is not None:
+            self._replay_rank_cache.clear()
         old_mode = self.mode
         old_alias = self._dmrg_mode_alias
         mode_name = str(mode).strip().lower()
@@ -1305,7 +1362,7 @@ class MpoOptimizer:
             if target_measurement is not None
             else None if target_norm is None else float(abs(target_norm))
         )
-        if unitary and raw is not None:
+        if self._finite_check_enabled and unitary and raw is not None:
             overshoot_tolerance = self._unitary_norm_overshoot_tolerance()
             if raw > 1.0 + overshoot_tolerance:
                 raise FloatingPointError(
@@ -1921,7 +1978,8 @@ class MpoOptimizer:
         start, while FIT still receives the uncapped target built by the DMRG
         target path.
         """
-        guess = p.copy()
+        active = [site for where in batch_where for site in where]
+        guess = self._copy_working_state(p, (min(active), max(active)))
         active_sites = []
         for index, (G_i, where_i) in enumerate(zip(batch_G, batch_where)):
             gate, bra_gate, where = self._parse_gate_entry(G_i, where_i)
@@ -2263,6 +2321,11 @@ class MpoOptimizer:
         two index families stay decoupled.
         """
         n_sites = len(where)
+        if p is self.p and n_sites == 1 and not self._is_unitary_gate_pair(gate, bra_gate):
+            # Non-unitary left/right multiplication invalidates an off-center
+            # isometry. Move the center before acting, preserving the absolute
+            # operator scale; unitary one-site updates keep their old center.
+            self.canonize_mpo(p, where)
         needs_state_adaptation = self._has_symmray_data(p) or any(
             self._is_fermionic_array(operator)
             for operator in (gate, bra_gate)
@@ -2616,6 +2679,38 @@ class MpoOptimizer:
             return self._canonical_norm_measurement(p)
         return self._canonical_norm_measurement(target)
 
+    def _rank_targets(self, p, start, stop):
+        """Cache immutable MPO geometry while keeping exterior ranks live."""
+        if stop <= start:
+            return ()
+        cache = self._replay_rank_cache
+        key = (int(p.L), int(self.chi))
+        dims = None if cache is None else cache.get(key)
+        if dims is None:
+            dims = tuple(
+                int(p.ind_size(p.upper_ind(site))) * int(p.ind_size(p.lower_ind(site)))
+                for site in range(p.L)
+            )
+            if cache is not None:
+                cache[key] = dims
+        left = int(p.bond_size(start - 1, start)) if start else 1
+        right = int(p.bond_size(stop, stop + 1)) if stop + 1 < p.L else 1
+        left_caps = []
+        for site in range(start, stop):
+            left = min(self.chi, left * dims[site])
+            left_caps.append(left)
+        targets = list(left_caps)
+        for site in range(stop, start, -1):
+            right = min(self.chi, right * dims[site])
+            targets[site - start - 1] = min(targets[site - start - 1], right)
+        return tuple(targets)
+
+    def _bonds_at_rank_targets(self, p, start, stop):
+        return all(
+            int(p.bond_size(site, site + 1)) >= target
+            for site, target in zip(range(start, stop), self._rank_targets(p, start, stop))
+        )
+
     def _resolve_dmrg_fit_block_size(self, p, xmin, xmax, requested):
         """Resolve the live native FIT block for one MPO target window.
 
@@ -2637,11 +2732,10 @@ class MpoOptimizer:
         if int(xmax) - int(xmin) < 2:
             return active
         try:
-            at_target = FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+            at_target = self._bonds_at_rank_targets(
                 p,
                 int(xmin),
                 int(xmax),
-                self.chi,
             )
         except (AttributeError, TypeError, ValueError):
             at_target = False
@@ -2655,11 +2749,10 @@ class MpoOptimizer:
         if length <= 1:
             return True
         try:
-            targets = FIT._active_bond_rank_targets(  # pylint: disable=protected-access
+            targets = self._rank_targets(
                 self.p,
                 0,
                 length - 1,
-                self.chi,
             )
             return all(
                 int(self.p.bond_size(site, site + 1)) >= int(target)
@@ -2678,16 +2771,15 @@ class MpoOptimizer:
 
     def _validate_dmrg1_iteration_budget(self, p, xmin, xmax, *, n_iter, block_size):
         """Require two growth sweeps plus refinement for uncapped DMRG1."""
-        if self._dmrg_mode_alias != "dmrg1" or int(block_size) != 2:
+        if self._dmrg_mode_alias != "dmrg1" or int(block_size) != 2 or int(n_iter) >= 3:
             return
         if int(xmax) - int(xmin) < 2:
             return
         try:
-            at_target = FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+            at_target = self._bonds_at_rank_targets(
                 p,
                 int(xmin),
                 int(xmax),
-                self.chi,
             )
         except (AttributeError, TypeError, ValueError):
             at_target = False
@@ -2714,6 +2806,8 @@ class MpoOptimizer:
                 contraction_opt=contraction_opt,
             )
             overlap = float(ar.do("real", overlap))
+            if not math.isfinite(overlap):
+                raise ValueError("FIT overlap is non-finite.")
             return {
                 "fit_overlap_fidelity": overlap,
                 "fit_overlap_infidelity": max(0.0, 1.0 - overlap),
@@ -2796,6 +2890,7 @@ class MpoOptimizer:
 
     def _run_fit_gate(self, fit, **kwargs):
         """Run FIT and transfer its opt-in timing records to the MPO run."""
+        fit._finite_check_warning_handled = self._finite_check_enabled
         if self._timing_state is None:
             return fit.run_gate(**kwargs)
 
@@ -3090,19 +3185,52 @@ class MpoOptimizer:
         )
         return p_after
 
-    def _capture_run_state(self, p=None):
+    def _copy_working_state(self, p, where=None):
+        """Own mutable dense arrays in a FIT window, preserving isometry tags.
+
+        Exterior arrays are shared read-only. Native/unknown arrays retain
+        full deep-copy isolation; Torch copies use differentiable clone().
+        """
+        cache = self._replay_array_kinds
+        if cache is not None and p in cache:
+            dense = cache[p]
+        else:
+            dense = all(
+                not self._is_symmray_array(t.data)
+                and ar.infer_backend(t.data) in {"numpy", "torch", "jax", "cupy"}
+                for t in p
+            )
+            if cache is not None:
+                cache[p] = dense
+        if not dense:
+            return p.copy(deep=True)
+        result = p.copy()
+        start, stop = (0, p.L - 1) if where is None else (min(where), max(where))
+        for site in range(start, stop + 1):
+            tensor = result[site]
+            data = tensor.data
+            copied = data.clone() if ar.infer_backend(data) == "torch" else ar.do("copy", data)
+            tensor.modify(data=copied, left_inds=tensor.left_inds)
+        if cache is not None:
+            cache[result] = dense
+        return result
+
+    def _capture_run_state(self, p=None, *, where=None, copy_state=True):
         """Capture optimizer state needed for atomic DMRG recovery."""
+        state = self.p if p is None else p
         return {
-            "p": (self.p if p is None else p).copy(),
+            "p": self._copy_working_state(state, where) if copy_state else state,
             "info_c": deepcopy(self.info_c),
             "losses": list(self.losses),
-            "norm_events": deepcopy(self.norm_events),
+            "norm_events": list(self.norm_events),
             "norm_log_survival": self._norm_log_survival,
-            "fit_diagnostics": deepcopy(self.fit_diagnostics),
-            "last_fit": deepcopy(self._last_dmrg_fit_diagnostics),
-            "channel_events": deepcopy(self.channel_events),
-            "fallback_events": deepcopy(self.fallback_events),
-            "trace_events": deepcopy(self.trace_events),
+            # Committed records are append-only; only their list containers
+            # need snapshots. Public accessors keep defensive deep copies.
+            "fit_diagnostics": list(self.fit_diagnostics),
+            "last_fit": self._last_dmrg_fit_diagnostics,
+            "channel_events": list(self.channel_events),
+            "fallback_events": list(self.fallback_events),
+            "trace_events": list(self.trace_events),
             "dmrg1_one_site_locked": bool(self._dmrg1_one_site_locked),
         }
 
@@ -3239,10 +3367,11 @@ class MpoOptimizer:
                 "cutoff": cutoff,
                 "cutoff_mode": cutoff_mode,
                 "three_site_sweeps": fit_three_site_sweeps,
-                # MPO replay owns its schedule independently of standalone
-                # FIT defaults and the MPS DMRG3 transition policy.
+                # Match the named MPS schedule while fitting both operator
+                # physical legs: three-site warm-up, two-site transition,
+                # then one-site refinement. Generic DMRG keeps its handoff.
                 "adaptive_block_sweeps": adaptive_block_sweeps,
-                "two_site_transition_sweeps": 0,
+                "two_site_transition_sweeps": 1 if self._dmrg_mode_alias == "dmrg3" else 0,
                 "min_iter": fit_min_iter,
                 "rtol": fit_rtol,
                 "patience": fit_patience,
@@ -3284,7 +3413,7 @@ class MpoOptimizer:
             """Run one FIT update with optional per-update recovery/fallback."""
             nonlocal p
             snapshot = (
-                self._capture_run_state(p)
+                self._capture_run_state(p, where=where, copy_state=fit.p is p)
                 if transactional_steps or fit_fallback is not None
                 else None
             )
@@ -3944,7 +4073,7 @@ class MpoOptimizer:
 
             pbar = tqdm(
                 total=len(G_seq),
-                desc="mpo",
+                desc=method,
                 leave=True,
                 position=0,
                 colour="GREEN",
@@ -4126,16 +4255,17 @@ class MpoOptimizer:
         self.p = p
 
 
+    @_replay_policy
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
-        n_iter=6,
+        n_iter=8,
         *,
         mode=None,
         compression_seed=None,
         submpo_method=None,
         progbar=False,
-        cutoff=1e-12,
-        cutoff_mode="rsum2",
+        cutoff="auto",
+        cutoff_mode="auto",
         fidelity_samples=10,
         k_2q_batch=1,
         fit_block_size=2,
@@ -4145,10 +4275,11 @@ class MpoOptimizer:
         fit_adaptive_sweeps=2,
         fit_single_pair_fast_path=False,
         target_cutoff=0.0,
-        fit_min_iter=None,
-        fit_rtol=None,
-        fit_patience=1,
-        fit_finite_check=False,
+        fit_min_iter=2,
+        fit_rtol="auto",
+        fit_patience=2,
+        finite_check=False,
+        fit_finite_check=None,
         timing=False,
         timing_sync_device=False,
         fit_collect_split_diagnostics=False,
@@ -4171,11 +4302,11 @@ class MpoOptimizer:
 
         Parameters
         ----------
-        n_iter : int, default=6
+        n_iter : int, default=8
             Inner iterations for DMRG ``FIT`` updates on two-site gates. With
             adaptive block fitting, the initial block phase hands the
             remaining sweeps to one-site refinement. Ignored by ``svd`` mode.
-        mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo", "quimb-<method>"} | None, default=None
+        mode : {"direct", "dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "quimb-<method>"} | None, default=None
             Optional mode override for this run. Bare Quimb method names
             such as ``"src"`` are accepted as aliases for ``"quimb-src"``.
         compression_seed : int | None, default=None
@@ -4185,15 +4316,16 @@ class MpoOptimizer:
         submpo_method : str | None, default=None
             Optional Quimb compression override for an MPO-mode run. This is
             the MPO analogue of `MpsOptimizer`'s ``submpo_method``; for
-            example, ``mode="mpo", submpo_method="src"`` is equivalent to
+            example, ``mode="direct", submpo_method="src"`` is equivalent to
             ``mode="src"``.
         progbar : bool, default=False
             Show tqdm progress bar.
-        cutoff : float | {"auto"}, default=1e-12
-            Truncation cutoff used in gate application and compression.
-        cutoff_mode : str, default="rsum2"
+        cutoff : float | {"auto"}, default="auto"
+            Dtype-aware truncation cutoff used in gating and compression.
+        cutoff_mode : str, default="auto"
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
-            ``tensor_network_1d_compress``.
+            ``tensor_network_1d_compress``. Auto uses ``rsum1`` for dense
+            density-matrix compression and ``rsum2`` for SVD-based routes.
         fidelity_samples : int, default=10
             ``svd`` mode only: number of intermediate norm-proxy samples.
             A final sample is always recorded at the end of the run.
@@ -4229,16 +4361,20 @@ class MpoOptimizer:
         target_cutoff : float, default=0.0
             ``dmrg`` mode only: cutoff used while constructing the target
             MPO. The output FIT SVD remains controlled by ``cutoff``.
-        fit_min_iter : int | None, default=None
+        fit_min_iter : int | None, default=2
             Minimum FIT sweeps before ``fit_rtol`` can stop a DMRG update.
-        fit_rtol : float | None, default=None
-            Relative retained-center norm tolerance for early FIT stopping.
+        fit_rtol : float | {"auto"} | None, default="auto"
+            Dtype-aware retained-center norm tolerance for early FIT stopping.
             ``None`` preserves fixed ``n_iter`` behavior.
-        fit_patience : int, default=1
+        fit_patience : int, default=2
             Number of stable FIT norm samples required by ``fit_rtol``.
-        fit_finite_check : bool | callable, default=False
-            Check every fitted MPO for finite tensor data. A callable receives
-            the current MPO and must return a truthy value.
+        finite_check : bool | callable, default=False
+            Opt-in finite-data and norm-overshoot diagnostics across replay
+            modes, including empty runs. Warns once per enabled run. A
+            callable receives the MPO and must return a truthy value.
+        fit_finite_check : bool | callable | None, default=None
+            Compatibility alias for ``finite_check``; conflicting values
+            raise an error.
         timing : bool, default=False
             Record wall-clock and FIT sweep timing in ``last_run_timing``.
         timing_sync_device : bool, default=False
@@ -4293,7 +4429,7 @@ class MpoOptimizer:
         transactional_steps : bool, default=True
             Snapshot each DMRG gate or batch before FIT so ``atomic=False`` can
             still preserve all completed updates when one local update fails.
-        fit_fallback : {None, "mpo", "svd"}, default=None
+        fit_fallback : {None, "direct", "svd"}, default=None
             If DMRG FIT fails, restore the pre-run state and replay the complete
             stream through the selected direct compression backend.
 
@@ -4304,12 +4440,14 @@ class MpoOptimizer:
 
         Notes
         -----
-        Symmray MPOs use the block-aware SVD compression implementation for
-        all three modes. This preserves multi-sector bonds when Quimb's
-        generic dense auxiliary or bond-padding paths are unavailable.
+        Native Symmray direct/Quimb modes use block-aware SVD compression;
+        DMRG modes retain native FIT. Evolution preserves the operator's
+        absolute Hilbert--Schmidt scale and never normalizes it as a state.
         """
         if mode is not None:
             self.set_mode(mode)
+
+        fit_finite_check = finite_check
 
         if layout is not None and layout is not False:
             requested_layout = layout_order if layout is True else layout
@@ -4321,6 +4459,13 @@ class MpoOptimizer:
             )
 
         cutoff = self._resolve_cutoff(cutoff, self.p)
+        if cutoff_mode is None or cutoff_mode == "auto":
+            method = self._resolve_mpo_method(submpo_method)
+            cutoff_mode = "rsum1" if (
+                self._is_mpo_mode(self.mode)
+                and method == "dm"
+                and not self._has_symmray_data(self.p)
+            ) else "rsum2"
         timing = bool(timing)
         timing_sync_device = bool(timing_sync_device)
 
@@ -4332,6 +4477,14 @@ class MpoOptimizer:
             self.last_run_timing = None
             if timing:
                 self._start_run_timing(event_count=0, sync_device=timing_sync_device)
+            try:
+                self._check_finite(finite_check)
+            except Exception as exc:
+                self.last_run_status = "failed"
+                self.last_run_error = f"{type(exc).__name__}: {exc}"
+                self._finish_run_timing("failed")
+                raise
+            if timing:
                 self._finish_run_timing("complete")
             return self.p
 
@@ -4341,6 +4494,11 @@ class MpoOptimizer:
             not isinstance(fit_min_iter, Integral) or int(fit_min_iter) < 1
         ):
             raise ValueError("fit_min_iter must be a positive integer or None.")
+        if fit_rtol == "auto":
+            dtype = str(self.backend_dtype).lower()
+            fit_rtol = 1e-3 if "16" in dtype else (
+                1e-5 if "32" in dtype or "complex64" in dtype else 1e-9
+            )
         if fit_rtol is not None:
             fit_rtol = float(fit_rtol)
             if not math.isfinite(fit_rtol) or fit_rtol < 0.0:
@@ -4356,8 +4514,10 @@ class MpoOptimizer:
             raise ValueError("fit_adaptive_sweeps must be a positive integer.")
         if isinstance(k_2q_batch, Integral):
             k_2q_batch = int(k_2q_batch)
+        if fit_fallback == "direct":
+            fit_fallback = "mpo"  # compatibility record spelling
         if fit_fallback not in {None, "mpo", "svd"}:
-            raise ValueError("fit_fallback must be None, 'mpo', or 'svd'.")
+            raise ValueError("fit_fallback must be None, 'direct', 'mpo', or 'svd'.")
         fit_target_strategy = self._validate_fit_target_strategy(fit_target_strategy)
         fit_mpo_guess = bool(fit_mpo_guess)
         fit_mpo_guess_order = self._validate_fit_mpo_guess_order(
@@ -4649,7 +4809,7 @@ class MpoOptimizer:
                 return self.p
             try:
                 self._timed_call(
-                    "mpo.replay",
+                    f"{mpo_method_override or self._mode_mpo_method(self.mode)}.replay",
                     self._run_mpo,
                     G_seq,
                     where_seq,
@@ -4702,8 +4862,9 @@ class MpoOptimizer:
         else:
             raise ValueError("where must be an int, (int,), or (int, int).")
 
-        p.canonize(where_canon, cur_orthog=self._current_orthog(p))
-        self.info_c["cur_orthog"] = target_orthog
+        info = self.info_c if p is self.p else {}
+        p.canonize(where_canon, cur_orthog=self._current_orthog(p, info=info), info=info)
+        info["cur_orthog"] = target_orthog
 
     def sync_canonicalization(self, site=None):
         """Repair ``info_c`` after direct canonicalization of the live MPO.
@@ -4713,6 +4874,8 @@ class MpoOptimizer:
         Discover the actual live centre, move it to a single site, and bind
         the resulting metadata back to this optimizer before replay resumes.
         """
+        if self._replay_rank_cache is not None:
+            self._replay_rank_cache.clear()
         if not hasattr(self.p, "calc_current_orthog_center"):
             raise TypeError("the live MPO does not expose canonical metadata.")
 

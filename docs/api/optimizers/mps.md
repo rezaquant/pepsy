@@ -1,5 +1,18 @@
 # `pepsy.optimizers.mps.optimizer`
 
+`MpsOptimizer` defaults to `mode="direct"`: Quimb's direct compression to
+the requested `chi`. Prefer this algorithm name in new code. `mode="mpo"`
+remains a silent compatibility alias for the same path; an MPO is an operator
+representation, not a distinct replay algorithm.
+
+```python
+opt = pepsy.MpsOptimizer(state, gates, chi=64)  # mode="direct"
+opt.run()
+```
+
+The previous constructor default was `"dmrg"`. Specify `mode="dmrg"` (or a
+named `dmrg1`/`dmrg2`/`dmrg3` schedule) to retain variational FIT replay.
+
 For finite-temperature preparation from Hamiltonian terms, see the dedicated
 [`GibbsMps` guide](gibbs_mps.md). It uses an interleaved physical/ancilla MPS
 and delegates non-unitary gate replay to this optimizer.
@@ -232,7 +245,7 @@ Use `retain="all"` (the default) for final states plus replay metadata,
 `retain="none"` when only the shot count/side effects matter. The latter keeps
 no optimizer states in the result and therefore cannot be used to evaluate
 observables afterward. `dmrg2` is the normal variational production backend;
-`mpo` is the direct-compression reference for explicit sub-MPO events, while
+`direct` is the default compression path for explicit sub-MPO events, while
 DMRG schedules retain multi-site sub-MPOs as layered FIT targets. `svd`, `swap`,
 and the other DMRG schedules use the same
 trajectory contract and should be benchmarked for the workload. `mix` and `su`
@@ -269,9 +282,10 @@ The practical shot-mode matrix is:
 
 | mode | trajectory status |
 | --- | --- |
-| bare `<method>` / `quimb-<method>` | selected Quimb 1D compression; `direct` is the preferred spelling, while `quimb` is its direct alias |
+| `direct` (default) | Quimb direct compression; `mpo` and `quimb` are compatibility aliases |
+| bare `<method>` / `quimb-<method>` | explicitly selected Quimb 1D compressor |
 | `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
-| `dmrg`, `dmrg1/2/3` | variational compressed replay; `dmrg2` is the production default |
+| `dmrg`, `dmrg1/2/3` | opt-in variational compressed replay with the selected FIT schedule |
 | `mix` | unitary FIT plus an explicit MPO fallback for Kraus gates; no controls/leakage |
 | `su` | gate-only simple-update; selected Kraus gates are normalized after replay |
 | `exact` | exact unitary, mixture, control, and state-dependent Kraus replay |
@@ -289,8 +303,8 @@ bond followed by a direct sweep to `chi`. `fit-projector` disables only the
 optional simple-update pre-gauge, which is singular on exact product-state
 bonds; its projector guess and variational FIT remain native. If `run()`
 receives `cutoff_mode="auto"` (now the default), ordinary Pepsy paths use
-`rsum2` while MPO methods keep their Quimb-native defaults. In particular,
-MPO `dm` keeps `rsum1`. Passing a concrete string explicitly overrides that
+`rsum2` while Quimb compressors keep their native defaults. In particular,
+`dm` keeps `rsum1`. Passing a concrete string explicitly overrides that
 method default. `None` remains a compatibility alias for `"auto"`.
 
 For dense MPS, `mode="quimb-src"` applies each gate with Quimb's Successive
@@ -573,7 +587,7 @@ representable positive absolute cutoff, which removes structural zero singular
 directions while retaining every representable nonzero value. This prevents
 invalid duplicate dummy modes without introducing target truncation.
 
-All unitary compressed modes (`dmrg*`, `mix`, `mpo`, `swap`, `perm`, and
+All unitary compressed modes (`dmrg*`, `mix`, `direct`, `swap`, `perm`, and
 `svd`) default to `stabilize_unitary=False`. The retained approximation scale
 therefore remains in the raw working MPS, making norm decay visible by default.
 Canonicalization and QR only move that scale to the tracked orthogonality
@@ -593,6 +607,14 @@ unclipped ratio. `opt.norm_diagnostics()` exposes the latest local value as
 `local_fidelity` and the log-accumulated product as `cumulative_fidelity`, with
 matching `*_infidelity` fields. These are compression fidelities measured from
 norms, not directional target-state fidelities.
+
+Measurement and reset Born weights refer to the state before collapse. Very
+small weights are contracted through the branch projector to avoid cancellation
+in `1 - <P>`; positive rare forced outcomes remain valid. Measurement norm
+accounting includes `p.exponent` on both sides, including the raw norm returned
+by DMRG FIT, so represented scale does not appear as compression loss.
+Canonical controls reuse tracked center norms; caps keep their raw contraction
+scale and establish a fresh baseline for subsequent unitary evolution.
 
 In `opt.norm_diagnostics()`, `norm` and `state_norm` are the actual represented
 live-MPS norm. `cumulative_norm` is different: it is the square root of the

@@ -19,8 +19,10 @@ Make decisions in this order; each choice owns a different invariant:
    MPS mode for local norms, controls, and DMRG. Do not make a cyclic MPS look
    canonical by scanning it—the missing loop environment makes a one-center
    norm invalid.
-2. **Compression route.** Use `dmrg2` for the normal variational production
-   path, `dmrg1` when the fixed two-site-growth/one-site-refinement schedule is
+2. **Compression route.** `direct` is the constructor default and preferred
+   public name for Quimb direct compression. `mpo` is a silent compatibility
+   alias, not a separate algorithm. Use `dmrg2` for explicit variational
+   replay, `dmrg1` when the fixed two-site-growth/one-site-refinement schedule is
    required, and `dmrg3` when a three-site warm-up is useful. Use
    `quimb-<method>` (or its bare method alias) when benchmarking a specific
    Quimb compressor, `svd` for a transparent local split reference, and
@@ -68,9 +70,10 @@ than hiding policy in a mode-specific helper.
   remaining `n_iter` budget. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
-- `quimb-<method>`: native Quimb non-local gate/MPO replay with the selected
-  compression method; `quimb-direct` is explicit and `quimb` is its direct
-  alias. The legacy `mpo-<method>` and `mpo` spellings remain supported.
+- `direct` (default), or another bare/`quimb-<method>` name: native Quimb
+  non-local gate/sub-MPO replay with the selected compression method.
+  `direct`, `quimb`, and legacy `mpo` normalize to `quimb-direct` internally.
+  Keep `mpo-<method>` compatibility, but use algorithm names in new examples.
   Supported methods include `direct`, `dm`, `zipup`, the zipup/SDC/SRC/SRCMPS
   oversampling variants, `fit`, `fit-zipup`, `fit-projector`, and
   `fit-oversample`.
@@ -123,6 +126,10 @@ before rebuilding an open MPS.
 - Pass the tracked range through Quimb `info` arguments and canonicalization.
 - Local Pauli expectations should use `local_expectation_canonical` when
   available and move the center from the tracked range to the support.
+- Canonical Kraus Gram expectations share that tracked-center path. Control
+  norms include the represented exponent, including raw FIT measurement norms.
+  Recontract small Born weights with the projector instead of subtracting
+  nearly equal scalars; positive rare branches are not impossible outcomes.
 - Norm diagnostics should canonicalize to one center and use its tensor norm;
   do not replace this with a global doubled-network contraction.
 - Local non-unitary scale control reuses an authoritative singleton center
@@ -281,6 +288,11 @@ Before changing `optimizer.py`, verify the following ownership boundaries:
   padding plus per-row `lengths`; valid bits, lengths, probabilities, and leaf
   indices must remain aligned during shuffle. Uniform batches retain their
   existing shape and values.
+- Ordinary MPS reset fast paths require a structural product certificate at
+  the mapped logical site, not a numerical purity tolerance. Leakage of an
+  entangled site branches its hidden reset before installing the placeholder.
+  Branch budgets reserve retained leaves and unprocessed parents; hidden
+  leakage outcomes also consume the original event's branch-factor budget.
 - DMRG builds an isolated exact target and selects an owned guess or a direct
   live-state guess. Rollback retains the original only for an isolated dense
   guess; direct/native paths require a copy. A fallback must restore both

@@ -22,6 +22,26 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Aligned `MpoOptimizer` with MPS replay: default `mode="direct"` with
+  `"mpo"`/`"quimb"` aliases, dtype-aware FIT defaults, the DMRG3 two-site
+  transition, and opt-in `finite_check` across modes. Corrected operator
+  rank ceilings to count both physical legs, isolated temporary canonical
+  metadata, and protected transactional recovery against in-place array
+  mutation while reducing repeated copies. Operator scale, ket/bra gate
+  conventions, and deterministic Kraus sums remain unchanged.
+
+- Made `MpsOptimizer(mode="direct")` the constructor default, replacing
+  `"dmrg"`. Prefer `direct` in new code; `"mpo"` and `"quimb"` remain silent
+  compatibility aliases for the same direct compressor. Variational replay
+  now requires an explicit `"dmrg"`, `"fit"`, or named DMRG mode.
+
+- Corrected coalesced MPS reset/leakage branching for permuted and weakly
+  entangled sites, and enforced branch budgets across the whole ensemble.
+  Rare positive measurement outcomes remain selectable with directly
+  contracted small Born weights. DMRG measurement norm accounting now includes
+  the represented exponent. Canonical MPS controls and Kraus probabilities
+  reuse tracked local centers instead of full-chain norm/environment work.
+
 - Fixed conditional MPS gates to inherit the configured DMRG/FIT schedule,
   guess, and replay options. Trajectory controls now share ordinary branching
   and cap handling, including nested conditionals and mixed leakage leaves.

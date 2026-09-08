@@ -1607,6 +1607,7 @@ def test_mpo_unitary_norm_overshoot_guard_rejects_inconsistent_metadata():
     opt = py.MpoOptimizer(
         qtn.MPO_identity(3, dtype="complex128"), gates=[], chi=4, mode="mpo"
     )
+    opt._finite_check_enabled = True
     with pytest.raises(FloatingPointError, match="exceeds its expected norm"):
         opt._record_norm_event(
             "mpo_compression",

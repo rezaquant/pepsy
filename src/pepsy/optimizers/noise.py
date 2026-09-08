@@ -3017,7 +3017,9 @@ def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
 def _trajectory_norm_squared(optimizer) -> float:
     """Read the represented state norm through the optimizer's public API."""
     norm = getattr(optimizer, "norm", None)
-    if callable(norm):
+    if isinstance(optimizer, MpsOptimizer):
+        value = optimizer._control_state_norm()
+    elif callable(norm):
         value = _trajectory_real_scalar(norm(), label="trajectory state norm")
     else:
         p = getattr(optimizer, "p", None)
@@ -3032,10 +3034,9 @@ def _trajectory_norm_squared(optimizer) -> float:
 def _mps_local_kraus_norm_squared(optimizer, matrix, where):
     """Evaluate ``<psi|K^dagger K|psi>`` without copying the MPS.
 
-    Quimb's environment contraction works for canonical and non-canonical open
-    MPS states and returns the normalized local expectation directly. Returning
-    ``None`` keeps the conservative copied-state path available for custom MPS
-    lookalikes and backends that cannot contract the generated dense operator.
+    Canonical MPS replay reuses and updates the live center metadata. Quimb's
+    environment contraction remains available for noncanonical MPS lookalikes;
+    returning ``None`` retains the conservative copied-state fallback.
     """
     p = getattr(optimizer, "p", None)
     compute = getattr(p, "compute_local_expectation", None)
@@ -3044,6 +3045,20 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
     try:
         gram = matrix.conj().T @ matrix
         support = tuple(int(site) for site in where)
+        canonical = getattr(p, "local_expectation_canonical", None)
+        if (
+            isinstance(optimizer, MpsOptimizer)
+            and optimizer.mode not in {"exact", "su"}
+            and callable(canonical)
+        ):
+            value = canonical(
+                gram, support, normalized=True, info=optimizer.info_c,
+                optimize=optimizer.contraction_opt,
+            )
+            value = _trajectory_real_scalar(value, label="local Kraus probability")
+            if not np.isfinite(value) or value < -1e-10:
+                raise ValueError("local Kraus contraction produced an invalid probability.")
+            return max(0.0, value)
         # Quimb's environment helper has a known length-one edge case. The
         # represented state is only a two-component vector there, so evaluate
         # the local Gram form directly instead of copying/applying a candidate
@@ -3422,7 +3437,7 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
         )
     if isinstance(norm_event, dict) and "input_norm" in norm_event:
         probability = float(norm_event["branch_probability"])
-        projected_norm = optimizer._real_float(optimizer.p.norm())
+        projected_norm = optimizer._control_state_norm()
         optimizer._record_norm_event(
             "trajectory_kraus",
             expected_norm=float(norm_event["input_norm"]) * np.sqrt(probability),
@@ -3780,7 +3795,7 @@ def _apply_trajectory_event(
         norm_event = {
             "kind": "trajectory_kraus",
             "branch_probability": float(probability),
-            "input_norm": optimizer._real_float(optimizer.p.norm()),
+            "input_norm": optimizer._control_state_norm(),
         }
     else:
         norm_event = None
@@ -3891,6 +3906,11 @@ def _coalesced_probabilities(probabilities, *, context):
     return probabilities / total
 
 
+def _remaining_coalesced_budget(limit, *reserved):
+    """Reserve slots for retained leaves and parents not yet processed."""
+    return None if limit is None else limit - sum(reserved)
+
+
 def _split_coalesced_nodes(
     nodes,
     outcomes,
@@ -3909,14 +3929,15 @@ def _split_coalesced_nodes(
     if len(outcomes) != len(probabilities):
         raise ValueError(f"{context} has mismatched outcomes and probabilities.")
     split = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         counts = rng.multinomial(node.count, probabilities)
         nonempty = [
             (outcome, float(probability), int(count))
             for outcome, probability, count in zip(outcomes, probabilities, counts)
             if int(count) > 0
         ]
-        if max_branches is not None and len(split) + len(nonempty) > max_branches:
+        live_count = len(split) + len(nonempty) + len(nodes) - index - 1
+        if max_branches is not None and live_count > max_branches:
             raise _CoalescedBranchCapExceeded(
                 f"coalesced trajectory branch cap ({max_branches}) exceeded "
                 f"while splitting {context}."
@@ -4005,7 +4026,7 @@ def _run_coalesced_entries(
         if parts is not None and parts[0] == "conditional":
             flush()
             selected = []
-            for node in nodes:
+            for index, node in enumerate(nodes):
                 action = _resolve_trajectory_conditional(node.optimizer, entry)
                 if action is None:
                     selected.append(node)
@@ -4015,7 +4036,9 @@ def _run_coalesced_entries(
                     # stream once, not both the action and its wrapper.
                     selected.extend(_run_coalesced_entries(
                         [node], [(event_index, action)], run_kwargs, rng,
-                        max_branches=max_branches,
+                        max_branches=_remaining_coalesced_budget(
+                            max_branches, len(selected), len(nodes) - index - 1,
+                        ),
                         max_branch_factor=max_branch_factor,
                         parallel_workers=parallel_workers,
                         parallel_backend=parallel_backend,
@@ -4086,7 +4109,7 @@ def _coalesced_leakage_measure_leaked(
 ):
     """Replay ``measure_leaked`` while preserving count-bearing branches."""
     result = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         state = node.leakage_state
         if site in state.leaked:
             node.leakage_records.append(
@@ -4103,7 +4126,7 @@ def _coalesced_leakage_measure_leaked(
             result.append(node)
             continue
 
-        p_plus = _coalesced_measurement_probability(node.optimizer, "Z", (site,))
+        probabilities = _coalesced_measurement_probabilities(node.optimizer, "Z", (site,))
 
         def apply(child, outcome, probability):
             outcome = int(outcome)
@@ -4136,11 +4159,13 @@ def _coalesced_leakage_measure_leaked(
             _split_coalesced_nodes(
                 [node],
                 (+1, -1),
-                (p_plus, 1.0 - p_plus),
+                probabilities,
                 apply,
                 rng,
                 context="leakage measurement",
-                max_branches=max_branches,
+                max_branches=_remaining_coalesced_budget(
+                    max_branches, len(result), len(nodes) - index - 1,
+                ),
                 max_branch_factor=max_branch_factor,
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
@@ -4191,7 +4216,7 @@ def _coalesced_leakage_event(
         )
 
     result = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         initially_leaked = site in node.leakage_state.leaked
         probability = float(payload["probability"])
         if kind == "leakage":
@@ -4225,12 +4250,8 @@ def _coalesced_leakage_event(
                     if initially_leaked:
                         branch = "already_leaked"
                     else:
-                        _run_leakage_entries(
-                            child.optimizer,
-                            (_reset_zero_entry(site),),
-                            run_kwargs,
-                            child.gate_stream,
-                        )
+                        # Reset after the classical split, where its hidden
+                        # measurement can create separate count-bearing leaves.
                         child.leakage_state.leaked.add(site)
                         branch = "leaked"
                 child.leakage_records.append(
@@ -4292,21 +4313,44 @@ def _coalesced_leakage_event(
         else:  # pragma: no cover - parser guards the event names
             raise AssertionError(f"Unhandled leakage event kind {kind!r}.")
 
-        result.extend(
-            _split_coalesced_nodes(
-                [node],
-                labels,
-                probabilities,
-                apply,
-                rng,
-                context=f"leakage {kind}",
-                max_branches=max_branches,
-                max_branch_factor=max_branch_factor,
+        budget = _remaining_coalesced_budget(
+            max_branches, len(result), len(nodes) - index - 1,
+        )
+        children = _split_coalesced_nodes(
+            [node], labels, probabilities, apply, rng,
+            context=f"leakage {kind}", max_branches=budget,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers, parallel_backend=parallel_backend,
+        )
+        resetting = []
+        retained = []
+        for child in children:
+            needs_reset = kind == "leakage" and child.leakage_records[-1].branch == "leaked"
+            (resetting if needs_reset else retained).append(child)
+        if resetting:
+            entry = _reset_zero_entry(site)
+            resetting = _coalesced_control_event(
+                resetting, event_index, MpsOptimizer.control_event_parts(entry),
+                run_kwargs, rng, entry=entry,
+                max_branches=_remaining_coalesced_budget(budget, len(retained)),
+                max_branch_factor=_remaining_coalesced_budget(max_branch_factor, len(retained)),
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
             )
-        )
+            for child in resetting:
+                child.leakage_state.leaked.add(site)
+        result.extend(retained + resetting)
     return result
+
+
+def _coalesced_measurement_probabilities(optimizer, pauli, where):
+    """Keep small MPS Born branches without subtractive cancellation."""
+    if isinstance(optimizer, MpsOptimizer):
+        return optimizer._measurement_probabilities(
+            pauli, optimizer._logical_to_physical_where(where),
+        )
+    p_plus = _coalesced_measurement_probability(optimizer, pauli, where)
+    return p_plus, 1.0 - p_plus
 
 
 def _coalesced_measurement_probability(optimizer, pauli, where) -> float:
@@ -4347,12 +4391,30 @@ def _coalesced_reset_needs_branch(optimizer, where) -> bool:
         return True
     site = where[0]
     try:
+        if isinstance(optimizer, MpsOptimizer):
+            # Only a structural product certificate may discard hidden
+            # outcomes. A purity tolerance can erase rare but physical
+            # branches, and three Pauli contractions cost more than these
+            # two bond lookups. Nonminimal product MPS safely take the
+            # branching path (deterministic outcomes still create one leaf).
+            (physical_site,) = optimizer._logical_to_physical_where((site,))
+            p = optimizer.p
+            length = int(p.L)
+            if getattr(p, "cyclic", False):
+                return True
+            return any(
+                p.bond_size(physical_site, neighbor) != 1
+                for neighbor in (physical_site - 1, physical_site + 1)
+                if 0 <= neighbor < length
+            )
         values = []
         state_expectation = getattr(optimizer, "_state_expectation", None)
         expectation = getattr(optimizer, "expectation", None)
         for axis in ("X", "Y", "Z"):
             if callable(state_expectation):
-                value = state_expectation(axis, (site,))
+                remap = getattr(optimizer, "_logical_to_physical_where", None)
+                support = remap((site,)) if callable(remap) else (site,)
+                value = state_expectation(axis, support)
             elif callable(expectation):
                 value = expectation(axis, site)
             else:
@@ -4419,8 +4481,8 @@ def _apply_coalesced_measurement(
         # recorded value is still the Born probability before that collapse.
         checked = []
         for node in nodes:
-            p_plus = _coalesced_measurement_probability(node.optimizer, pauli, where)
-            checked.append(p_plus if outcome > 0 else 1.0 - p_plus)
+            probabilities = _coalesced_measurement_probabilities(node.optimizer, pauli, where)
+            checked.append(probabilities[0 if outcome > 0 else 1])
         result = []
         for node, branch_probability in zip(nodes, checked):
             apply(node, outcome, branch_probability)
@@ -4430,17 +4492,19 @@ def _apply_coalesced_measurement(
     # The state can differ between nodes, so each node gets its own binomial
     # draw. This is exactly the result of independent per-shot Born draws.
     result = []
-    for node in nodes:
-        p_plus = _coalesced_measurement_probability(node.optimizer, pauli, where)
+    for index, node in enumerate(nodes):
+        probabilities = _coalesced_measurement_probabilities(node.optimizer, pauli, where)
         result.extend(
             _split_coalesced_nodes(
                 [node],
                 (+1, -1),
-                (p_plus, 1.0 - p_plus),
+                probabilities,
                 apply,
                 rng,
                 context="measurement",
-                max_branches=max_branches,
+                max_branches=_remaining_coalesced_budget(
+                    max_branches, len(result), len(nodes) - index - 1,
+                ),
                 max_branch_factor=max_branch_factor,
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
@@ -4509,7 +4573,7 @@ def _coalesced_control_event(
                     absorb_basis=absorb_basis,
                     run_kwargs=run_kwargs,
                     rng=rng,
-                    max_branches=max_branches,
+                    max_branches=_remaining_coalesced_budget(max_branches, len(direct)),
                     max_branch_factor=max_branch_factor,
                     parallel_workers=parallel_workers,
                     parallel_backend=parallel_backend,
@@ -4584,7 +4648,7 @@ def _coalesced_control_event(
                 rng,
                 entry=entry,
                 absorb_basis=absorb_basis,
-                max_branches=max_branches,
+                max_branches=_remaining_coalesced_budget(max_branches, len(leaked_nodes)),
                 max_branch_factor=max_branch_factor,
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
@@ -5362,7 +5426,7 @@ def _apply_coalesced_trajectory_outcome(
         norm_event = {
             "kind": "trajectory_kraus",
             "branch_probability": float(target_probability),
-            "input_norm": node.optimizer._real_float(node.optimizer.p.norm()),
+            "input_norm": node.optimizer._control_state_norm(),
         }
     else:
         norm_event = None
@@ -5492,7 +5556,7 @@ def run_coalesced_trajectory_shots(
             )
         else:
             split = []
-            for node in nodes:
+            for index, node in enumerate(nodes):
                 probabilities = _kraus_probabilities(
                     node.optimizer, entry.channel, entry.where
                 )
@@ -5529,7 +5593,9 @@ def run_coalesced_trajectory_shots(
                         apply,
                         rng,
                         context="trajectory Kraus channel",
-                        max_branches=max_branches,
+                        max_branches=_remaining_coalesced_budget(
+                            max_branches, len(split), len(nodes) - index - 1,
+                        ),
                         max_branch_factor=max_branch_factor,
                         parallel_workers=parallel_workers,
                         parallel_backend=parallel_backend,

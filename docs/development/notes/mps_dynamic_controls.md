@@ -113,3 +113,84 @@ covered the changed MPS control layer and shared trajectory consumers, while
 unrelated solver and VMC kernels were unchanged. No GPU runtime benchmark was
 performed. No changes were made to per-sweep finite-check defaults or scalar
 channel-probability validation.
+
+## Follow-up control and canonicalization review (2026-09-08)
+
+The deeper review reproduced and corrected these additional cases:
+
+- In `perm`, a Bell pair on logical sites 0 and 2 had order `[0, 2, 1]`.
+  Resetting logical site 2 tested physical site 2's purity and retained one
+  arbitrary remote branch. Ordinary MPS resets now use the mapped site's
+  adjacent bond dimensions as a structural product certificate. Nontrivial
+  bonds use explicit branching, avoiding both three Pauli contractions and
+  the old `1e-7` purity tolerance. A probability `2e-8` entangled branch remains
+  present in a billion-shot count-coalesced test without allocating shots.
+- Leaking a Bell-pair site reset its placeholder once for all 128 coalesced
+  shots, losing the other remote branch. Leakage now branches the hidden
+  reset separately for each parent's occurred child. These children consume
+  both the global leaf budget and their original event's branch-factor budget.
+- Two successive measurements, Kraus channels, or leakage events could retain
+  four leaves despite `max_branches=2`. Splits now reserve retained siblings
+  and unprocessed parents, including conditional, mixed leakage, and reset
+  dispatch. Checks precede child cloning; probabilities are never pruned.
+- A represented norm of 10 followed by an exact DMRG Pauli projection reported
+  compression infidelity 0.99. FIT's raw output norm now receives the same
+  exponent convention as the input. Caps still preserve raw scale and rebase
+  only the unitary baseline.
+- Forced measurement rejected all probabilities below `1e-12`. Positive
+  outcomes remain selectable, and weights below `1e-8` are recomputed from the
+  branch projector to avoid cancellation in `1 - <P>`. A `1e-13` branch now
+  has an accurate Born record and no artificial compression loss. Independent
+  and coalesced MPS controls use the same pair of Born weights.
+
+Canonical MPS control norms now reuse the tracked center and represented
+exponent. Kraus Gram expectations pass the live `info_c` through Quimb's
+canonical local expectation API. Exact/SU modes retain their general norm
+paths; noncanonical/custom probability evaluation retains the prior fallback.
+No finite-check defaults, FIT schedules, or truncation settings changed.
+
+### Compatibility audit
+
+Rechecked the [Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+[Autoray repository](https://github.com/jcmgray/autoray),
+[Cotengra documentation](https://cotengra.readthedocs.io/en/latest/) and
+[changelog](https://cotengra.readthedocs.io/en/latest/changelog.html), and
+[Symmray repository](https://github.com/jcmgray/symmray). The Symmray
+Abelian-array documentation endpoint again returned an error. Installed
+versions remain Quimb `1.15.1.dev39+g369d09b9d`, Autoray
+`0.11.1.dev1+gc56f64427`, Cotengra `0.8.3.dev6+g08fe1a3a1`, and Symmray
+`0.3.2.dev6+ga17699db6` in the activated genpy environment.
+
+Probed installed `local_expectation_canonical(G, where, normalized=True,
+info=None, **contract_opts)`, `compute_local_expectation`, `canonicalize`,
+`copy`, `bond_size`, `norm`, `Tensor.modify`, and `Tensor.split` signatures.
+Inspected the actual canonical-expectation body, which forms a local reduced
+density matrix, updates the supplied center metadata, and evaluates its trace
+with the operator. Inspected NumPy/Torch/JAX copy, conjugation, host-transfer,
+QR, and SVD dispatch registrations. **Adopt:** the existing public canonical
+expectation and bond APIs. **Defer:** new upstream compressor, contraction,
+and native-array algorithms. No new shim or installed-package changes.
+
+### Validation
+
+- Added 18 focused regressions to `tests/test_mps_dynamic_controls.py`.
+  Dense complex128 references cover unsorted multi-Pauli supports, both cap
+  absorption directions and endpoints, repeated shortening to one site,
+  rejected last-site removal, represented scale, and reset basis flips.
+  Direct, DMRG2, perm, and exact states agree; canonical-mode tests explicitly
+  check tensor isometry Gram matrices after each event.
+- NumPy/Torch/JAX local Kraus tests reject global norm calls, environment
+  rebuilds, and canonical-center scans while comparing probabilities and
+  unchanged physical states against dense references.
+- Combined MPS, trajectory, control, sampler, public API, package layout, MPI
+  unit, native symmetric tensor, and dependency compatibility tests:
+  1,152 passed, 7 skipped, 39 slow cases deselected.
+- Final trajectory/control rerun after the hidden leakage branch-factor
+  refinement: 136 passed. An earlier full MPS/control/trajectory run, including
+  slow native cases, passed 767 tests before the rare-probability refinements.
+- Default smoke suite: 128 passed. Ruff, MPS skill validation, skill catalog
+  validation, and `git diff --check` passed.
+
+Counts overlap. This was not a full repository extended run or a GPU runtime
+benchmark. Local contraction checks demonstrate removed global work; they do
+not establish a general wall-time speedup or optimality claim.

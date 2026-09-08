@@ -104,7 +104,7 @@ fresh state for every shot:
 
 ```python
 result = pepsy.run_noisy_shots(
-    lambda: pepsy.MpsOptimizer(initial_mps, chi=64, mode="mpo"),
+    lambda: pepsy.MpsOptimizer(initial_mps, chi=64, mode="direct"),
     gates,
     pepsy.PauliErrorModel.bit_flip(0.01),
     shots=100,
@@ -129,7 +129,7 @@ simulator = pepsy.MpsOptimizer(
     initial_mps,
     gate_stream,
     chi=64,
-    mode="mpo",
+    mode="direct",  # default compression algorithm
 )
 result = simulator.run(
     shots=10_000,
@@ -211,6 +211,18 @@ leakage, and mid-circuit controls. It branches `measure`, `reset`, and
 `measure_reset` with exact binomial counts when a hidden measurement outcome
 can change the pure state. Product-state resets use a one-leaf fast path; leaf
 `measurements` records selected projective outcomes.
+
+For ordinary MPS states, the reset fast path requires dimension-one bonds on
+both sides of the logical target (after layout mapping). A numerical purity
+tolerance cannot discard rare entangled outcomes. A product state with larger,
+redundant bonds may therefore retain separate equivalent leaves. Leakage of an
+entangled site also branches its hidden reset outcome before marking the
+placeholder leaked. Branch limits count all live leaves, including retained
+siblings and parents awaiting processing.
+
+Canonical MPS Kraus probabilities use local Gram-operator expectations with
+the optimizer's tracked center. Control norms use that center and the stored
+exponent; exact and simple-update states retain their general norm paths.
 
 Every trajectory result exposes a lightweight `diagnostics` summary:
 

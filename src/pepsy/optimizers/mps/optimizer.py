@@ -2,7 +2,9 @@
 
 :class:`MpsOptimizer` replays a canonical bundled gate stream
 ``[(gate, where), ...]`` against an MPS, using one of several compression
-backends. ``mode="perm"`` uses a lazy permutation swap network: non-local
+backends. The default ``mode="direct"`` selects Quimb's direct compressor;
+``mode="mpo"`` is only a compatibility alias for that algorithm.
+``mode="perm"`` uses a lazy permutation swap network: non-local
 two-site gates swap the right endpoint next to the left endpoint, apply the
 gate, and leave the resulting physical ordering in place. The current
 physical-site-to-logical-site ordering is available as ``optimizer.qubits``.
@@ -12,13 +14,12 @@ swap-back; logical readout is available through ``logical_order``,
 ``remap_sample``, and ``to_dense``.
 Bare Quimb method names such as ``mode="src"`` and ``mode="zipup"`` are
 accepted and normalized internally to ``"quimb-<method>"``. The explicit
-``mode="quimb-direct"`` spelling (with ``"quimb"`` as its direct alias and
-the legacy ``"mpo-<method>"`` / ``"mpo"`` spellings retained) also accepts
+``mode="direct"`` path (internally ``"quimb-direct"``) also accepts
 explicit sub-MPO events of the form
 ``("submpo", mpo, where)`` or
 ``{"kind": "submpo", "mpo": mpo, "where": where}``.  In every mode the stream
 may also carry *control events* that are state operations rather than gates.
-MPO compression modes apply sub-MPO events with ``gate_with_submpo_``;
+Quimb compression modes apply sub-MPO events with ``gate_with_submpo_``;
 DMRG keeps multi-site sub-MPOs as tagged lazy FIT target layers and uses the
 same SRC warm-up policy as ordinary DMRG targets.  The stream may also carry:
 
@@ -43,7 +44,7 @@ canonicalized.
 Control events split the stream into gate/subMPO segments run through the
 active mode and are applied directly to the state between segments, so the same
 stream works in every mode. The default gate path assumes a norm-preserving
-stream. Compressed DMRG/FIT, mixed, MPO, swap/permutation, and SVD modes can
+stream. Compressed DMRG/FIT, mixed, direct, swap/permutation, and SVD modes can
 restore the raw unitary working norm, preventing deep low-precision
 underflow. Non-unitary streams should use ``non_unitary=True``; when
 ``normalize_every`` is enabled this moves the orthogonality center to one site
@@ -1397,8 +1398,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         materialized as ordinary gate matrices before stream validation.
         ``where`` supports one- or two-site locations in 1D/2D/3D forms.
         For a bare Quimb method such as ``mode="src"`` or the qualified
-        ``mode="quimb-<method>"`` (with aliases ``"quimb"`` and legacy
-        ``"mpo-<method>"`` / ``"mpo"``), entries may
+        ``mode="direct"`` or another ``mode="quimb-<method>"``, entries may
         also have the explicit sub-MPO form
         ``("submpo", mpo, where)`` or mapping form
         ``{"kind": "submpo", "mpo": mpo, "where": where}``, with a 1D
@@ -1428,8 +1428,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Positive target/max bond dimension used by compressed modes. Mixed mode
         requires the initial MPS to have ``max_bond() <= chi`` and keeps its
         committed DMRG/MPO results at or below this limit.
-    mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "<quimb-method>", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
-        Optimization backend. ``"fit"`` is the clear alias of the historical
+    mode : str, default="direct"
+        Gate-replay compression algorithm. ``"direct"`` uses Quimb's direct
+        compression to the requested bond dimension; it is the default and
+        preferred public name. ``"mpo"`` and ``"quimb"`` remain compatibility
+        aliases for ``"direct"``. MPO describes an operator representation,
+        not a separate algorithm; explicit sub-MPO inputs work in direct mode.
+        Other Quimb methods accept their bare or ``"quimb-<method>"`` names;
+        legacy ``"mpo-<method>"`` spellings also remain accepted.
+        ``"fit"`` is the clear alias of the historical
         ``"dmrg"`` spelling. ``"dmrg1"`` uses at most two two-site growth
         sweeps, then one-site refinement; once every bond reaches its
         attainable physical/``chi`` ceiling, it latches one-site updates
@@ -1438,7 +1445,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         for the required warm-up (two sweeps by default), then one-site
         refinement. ``"dmrg3"`` follows the same fixed warm-up policy with
         three-site updates before one-site refinement. ``"mix"`` defaults to
-        a direct/MPO warm-up on under-capacity active bonds, followed by
+        a direct-compression warm-up on under-capacity active bonds, followed by
         transactional one-site DMRG/FIT; explicit ``fit_block_size=2`` or
         ``3`` opts into mixed block-FIT transactions.
     contraction_opt : object | None, default="auto-hq"
@@ -1539,6 +1546,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _normalize_mode(cls, mode):
         """Validate and normalize execution mode."""
         mode_norm = str(mode).strip().lower()
+        # Public ``direct`` names the compression algorithm. Historical
+        # ``mpo``/``quimb`` spellings select exactly that same path; retain
+        # them as silent aliases, not distinct replay modes.
+        if mode_norm in {"mpo", "quimb"}:
+            mode_norm = "direct"
         # ``fit`` names the algorithm while ``dmrg`` preserves the historical
         # mode spelling. DMRG1/2/3 are readable block-size aliases that share
         # the same implementation and are normalized to ``dmrg``. The alias
@@ -1557,7 +1569,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @classmethod
     def _is_mpo_mode(cls, mode):
-        """Return whether ``mode`` selects Quimb compression."""
+        """Recognize Quimb compression, including the default direct mode.
+
+        The private helper's historical name refers to the shared operator
+        application machinery, not a public algorithm named ``mpo``.
+        """
         mode_norm = str(mode).strip().lower()
         return (
             mode_norm in {"mpo", "quimb"}
@@ -2088,7 +2104,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         p,
         gates=None,
         chi=None,
-        mode="dmrg",
+        mode="direct",
         contraction_opt="auto-hq",
         ind_id="k{}",
         inplace=False,
@@ -3955,7 +3971,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         has_submpo = any(_is_submpo_event(entry) for entry in entries)
         if has_submpo and not self._is_mpo_mode(self.mode):
             raise ValueError(
-                "shot replay of sub-MPO events requires an MPO mode; "
+                "shot replay of sub-MPO events requires mode='direct' "
+                "or another Quimb compression mode; "
                 f"mode={self.mode!r} cannot consume sub-MPO payloads."
             )
         if self.mode == "mix" and (controls or has_leakage):
@@ -4874,14 +4891,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             paths while preserving Quimb's method-specific native default for
             the MPO path, notably ``"rsum1"`` for ``method="dm"``. Pass a
             string to override it.
-        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "<quimb-method>", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
-            Optional mode override for this run. If supplied, updates
-            ``self.mode`` before execution.
+        mode : str | None, default=None
+            Optional compression-algorithm override for this run. If omitted,
+            use the constructor's mode (``"direct"`` by default). If supplied,
+            update ``self.mode`` before execution. ``"mpo"`` remains a
+            compatibility alias for ``"direct"``.
         k_2q_batch : int, default=1
             DMRG and mixed modes: number of contiguous two-qubit gates to batch
             into one local FIT update. In mixed mode, a failed batch is replayed
-            through MPO as one transaction. Standalone one-site gates use the
-            exact direct/MPO path; an ordinary DMRG target block can also absorb
+            through direct compression as one transaction. Standalone one-site gates use the
+            exact direct path; an ordinary DMRG target block can also absorb
             intervening one-site gates before its shared FIT compression.
         non_unitary : bool, default=False
             Convenience flag for non-unitary gate streams. Normalization is
@@ -4904,10 +4923,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_eps : float, default=1e-15
             Numerical threshold used by the final normalization path.
         submpo_method : str | None, default=None
-            Optional compression-method override for the MPO family. If
+            Optional compression-method override for the Quimb family. If
             omitted, a bare Quimb method such as ``mode="src"`` or the
             qualified ``mode="quimb-<method>"`` selects the method;
-            ``mode="quimb"`` selects ``"direct"``. The opt-in
+            the default ``mode="direct"`` selects ``"direct"``. The opt-in
             ``"sdc"`` and ``"sdc-oversample"`` methods require a Quimb build
             that provides those compressors; they never replace an existing
             default. The legacy
@@ -6013,8 +6032,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if self._is_mpo_mode(self.mode):
             # Report the selected compression method rather than the internal
-            # implementation family. For example, ``mode="mpo"`` and
-            # ``mode="direct"`` both report ``direct.replay``.
+            # implementation family. The default direct compressor reports
+            # ``direct.replay``, including when selected via a legacy alias.
             replay_name = self._mode_mpo_method(self.mode)
             self._timed_call(
                 f"{replay_name}.replay",
@@ -6743,8 +6762,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         the support span rather than the full chain. The fallback preserves
         compatibility with older Quimb versions without that method.
         """
+        return self._state_operator_expectation(self._pauli_operator(pauli, where), where)
+
+    def _state_operator_expectation(self, op, where):
+        """Contract a normalized local operator using the live center metadata."""
         p = self.p
-        op = self._to_state_backend(self._pauli_operator(pauli, where))
+        op = self._to_state_backend(op)
         local_expectation = getattr(p, "local_expectation_canonical", None)
         if callable(local_expectation):
             return self._real_float(
@@ -6773,6 +6796,32 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if norm_val == 0.0:
             return 0.0
         return self._real_float(overlap) / norm_val
+
+    def _measurement_probabilities(self, pauli, where):
+        """Return both Born weights, retaining small positive branches."""
+        expectation = self._state_expectation(pauli, where)
+        p_plus = min(max(0.5 * (1.0 + expectation), 0.0), 1.0)
+        p_minus = 1.0 - p_plus
+        if min(p_plus, p_minus) < 1e-8:
+            # Subtracting an expectation near +/-1 loses relative precision
+            # in rare branches. Contract that branch's projector directly;
+            # ordinary measurements keep their single expectation contraction.
+            outcome = 1 if p_plus < p_minus else -1
+            op = self._pauli_operator(pauli, where)
+            projector = 0.5 * (np.eye(op.shape[0], dtype=complex) + outcome * op)
+            probability = min(max(self._state_operator_expectation(projector, where), 0.0), 1.0)
+            return (probability, 1.0 - probability) if outcome > 0 else (1.0 - probability, probability)
+        return p_plus, p_minus
+
+    def _control_state_norm(self):
+        """Read the represented control-state norm from its tracked center."""
+        if self.mode in {"exact", "su"}:
+            return self._real_float(ar.do("abs", self.p.norm()))
+        current = self._current_orthog(self.p)
+        raw_norm, _center = self._retained_center_norm(self.p, current)
+        return self._real_float(ar.do("abs", raw_norm)) * (
+            10 ** self._real_float(self.p.exponent)
+        )
 
     def _recanonize_center(self, site, *, renormalize):
         """Move the orthogonality centre to ``site`` and track it exactly.
@@ -6842,23 +6891,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # any localizer. The localizer is a Clifford change of Pauli frame; it
         # can make the same observable look simpler, but its post-frame
         # expectation is not the probability of the original branch.
-        exp = self._state_expectation(pauli, where)
-        p_plus = min(max(0.5 * (1.0 + exp), 0.0), 1.0)
+        p_plus, p_minus = self._measurement_probabilities(pauli, where)
         if outcome is None:
             m = 1 if self._rng.random() < p_plus else -1
         else:
             m = 1 if int(outcome) >= 0 else -1
-        prob = p_plus if m > 0 else (1.0 - p_plus)
-        if outcome is not None and prob < 1e-12:
+        prob = p_plus if m > 0 else p_minus
+        if outcome is not None and prob <= 0.0:
             raise ValueError(
-                f"forced measure outcome {outcome} has ~0 probability ({prob:.2e})."
+                f"forced measure outcome {outcome} has zero probability ({prob:.2e})."
             )
         # Move the orthogonality centre to the (anchor) collapse site so the
         # projector acts at the centre and truncation/renormalization stay
         # local and exactly tracked.
         anchor = min(int(site) for site in where)
         self.canonize_mps(self.p, anchor)
-        input_norm = self._real_float(ar.do("abs", self.p.norm()))
+        input_norm = self._control_state_norm()
 
         collapse_center = None
         projector_submpo = self._build_pauli_projector_submpo(
@@ -6900,6 +6948,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     ],
                     measurement_index=len(self.measurements),
                 )
+                # FIT returns the raw center norm. Match the represented
+                # input scale before separating Born weight from truncation.
+                projected_norm *= 10 ** self._real_float(self.p.exponent)
             else:
                 method = (
                     self._mode_mpo_method(self.mode)
@@ -6921,9 +6972,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff_mode=method_cutoff_mode,
                     info=self.info_c,
                 )
-                projected_norm = self._real_float(
-                    ar.do("abs", self.p.norm())
-                )
+                projected_norm = self._control_state_norm()
         else:
             op = self._pauli_operator(pauli, where)
             dim = op.shape[0]
@@ -6936,7 +6985,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
             )
-            projected_norm = self._real_float(ar.do("abs", self.p.norm()))
+            projected_norm = self._control_state_norm()
         self._record_norm_event(
             norm_kind,
             # ``prob`` is the physical branch factor, while ``projected_norm``
@@ -6979,8 +7028,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             axes = ("Z",) * len(where)
         for site, axis in zip(where, axes):
             q = int(site)
-            exp = self._state_expectation(axis, (q,))
-            p_plus = min(max(0.5 * (1.0 + exp), 0.0), 1.0)
+            p_plus, p_minus = self._measurement_probabilities(axis, (q,))
             m = 1 if self._rng.random() < p_plus else -1
             projector = 0.5 * (
                 np.eye(2, dtype=complex) + m * _PAULI_1Q[axis]
@@ -6988,7 +7036,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # Centre at q, collapse, renormalize, and (if needed) flip |1> -> |0>,
             # keeping the tracked centre at q throughout.
             self.canonize_mps(self.p, q)
-            input_norm = self._real_float(ar.do("abs", self.p.norm()))
+            input_norm = self._control_state_norm()
             self._apply_dense_operator(
                 self.p,
                 projector,
@@ -6997,8 +7045,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
             )
-            projected_norm = self._real_float(ar.do("abs", self.p.norm()))
-            branch_probability = p_plus if m > 0 else 1.0 - p_plus
+            projected_norm = self._control_state_norm()
+            branch_probability = p_plus if m > 0 else p_minus
             self._record_norm_event(
                 "reset",
                 expected_norm=input_norm * math.sqrt(float(branch_probability)),
@@ -8589,7 +8637,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         compression_seed=None,
         stabilize_unitary,
     ):
-        """Apply one mixed-mode step through the MPO backend."""
+        """Apply one mixed-mode step with the selected Quimb compressor."""
         self._run_mpo(
             [gate],
             [where],
@@ -8617,7 +8665,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         compression_seed=None,
         stabilize_unitary,
     ):
-        """Apply a mixed-mode fallback batch through the MPO backend."""
+        """Apply a mixed-mode fallback batch with Quimb compression."""
         self._run_mpo(
             G_seq,
             where_seq,
@@ -10959,14 +11007,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         compression_seed=None,
         stabilize_unitary=False,
     ):
-        """Apply gates with MPO-style nonlocal compression.
+        """Replay gates/sub-MPOs with Quimb compression (direct by default).
 
         Uses :meth:`qtn.MatrixProductState.gate_nonlocal_` for two-qubit gates.
+        The historical private name describes operator application machinery;
+        the public mode names the algorithm, such as ``direct`` or ``src``.
         """
         p = self.p
         mpo_method = self._normalize_submpo_method(submpo_method)
-        # ``mpo`` is the internal backend name; expose the selected Quimb
-        # compressor in timing records instead (``direct``, ``src``, etc.).
+        # Report the selected algorithm (``direct``, ``src``, etc.), not
+        # the historical private helper name.
         timing_name = mpo_method
         gate_cutoff_mode = (
             _DEFAULT_CUTOFF_MODE

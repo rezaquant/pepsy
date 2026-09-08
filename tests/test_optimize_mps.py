@@ -499,7 +499,7 @@ def test_mps_optimizer_opt_in_run_timing_reports_replay_metrics():
         qtn.MPS_computational_state("00", dtype="complex128"),
         gates=[(qu.CNOT(), (0, 1))],
         chi=2,
-        mode="mpo",
+        mode="direct",
     )
 
     assert opt.get_run_timing() is None
@@ -507,7 +507,7 @@ def test_mps_optimizer_opt_in_run_timing_reports_replay_metrics():
 
     timing = opt.get_run_timing()
     assert timing["status"] == "complete"
-    assert timing["mode"] == "mpo"
+    assert timing["mode"] == "quimb-direct"
     assert timing["mode_alias"] is None
     assert timing["event_count"] == 1
     assert timing["elapsed_seconds"] >= 0.0
@@ -516,7 +516,7 @@ def test_mps_optimizer_opt_in_run_timing_reports_replay_metrics():
     assert timing["stages"]["canonicalize"]["calls"] >= 1
     assert not any(name.startswith("infidelity.") for name in timing["stages"])
     timing["mode"] = "changed"
-    assert opt.last_run_timing["mode"] == "mpo"
+    assert opt.last_run_timing["mode"] == "quimb-direct"
 
 
 def test_mps_optimizer_diagnostic_accessors_are_copy_safe():
@@ -1001,6 +1001,27 @@ def test_mps_optimizer_accepts_bare_quimb_method_modes(mode, canonical, method):
     assert optimizer.mode == canonical
     assert optimizer._is_mpo_mode(mode)
     assert optimizer._mode_mpo_method(mode) == method
+
+
+def test_mps_optimizer_defaults_to_direct_and_preserves_legacy_aliases():
+    """Omitting mode selects direct compression, including sub-MPO replay."""
+    assert inspect.signature(py.MpsOptimizer).parameters["mode"].default == "direct"
+    state = qtn.MPS_rand_state(4, bond_dim=3, dtype="complex128", seed=917)
+    stream = [(qu.rand_uni(4, seed=918), (0, 3))]
+    stream.append(("submpo", qtn.MPO_identity(2, dtype="complex128"), (1, 2)))
+    reference = None
+    for kwargs in ({}, {"mode": "direct"}, {"mode": "mpo"}, {"mode": "quimb"}):
+        optimizer = py.MpsOptimizer(state, stream, chi=2, **kwargs)
+        optimizer.run(cutoff=0., timing=True)
+        assert optimizer.mode == "quimb-direct"
+        assert optimizer._progress_mode_name(optimizer.mode) == "direct"
+        assert optimizer.get_run_timing()["mode"] == "quimb-direct"
+        assert optimizer.get_fit_diagnostics() is None
+        result = optimizer.to_dense()
+        if reference is None:
+            reference = result
+        else:
+            np.testing.assert_allclose(result, reference, atol=1e-12)
 
 
 def test_mps_optimizer_fit_name_remains_dmrg_alias():
