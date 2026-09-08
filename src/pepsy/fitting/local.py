@@ -9,6 +9,7 @@ import functools
 import logging
 import math
 import time
+import warnings
 from collections import deque
 from collections.abc import Mapping
 from copy import deepcopy
@@ -2964,7 +2965,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         min_iter=None,
         rtol=None,
         patience=1,
-        finite_check=None,
+        finite_check=False,
         timing=None,
         timing_sync_device=False,
         single_pair_fast_path=False,
@@ -2997,7 +2998,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         norm changes by at most ``rtol`` across a ``patience``-sample window.
         Thus ``patience=2`` means one stable comparison between two same-phase
         sweep norms; ``patience=1`` retains the same minimum comparable pair.
-        ``finite_check=True`` reduces all active tensor blocks to native
+        ``finite_check=False`` is the default. Enabling it emits a performance
+        warning; ``finite_check=True`` reduces all active tensor blocks to native
         finite-status scalars and transfers one tiny vector per sweep. The
         terminal retained norm used by ``rtol`` shares that transfer. A callable
         retains the general state-check callback behavior. ``timing=True``
@@ -3091,6 +3093,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         patience = int(patience)
         if finite_check not in (None, False, True) and not callable(finite_check):
             raise TypeError("finite_check must be bool, callable, or None.")
+        if finite_check is True or callable(finite_check):
+            warnings.warn(
+                "FIT finite_check is enabled: checking active tensors every "
+                "sweep adds work and can synchronize accelerator devices.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         timing = bool(timing)
         timing_sync_device = bool(timing_sync_device)
         single_pair_fast_path = bool(single_pair_fast_path)

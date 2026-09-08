@@ -432,6 +432,25 @@ checks are needed. A transactional MPO fallback is still norm-checked before
 commit. Torch and CuPy quality checks process one tensor at a time, combine
 scalar results on the device, and transfer one Boolean to the host.
 
+`run(finite_check=False)` is the default: FIT does not scan active tensor
+arrays for non-finite entries after every sweep. Set `finite_check=True` for
+that diagnostic; FIT emits a `RuntimeWarning` because scanning all active
+arrays adds work and can synchronize an accelerator. This applies to ordinary
+DMRG, mixed-mode FIT, and multi-site measurement FIT, and is forwarded to shot
+workers (an explicit `run_kwargs["finite_check"]` takes precedence).
+Scalar canonical-center norm checks used by convergence and unitary norm
+accounting remain active. Reading those scalars can still synchronize an
+accelerator even with timing and full finite scans disabled.
+`quality_check_every` remains the independent periodic whole-state check.
+
+Dense DMRG SRC guesses and rollback snapshots copy tensor metadata across the
+chain but allocate independent array data only inside the active endpoint
+span. Exterior arrays are read-only shared inputs; Quimb canonicalization
+replaces arrays in the private copy. Active copies retain `left_inds`, backend,
+dtype/device, and Torch autograd connections. Native Symmray/fermionic and
+unrecognized array backends retain full deep copies. The public standalone
+`guess(..., inplace=False)` contract is unchanged.
+
 The expensive direct FIT-target overlap contraction is opt-in through
 `fit_overlap_diagnostics=True`. Its result is reported in
 `opt.get_fit_diagnostics()` as `fit_overlap_fidelity` and
@@ -440,6 +459,10 @@ while retaining the ordinary FIT convergence metadata. If enabled, the
 contraction is performed after each successful DMRG FIT update, including
 DMRG1/2/3 schedules. Mixed-mode transactions retain the existing behavior of
 omitting this target-overlap calculation.
+If the optional contraction fails or returns NaN/infinity, both overlap values
+remain `None` and `fit_overlap_error` explains the failure. This does not reject
+the FIT update. The scalar check applies only to the requested overlap result;
+it does not enable per-sweep `finite_check` scans.
 
 The DMRG/FIT update follows the variational update described in
 the [Ayral *et al.* PRX Quantum paper](https://doi.org/10.1103/PRXQuantum.4.020304):

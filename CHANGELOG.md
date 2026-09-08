@@ -14,6 +14,15 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Added opt-in `MpsOptimizer.run(finite_check=True)` validation for DMRG,
+  mixed-mode FIT, and measurement/shot FIT. Per-sweep active-array scans are
+  disabled by default; enabling them emits a performance warning. Scalar
+  convergence/norm guards and periodic quality checks remain independent.
+- Reduced dense DMRG rollback and SRC-guess copy traffic by isolating array
+  data only in the active window, with independent tensor metadata and
+  read-only exterior sharing. Preserved canonical `left_inds`, Torch gradient
+  connections, and conservative full copies for native symmetry arrays.
+
 - Added a geometry-aware rank scheduling policy to native `TreePeps` and
   `TreePEPO` compression. The default `order="rank"` removes the currently
   cheapest legal leaf branch using live physical/virtual dimensions, while
@@ -317,6 +326,10 @@ Changes for the next release should be added here before the version is bumped.
   defaults and fail locally when an optional Quimb capability is unavailable.
 
 ### Fixed
+
+- Optional MPS FIT overlap diagnostics now report non-finite contraction
+  results as diagnostic errors instead of clipping NaN/infinity to a valid
+  fidelity. Default replay performs no additional checks or contractions.
 
 - Fixed TreeMPO DMRG update finalization so explicit `apply_subtreempo` calls
   close their active norm ledger and record diagnostics. Fixed

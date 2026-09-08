@@ -4761,6 +4761,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        finite_check=False,
         fit_overlap_diagnostics=False,
         stabilize_unitary=False,
         fit_stabilize_unitary=_DEPRECATED_OPTION,
@@ -5038,6 +5039,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             streams.
         fit_stabilize_unitary : optional
             Deprecated compatibility alias for ``stabilize_unitary``.
+        finite_check : bool, default=False
+            Scan active FIT arrays for non-finite values after every sweep.
+            Enabling this emits a RuntimeWarning because the scan adds work
+            and can synchronize accelerators. Applies to DMRG, mixed-mode
+            FIT, and measurement FIT. Shot workers inherit this flag unless
+            ``run_kwargs`` overrides it. Scalar norm-convergence and
+            norm-accounting guards remain independent.
         timing : bool, default=False
             Record wall-clock replay timing in :attr:`last_run_timing` without
             printing. Timing is fully opt-in: disabled runs retain the normal
@@ -5124,6 +5132,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             The updated ``self.p`` state for a single ordinary replay, or a
             stable noisy/MPI result facade when shot replay is selected.
         """
+        if not isinstance(finite_check, (bool, np.bool_)):
+            raise TypeError("finite_check must be a boolean.")
+        finite_check = bool(finite_check)
         if self._shot_runner_requested(
             shots,
             has_trajectory_events=self._has_trajectory_events,
@@ -5144,6 +5155,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ):
             if mode is not None:
                 self.set_mode(mode)
+            run_kwargs = dict(run_kwargs or {})
+            run_kwargs.setdefault("finite_check", finite_check)
             return self._run_shots(
                 shots,
                 error_model=error_model,
@@ -5523,6 +5536,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_init_rand_strength=fit_init_rand_strength,
             fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=bool(fit_single_pair_fast_path),
+            finite_check=finite_check,
             fit_overlap_diagnostics=fit_overlap_diagnostics,
             stabilize_unitary=bool(stabilize_unitary),
             quality_check_every=quality_check_every,
@@ -5742,6 +5756,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 contraction_opt=contraction_opt,
             )
             overlap = float(ar.do("real", overlap))
+            if not math.isfinite(overlap):
+                raise ValueError("FIT target overlap is non-finite")
         except Exception as exc:  # diagnostic only; FIT result remains valid
             return {
                 "fit_overlap_fidelity": None,
@@ -5790,6 +5806,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        finite_check=False,
         fit_overlap_diagnostics=False,
         stabilize_unitary=False,
         quality_check_every=None,
@@ -5829,7 +5846,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_min_iter=fit_min_iter,
                 fit_rtol=fit_rtol,
                 fit_patience=fit_patience,
-                fit_finite_check=True,
+                fit_finite_check=finite_check,
                 fit_block_size=fit_block_size,
                 fit_adaptive_sweeps=fit_adaptive_sweeps,
                 fit_sweep_sequence=fit_sweep_sequence,
@@ -5841,6 +5858,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_init_rand_strength=fit_init_rand_strength,
                 fit_init_seed=fit_init_seed,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
+                finite_check=finite_check,
                 fit_overlap_diagnostics=fit_overlap_diagnostics,
                 stabilize_unitary=stabilize_unitary,
                 quality_check_every=quality_check_every,
@@ -5878,6 +5896,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_init_rand_strength=fit_init_rand_strength,
                 fit_init_seed=fit_init_seed,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
+                finite_check=finite_check,
                 fit_overlap_diagnostics=fit_overlap_diagnostics,
                 stabilize_unitary=stabilize_unitary,
                 non_unitary=non_unitary,
@@ -6160,6 +6179,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     normalize_eps=1e-12,
                     non_unitary=False,
                     submpo_method="direct",
+                    finite_check=mode_kwargs.get("finite_check", False),
                     fit_overlap_diagnostics=mode_kwargs.get(
                         "fit_overlap_diagnostics",
                         False,
@@ -6776,6 +6796,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     fit_single_pair_fast_path=mode_kwargs[
                         "fit_single_pair_fast_path"
                     ],
+                    finite_check=mode_kwargs.get("finite_check", False),
                     fit_overlap_diagnostics=mode_kwargs[
                         "fit_overlap_diagnostics"
                     ],
@@ -7601,6 +7622,35 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         return p_target
 
+    def _copy_fit_window_state(self, p, where):
+        """Copy active FIT data, retaining read-only exterior arrays.
+
+        Quimb copies tensor metadata independently and canonicalization
+        replaces arrays rather than writing through them. FIT and the local
+        compressor update only the endpoint span. Own every array in that
+        span so an in-place failure cannot corrupt the source or rollback.
+        Native/unknown array types retain the conservative full deep copy.
+        """
+        if self._has_symmray_data(p) or p.isfermionic():
+            return p.copy(deep=True)
+        if any(
+            ar.infer_backend(t.data) not in {"numpy", "torch", "jax"}
+            for t in p.tensors
+        ):
+            return p.copy(deep=True)
+        start, stop = min(where), max(where)
+        copied = p.copy()
+        for site in range(start, stop + 1):
+            tensor = copied[site]
+            # Autoray's Torch ``copy`` detaches the autograd graph. Clone
+            # directly so a disposable FIT state retains parameter gradients.
+            data = tensor.data
+            data = data.clone() if ar.infer_backend(data) == "torch" else ar.do("copy", data)
+            tensor.modify(
+                data=data, left_inds=tensor.left_inds
+            )
+        return copied
+
     def _build_compression_fit_guess(
         self,
         p,
@@ -7614,9 +7664,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Build a disposable Quimb-compressed guess from one gate."""
         return guess(
-            p,
+            self._copy_fit_window_state(p, where),
             gate,
             where,
+            inplace=True,
             method=method,
             dims=self._infer_gate_dims(gate, where),
             chi=self.chi,
@@ -7637,7 +7688,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         seed=None,
     ):
         """Build a disposable compressed FIT guess from a sub-MPO."""
-        guess_mps = p.copy(deep=True)
+        guess_mps = self._copy_fit_window_state(p, where)
         self._apply_submpo_with_method(
             guess_mps,
             submpo,
@@ -7662,7 +7713,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         seed=None,
     ):
         """Build a disposable Quimb-compressed guess for a gate batch."""
-        guess_mps = p.copy(deep=True)
+        guess_mps = self._copy_fit_window_state(
+            p, tuple(site for where in wheres for site in where)
+        )
         for i, (gate, where) in enumerate(zip(gates, wheres)):
             guess(
                 guess_mps,
@@ -8501,6 +8554,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        finite_check=False,
         fit_overlap_diagnostics=False,
         stabilize_unitary=False,
     ):
@@ -8518,7 +8572,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_min_iter=fit_min_iter,
             fit_rtol=fit_rtol,
             fit_patience=fit_patience,
-            fit_finite_check=True,
+            fit_finite_check=finite_check,
             fit_block_size=fit_block_size,
             fit_adaptive_sweeps=fit_adaptive_sweeps,
             fit_sweep_sequence=fit_sweep_sequence,
@@ -8528,6 +8582,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_init_rand_strength=fit_init_rand_strength,
             fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
+            finite_check=finite_check,
             fit_overlap_diagnostics=fit_overlap_diagnostics,
             stabilize_unitary=stabilize_unitary,
         )
@@ -8554,6 +8609,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        finite_check=False,
         fit_overlap_diagnostics=False,
         stabilize_unitary=False,
     ):
@@ -8571,7 +8627,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_min_iter=fit_min_iter,
             fit_rtol=fit_rtol,
             fit_patience=fit_patience,
-            fit_finite_check=True,
+            fit_finite_check=finite_check,
             fit_block_size=fit_block_size,
             fit_adaptive_sweeps=fit_adaptive_sweeps,
             fit_sweep_sequence=fit_sweep_sequence,
@@ -8581,6 +8637,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_init_rand_strength=fit_init_rand_strength,
             fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
+            finite_check=finite_check,
             fit_overlap_diagnostics=fit_overlap_diagnostics,
             stabilize_unitary=stabilize_unitary,
         )
@@ -9077,6 +9134,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        finite_check=False,
         fit_overlap_diagnostics=False,
         stabilize_unitary=False,
         non_unitary=False,
@@ -9312,6 +9370,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         fit_init_rand_strength=fit_init_rand_strength,
                         fit_init_seed=fit_init_seed,
                         fit_single_pair_fast_path=fit_single_pair_fast_path,
+                        finite_check=finite_check,
                         fit_overlap_diagnostics=fit_overlap_diagnostics,
                         stabilize_unitary=stabilize_unitary,
                     )
@@ -9527,6 +9586,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_seed,
         fit_single_pair_fast_path,
         measurement_index,
+        finite_check=False,
         fit_overlap_diagnostics=False,
     ):
         """Apply a multi-site projective measurement through DMRG FIT.
@@ -9554,7 +9614,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         self._prepare_fit_window(span, block_size=fit_block_size)
         self.canonize_mps(p, span)
-        state_snapshot = p.copy(deep=True)
+        state_snapshot = self._copy_fit_window_state(p, span)
         info_snapshot = dict(self.info_c)
 
         fit = None
@@ -9640,7 +9700,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 min_iter=fit_min_iter,
                 rtol=fit_rtol,
                 patience=fit_patience,
-                finite_check=True,
+                finite_check=finite_check,
                 block_size=active_fit_block_size,
                 sweep_sequence=fit_sweep_sequence,
                 max_bond=self.chi,
@@ -9802,6 +9862,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        finite_check=False,
         fit_overlap_diagnostics=False,
         stabilize_unitary=False,
         quality_check_every=None,
@@ -9960,7 +10021,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     # guess; norm loss is never silently converted into an MPO
                     # result.
                     fit_state_snapshot = (
-                        p.copy(deep=True)
+                        self._copy_fit_window_state(p, (xmin, xmax))
                         if xmax - xmin > 1 and self.mode != "mix"
                         else None
                     )
@@ -10302,7 +10363,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self.canonize_mps(p, (xmin, xmax))
                     unitary_target_norm = self._unitary_previous_norm
                     fit_state_snapshot = (
-                        p.copy(deep=True)
+                        self._copy_fit_window_state(p, (xmin, xmax))
                         if xmax - xmin > 1 and self.mode != "mix"
                         else None
                     )

@@ -1,5 +1,11 @@
 # `pepsy.fitting.local`
 
+`FIT.run_gate(finite_check=False)` skips per-sweep active-array finite scans
+by default. Enabling `finite_check=True` (or a custom checking callback) emits
+a performance warning. The optional scan is independent of timing and the
+terminal scalar norm used for convergence. `MpsOptimizer.run(finite_check=...)`
+forwards this policy to its FIT calls, including measurements and shot replay.
+
 `FIT(target, p=guess, ...)` variationally fits an open-boundary MPS or MPO
 guess to a target tensor network. There are three sweep entry points:
 

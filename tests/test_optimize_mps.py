@@ -588,20 +588,40 @@ def test_mps_optimizer_fit_overlap_diagnostic_failure_is_nonfatal(monkeypatch):
     assert "diagnostic unavailable" in result["fit_overlap_error"]
 
 
-def test_mps_optimizer_fit_overlap_diagnostics_are_opt_in(monkeypatch):
-    """The expensive FIT-target overlap contraction is disabled by default."""
-    optimizer = py.MpsOptimizer(
+@pytest.mark.parametrize("overlap", [float("nan"), float("inf"), -float("inf")])
+def test_mps_optimizer_fit_overlap_nonfinite_is_reported(monkeypatch, overlap):
+    """Non-finite optional overlaps must not become valid clipped fidelities."""
+    opt = py.MpsOptimizer(
         qtn.MPS_computational_state("00", dtype="complex128"),
-        gates=[(qu.CNOT(), (0, 1))],
+        gates=[],
         chi=2,
         mode="dmrg",
+    )
+    monkeypatch.setattr(mps_optimizer_module, "tn_fidelity", lambda *a, **k: overlap)
+
+    result = opt._fit_overlap_diagnostics(opt.p, opt.p)
+
+    assert result["fit_overlap_fidelity"] is None
+    assert result["fit_overlap_infidelity"] is None
+    assert "non-finite" in result["fit_overlap_error"]
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3", "mix"])
+@pytest.mark.parametrize("timing", [False, True])
+def test_mps_optimizer_fit_overlap_diagnostics_are_opt_in(monkeypatch, mode, timing):
+    """The expensive FIT-target overlap contraction is disabled by default."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_rand_state(8, 2, dtype="complex128", seed=714),
+        gates=[(qu.CNOT(), (2, 4))],
+        chi=2,
+        mode=mode,
     )
 
     def fail(*args, **kwargs):
         raise AssertionError("FIT overlap diagnostics should be opt-in")
 
     monkeypatch.setattr(mps_optimizer_module, "tn_fidelity", fail)
-    optimizer.run(progbar=False, n_iter=2, fit_rtol=None)
+    optimizer.run(progbar=False, n_iter=2, fit_rtol=None, timing=timing)
 
     diagnostics = optimizer.get_fit_diagnostics()
     assert diagnostics["fit_overlap_diagnostics"] is False
