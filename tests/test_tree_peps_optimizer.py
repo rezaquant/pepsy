@@ -289,8 +289,8 @@ def test_tree_peps_dmrg_fits_explicit_sub_treepepo():
     assert optimizer.validate(check_canonical=True) is optimizer
 
 
-def test_tree_fit_center_motion_validates_once_per_sweep():
-    """TreeFIT avoids a whole-tree validation for every local block update."""
+def test_tree_fit_center_motion_avoids_full_canonical_validation():
+    """Trusted local updates do not recheck every outside isometry per sweep."""
 
     plan = TreePepsPlan.from_shape((2, 3))
     state = TreePeps.from_plan(plan)
@@ -305,7 +305,8 @@ def test_tree_fit_center_motion_validates_once_per_sweep():
     fit.p.validate = count_validate
     fit.run_eff(n_iter=2, block_size=2)
 
-    assert calls == [True, True]
+    assert calls == []
+    original_validate(check_canonical=True)
 
 
 def test_direct_optimizer_routes_over_the_tree_geodesic_exactly():

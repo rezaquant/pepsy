@@ -64,6 +64,34 @@ Changes for the next release should be added here before the version is bumped.
   canonical at its root. A contraction-size guard raises instead of silently
   approximating. Native Symmray/fermionic input is explicitly unsupported.
 
+- TreeOptimizer now defaults to `fit_rtol="auto"` and `fit_min_iter=2`,
+  matching MpsOptimizer's dtype-aware stopping tolerances alongside the
+  existing automatic cutoff policy. Automatic tolerance stopping is disabled
+  for declared non-unitary updates; `None` retains fixed-iteration behavior.
+  TreeFIT constructs environments incrementally from neighboring messages
+  and invalidates their dependencies without storing full branch-node sets.
+  Tree sweep names are now `inward-outward` / `outward-inward`, with `RL`/`LR`
+  retained as aliases. Disposable FIT guesses avoid copying parent replay
+  histories while preserving its RNG draw sequence; public copies preserve
+  the warm-up budget.
+
+- Added `TreeOptimizer(mode="zipup")` and `fit_init_strategy="guess-zipup"`:
+  layered TreeMPO/state nodes are contracted and truncated incrementally
+  toward a canonical hub, including native fermionic trees. Ordinary DMRG
+  gates now share `apply_subtreempo` and transfer their disposable lazy target
+  directly to TreeFIT. Routine TreeFIT diagnostics no longer contract a
+  doubled target; known `target_norm` values enable normalized local fidelity,
+  and explicit overlap diagnostics use lossless QR when the norm is unknown.
+  `TreeFIT(finite_check=False)` / `TreeOptimizer(fit_finite_check=False)` keep
+  array scans opt-in, and trusted sweeps avoid full isometry revalidation.
+  Optional target-norm diagnostic failures are reported without aborting a
+  successful fit. Local fitting preserves the target's stored exponent even
+  when it differs from the initial guess. The `track_infidelity` default is
+  unchanged.
+  FIT messages resolve live bond names after canonicalization. Odd-parity
+  fermionic FIT inputs now raise explicitly because their local projections
+  are unsupported; native direct and zipup application remain available.
+
 - Added a geometry-aware rank scheduling policy to native `TreePeps` and
   `TreePEPO` compression. The default `order="rank"` removes the currently
   cheapest legal leaf branch using live physical/virtual dimensions, while

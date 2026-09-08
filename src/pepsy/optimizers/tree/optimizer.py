@@ -411,7 +411,7 @@ class TreeOptimizer:
         spelling ``None``) selects Pepsy's relative discarded-squared-weight
         convention, ``"rsum2"``. Use ``"rel"`` for a relative
         largest-singular-value threshold.
-    mode : {"auto", "direct", "dm", "sdc", "src", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"}
+    mode : {"auto", "direct", "dm", "sdc", "src", "zipup", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"}
         Gate/operator route and state-compression method. Ordinary gate
         entries in ``"auto"``, ``"direct"``, ``"dm"``, ``"sdc"``,
         ``"src"``, and ``"mpo"`` are converted to a true :class:`TreeMPO`
@@ -424,6 +424,9 @@ class TreeOptimizer:
         in the other legacy modes for compatibility.
         ``"sdc"`` and ``"src"`` are shorthands for automatic routing with
         deterministic or randomized successive tree-edge compression.
+        ``"zipup"`` contracts one operator/state node with incoming child
+        messages, then immediately truncates its outgoing message by SVD.
+        Its intermediate cuts do not have a canonical right environment.
         ``"dmrg"`` and ``"dmrg1"``/``"dmrg2"``/``"dmrg3"`` select the
         tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg1`` and
         ``dmrg2`` use two-node warm-up blocks, ``dmrg3`` uses three-node
@@ -514,7 +517,26 @@ class TreeOptimizer:
         Generic ``dmrg`` local block size. Named aliases select their own
         warm-up size; ``dmrg1`` uses two-node growth before one-node DMRG.
     fit_n_iter : int, default=2
-        Number of TreeFIT sweeps per fitted gate window.
+        Maximum TreeFIT iterations per fitted gate window. Each iteration
+        includes an inward and an outward pass in the configured order.
+    fit_min_iter : int or None, default=2
+        Minimum iterations before tolerance stopping; ``None`` permits
+        stopping as soon as two comparable norm samples are available.
+    fit_rtol : {"auto"}, float, or None, default="auto"
+        Relative retained-center-norm stopping tolerance: ``1e-3`` for 16-bit
+        data, ``1e-5`` for float32/complex64, and ``1e-9`` otherwise, matching
+        MpsOptimizer. ``None`` disables tolerance stopping. Automatic stopping
+        is disabled for non-unitary replay or ``track_norm=False`` updates.
+    fit_patience : int, default=1
+        Number of consecutive stable norm comparisons required to stop.
+    fit_sweep_sequence : str, default="inward-outward"
+        Order of the two passes: ``"inward-outward"`` or ``"outward-inward"``.
+        The legacy ``"RL"``/``"LR"`` and ``"INOUT"``/``"OUTIN"`` aliases
+        remain accepted with identical traversal order.
+    fit_finite_check : bool, default=False
+        Opt-in finite-value checks of active TreeFIT tensors after each sweep.
+        Routine fitting uses the terminal canonical-centre norm for convergence
+        and does not scan tensor entries or revalidate every tree isometry.
     fit_adaptive_sweeps : int, default=2
         Number of larger-block warm-up sweeps for generic ``dmrg``. Named
         ``dmrg1`` uses two warm-up sweeps, matching MpsOptimizer.
@@ -590,11 +612,11 @@ class TreeOptimizer:
         if mode in {"dmrg", "dmrg1", "dmrg2", "dmrg3"}:
             return mode
         if mode not in {
-            "auto", "direct", "dm", "sdc", "src", "mpo", "submpo",
+            "auto", "direct", "dm", "sdc", "src", "zipup", "mpo", "submpo",
             "tree_mpo_direct", "tree_mpo_dm",
         }:
             raise ValueError(
-                "mode must be one of 'auto', 'direct', 'dm', 'sdc', 'src', 'mpo', "
+                "mode must be one of 'auto', 'direct', 'dm', 'sdc', 'src', 'zipup', 'mpo', "
                 "'submpo', 'dmrg', 'dmrg1', 'dmrg2', 'dmrg3', "
                 "'tree_mpo_direct', or 'tree_mpo_dm'."
             )
@@ -644,7 +666,7 @@ class TreeOptimizer:
         explicit ``compression_mode`` is rejected rather than silently
         changing the meaning of a mode name.
         """
-        if mode not in {"tree_mpo_direct", "tree_mpo_dm"}:
+        if mode not in {"zipup", "tree_mpo_direct", "tree_mpo_dm"}:
             return compression_mode
         expected = "dm" if mode == "tree_mpo_dm" else "direct"
         if compression_mode not in {expected, "direct"}:
@@ -694,16 +716,40 @@ class TreeOptimizer:
             return "rsum2"
         return value
 
+    def _resolve_fit_rtol(self, value):
+        """Resolve the same dtype-aware stopping tolerance as MpsOptimizer."""
+        if value == "auto":
+            dtype = str(self.backend_dtype).lower()
+            if "16" in dtype:
+                return 1e-3
+            if "32" in dtype or "complex64" in dtype:
+                return 1e-5
+            return 1e-9
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "fit_rtol must be 'auto', a non-negative number, or None."
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "fit_rtol must be 'auto', a non-negative number, or None."
+            )
+        return value
+
     def __init__(self, gates=None, n=None, *, chi=64,
                  cutoff=_DEFAULT_CUTOFF,
                  cutoff_mode=_DEFAULT_CUTOFF_MODE, mode="auto",
                  compression_mode="direct",
                  compression_seed=None,
                  fit_block_size=2, fit_n_iter=2, fit_adaptive_sweeps=2,
-                 fit_min_iter=None, fit_rtol=None, fit_patience=1,
+                 fit_min_iter=2, fit_rtol="auto", fit_patience=1,
                  fit_init_strategy="guess-src",
                  fit_init_rand_strength=0.0, fit_init_seed=0,
-                 fit_sweep_sequence="RL", fit_overlap_diagnostics=False,
+                 fit_sweep_sequence="inward-outward", fit_overlap_diagnostics=False,
+                 fit_finite_check=False,
                  two_site_mode=None,
                  structure="quality", max_arity=2,
                  top_arity=_DEFAULT_TOP_ARITY,
@@ -908,8 +954,13 @@ class TreeOptimizer:
         ):
             raise ValueError("fit_adaptive_sweeps must be a positive integer.")
         self.fit_adaptive_sweeps = int(fit_adaptive_sweeps)
+        if fit_min_iter is not None and (
+            isinstance(fit_min_iter, bool)
+            or not isinstance(fit_min_iter, Integral) or fit_min_iter < 1
+        ):
+            raise ValueError("fit_min_iter must be a positive integer or None.")
         self.fit_min_iter = fit_min_iter
-        self.fit_rtol = fit_rtol
+        self._fit_rtol_requested = fit_rtol
         if not isinstance(fit_patience, Integral) or int(fit_patience) < 1:
             raise ValueError("fit_patience must be a positive integer.")
         self.fit_patience = int(fit_patience)
@@ -925,8 +976,9 @@ class TreeOptimizer:
         if isinstance(fit_init_seed, bool) or not isinstance(fit_init_seed, Integral):
             raise TypeError("fit_init_seed must be an integer.")
         self.fit_init_seed = int(fit_init_seed)
-        self.fit_sweep_sequence = fit_sweep_sequence
+        self.fit_sweep_sequence = TreeFIT._normalize_sweep_sequence(fit_sweep_sequence)
         self.fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
+        self.fit_finite_check = bool(fit_finite_check)
         self.fit_diagnostics = []
         self._last_fit_diagnostics = None
         if compression_seed is not None:
@@ -1075,6 +1127,7 @@ class TreeOptimizer:
         )
         self.cutoff = self._resolve_cutoff(cutoff)
         self.cutoff_mode = self._resolve_cutoff_mode(cutoff_mode)
+        self.fit_rtol = self._resolve_fit_rtol(fit_rtol)
 
         if run and self.G:
             if (
@@ -1414,6 +1467,9 @@ class TreeOptimizer:
 
     def _warn_track_truncation_slow(self):
         """Warn once that complete-spectrum diagnostics add SVD work."""
+        if self.mode == "zipup":
+            # Zipup records bond sizes, not canonical discarded spectra.
+            return
         if self.track_truncation and not self._track_warning_emitted:
             warnings.warn(
                 "TreeOptimizer track_truncation=True enables complete "
@@ -2166,13 +2222,14 @@ class TreeOptimizer:
             fit_n_iter=self.fit_n_iter,
             fit_adaptive_sweeps=self.fit_adaptive_sweeps,
             fit_min_iter=self.fit_min_iter,
-            fit_rtol=self.fit_rtol,
+            fit_rtol=("auto" if self._fit_rtol_requested == "auto" else self.fit_rtol),
             fit_patience=self.fit_patience,
             fit_init_strategy=self.fit_init_strategy,
             fit_init_rand_strength=self.fit_init_rand_strength,
             fit_init_seed=self.fit_init_seed,
             fit_sweep_sequence=self.fit_sweep_sequence,
             fit_overlap_diagnostics=self.fit_overlap_diagnostics,
+            fit_finite_check=self.fit_finite_check,
             structure=self.structure,
             max_arity=self.max_arity,
             top_arity=self.top_arity,
@@ -2897,7 +2954,7 @@ class TreeOptimizer:
                 self._truncation_log_survival,
             )
         else:
-            if self.track_truncation:
+            if self.track_truncation and self.mode != "zipup":
                 relative_loss = 0.0
                 absolute_loss = 0.0
                 max_edge_loss = 0.0
@@ -3013,22 +3070,6 @@ class TreeOptimizer:
             support=tuple(logical_where),
             operator_bond=tree_mpo.max_bond(),
         )
-        if self.mode == "dmrg":
-            target = _build_layered_operator_state_target(self.tn, tree_mpo)
-            region = frozenset(
-                self.tn.steiner_nodes(
-                    [self.plan.node_of_qubit[q] for q in where]
-                )
-            )
-            self._run_tree_fit(
-                target,
-                region,
-                logical_where,
-                operator=tree_mpo,
-            )
-            if renormalize:
-                self.normalize()
-            return self
         self.apply_subtreempo(
             tree_mpo,
             tree_mpo.operator_support,
@@ -3061,7 +3102,7 @@ class TreeOptimizer:
         if strategy in {"direct", "random", "random_expand"}:
             return strategy
         if strategy.startswith("guess_") and strategy[6:] in {
-            "direct", "dm", "sdc", "src"
+            "direct", "dm", "sdc", "src", "zipup"
         }:
             return strategy
         raise ValueError(
@@ -3095,19 +3136,24 @@ class TreeOptimizer:
             return self.tn.copy(), strategy, None
         method = strategy[6:]
         if operator is not None:
-            guess_optimizer = self.copy()
-            guess_optimizer.mode = "auto"
-            guess_optimizer._dmrg_mode_alias = None
-            guess_optimizer.compression_mode = method
-            guess_optimizer.chi = self.chi
-            guess_optimizer.cutoff = self.cutoff
-            guess_optimizer.track_infidelity = False
-            guess_optimizer.track_truncation = False
+            # This disposable replay needs the state and numerical policy,
+            # not the parent's gate queue, diagnostics, histories, or RNG.
+            # Preserve copy()'s one child-seed draw so later measurements
+            # retain their existing seeded sequence.
+            child_seed = int(self.rng.integers(0, 2**63, dtype=np.uint64))
+            guess_optimizer = type(self)(
+                None, state=self.tn, tree=self.plan,
+                chi=self.chi, cutoff=self.cutoff, cutoff_mode=self.cutoff_mode,
+                mode="zipup" if method == "zipup" else "auto",
+                compression_mode="direct" if method == "zipup" else method,
+                compression_seed=self.fit_init_seed, seed=child_seed,
+                threads=self.threads, subtree_workers=self.subtree_workers,
+                max_operator_qubits=self.max_operator_qubits,
+                max_subtree_nodes=self.max_subtree_nodes,
+                track_infidelity=False, track_truncation=False,
+                record_history=False, run=False,
+            )
             guess_optimizer._norm_tracking_enabled = False
-            # ``fit_init_seed`` owns the disposable FIT warm start. Keep it
-            # separate from ``compression_seed``, which controls ordinary
-            # live-state tree compression.
-            guess_optimizer.compression_seed = self.fit_init_seed
             guess_optimizer.apply_subtreempo(
                 operator,
                 getattr(operator, "operator_support", None),
@@ -3145,7 +3191,7 @@ class TreeOptimizer:
 
         return _build_layered_operator_state_target(self.tn, tree_mpo), tree_mpo
 
-    def _run_tree_fit(self, target, region, support, *, operator=None):
+    def _run_tree_fit(self, target, region, support, *, operator=None, target_norm=None):
         """Fit one exact tree target and install it atomically."""
 
         guess_result = self._tree_fit_initial_guess(
@@ -3172,6 +3218,9 @@ class TreeOptimizer:
                 if self.compression_seed is not None else self.fit_init_seed
             ),
             inplace=True,
+            copy_target=False,
+            finite_check=self.fit_finite_check,
+            target_norm=target_norm,
         )
         active_block_size = min(block_size, len(region))
         if (
@@ -3195,13 +3244,18 @@ class TreeOptimizer:
             2 if self._dmrg_mode_alias == "dmrg1"
             else self.fit_adaptive_sweeps
         )
+        fit_rtol = (
+            None if self._fit_rtol_requested == "auto" and (
+                target_norm is None or not self._norm_tracking_enabled
+            ) else self.fit_rtol
+        )
         fit.run_gate(
             region,
             n_iter=self.fit_n_iter,
             block_size=active_block_size,
             sweep_sequence=self.fit_sweep_sequence,
             min_iter=self.fit_min_iter,
-            rtol=self.fit_rtol,
+            rtol=fit_rtol,
             patience=self.fit_patience,
             adaptive_block_sweeps=adaptive_sweeps,
             adaptive_until_rank=(
@@ -3220,6 +3274,8 @@ class TreeOptimizer:
                 "region": tuple(sorted(region)),
                 "fit_init_strategy": strategy,
                 "fit_init_strategy_requested": self.fit_init_strategy,
+                "fit_rtol": fit_rtol,
+                "fit_rtol_requested": self._fit_rtol_requested,
                 "guess_used": strategy != "direct",
                 "guess_method": (
                     strategy[6:] if strategy.startswith("guess_") else strategy
@@ -3627,7 +3683,7 @@ class TreeOptimizer:
             maximum bond. The bar uses the same core readout as
             :class:`MpsOptimizer`; tree-specific ``kq``, ``ctrl``, and
             explicit-operator ``mpo`` counters are added when present.
-        mode : {"auto", "direct", "dm", "sdc", "src", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
+        mode : {"auto", "direct", "dm", "sdc", "src", "zipup", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
             Optional persistent gate/sub-MPO replay selection: a supplied
             value updates :attr:`mode` before replay and remains active for
             future runs and copies. ``"submpo"`` validates an explicit chain
@@ -3715,7 +3771,7 @@ class TreeOptimizer:
                         else self._normalize_compression_mode(compression_mode)
                     )
                     if requested_mode in {
-                        "tree_mpo_direct", "tree_mpo_dm"
+                        "zipup", "tree_mpo_direct", "tree_mpo_dm"
                     }:
                         self._dmrg_mode_alias = None
                         expected = (
@@ -3740,7 +3796,7 @@ class TreeOptimizer:
                             self._dmrg_mode_alias = None
                             self.mode = requested_mode
         if compression_mode is not None:
-            if self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
+            if self.mode in {"zipup", "tree_mpo_direct", "tree_mpo_dm"}:
                 normalized_compression = self._normalize_compression_mode(
                     compression_mode
                 )
@@ -5500,6 +5556,52 @@ class TreeOptimizer:
             if pool is not None:
                 pool.shutdown()
 
+    def _zipup_subtree_messages(self, local, state_inds, order, hub, *, max_bond, cutoff):
+        """Contract and truncate one layered tree node at a time toward a hub.
+
+        Each outgoing message has one retained state leg capped by max_bond
+        and the original state/operator legs toward its unvisited parent.
+        Unlike direct compression, this truncation precedes contraction of
+        the complete operator. Its right environment is not canonical, so
+        local discarded weights are not global fidelity errors.
+        """
+        physical_map = {self._phys(q) + "*": self._phys(q) for q in range(self.n)}
+        for u, v in order:
+            tensor = qtn.tensor_contract(*local[u]).reindex(physical_map)
+            state_bond = self.tn.bond(u, v)
+            left_inds = tuple(ix for ix in tensor.inds
+                              if ix in state_inds[u] and ix != state_bond)
+            new_bond = qtn.rand_uuid()
+            before_bond = self._split_rank_bound(tensor, left_inds)
+            if cutoff == 0.0 and (max_bond is None or before_bond <= max_bond):
+                kept, message = self._qr_route_message(
+                    tensor, left_inds, bond_ind=new_bond,
+                )
+            else:
+                kept, message = tensor.split(
+                    left_inds=left_inds, method="svd", absorb="right",
+                    max_bond=max_bond, cutoff=cutoff, cutoff_mode=self.cutoff_mode,
+                    get="tensors", bond_ind=new_bond,
+                )
+            local[u] = kept
+            local[v].append(message)
+            state_inds[v].discard(state_bond)
+            state_inds[v].add(new_bond)
+            self._record_truncation(
+                kind="zipup", edge=(u, v), before_bond=before_bond,
+                after_bond=kept.ind_size(new_bond), bond_ind=new_bond,
+                max_bond=max_bond, cutoff=cutoff,
+            )
+        local[hub] = qtn.tensor_contract(*local[hub]).reindex(physical_map)
+        if self.tn.fermionic and any(not tensor.data.blocks for tensor in local.values()):
+            # Early independent branch cuts can remove every combination
+            # compatible with the hub charge. Do not install an empty native
+            # array, whose absent blocks also erase its backend/dtype evidence.
+            raise ValueError(
+                "zipup left no compatible charge blocks; increase chi or use "
+                "mode='direct' to truncate with the complete operator environment"
+            )
+
     def _install_routed_subtree(self, local, snodes, hub):
         """Install routed tensors and recover their proven hub centre.
 
@@ -5552,34 +5654,27 @@ class TreeOptimizer:
             "subtree", _normalize_where(where), track_norm=track_norm
         )
         try:
-            if self.mode == "dmrg":
+            if self.mode in {"dmrg", "zipup"}:
+                from .operators import TreeMPO
+
                 logical_where = _normalize_where(where)
-                trial = self.copy()
-                trial.mode = "auto"
-                trial._dmrg_mode_alias = None
-                trial.chi = None
-                trial.cutoff = 0.0
-                trial.track_infidelity = False
-                trial.track_truncation = False
-                trial._norm_tracking_enabled = False
-                trial._apply_subtree_operator_impl(
-                    op,
-                    logical_where,
-                    max_bond=None,
-                    cutoff=0.0,
-                    renormalize=False,
+                compact_where = self._validate_support(logical_where)
+                self._check_operator_limits(compact_where)
+                if len(set(compact_where)) != len(compact_where):
+                    raise ValueError("apply_subtree_operator needs distinct qubits")
+                operator = TreeMPO.from_gate(
+                    self.plan, op, compact_where,
+                    fermionic=self.tn.fermionic,
+                    symmetry=self.tn.symmetry, dtype=self.backend_dtype,
                 )
-                nodes = [
-                    self.plan.node_of_qubit[q] for q in logical_where
-                ]
-                region = frozenset(self.tn.steiner_nodes(nodes))
-                result = self._run_tree_fit(
-                    trial.tn,
-                    region,
-                    logical_where,
+                result = self.apply_subtreempo(
+                    operator, compact_where, max_bond=max_bond, cutoff=cutoff,
+                    track_norm=track_norm, _validate_backend=False,
                 )
                 if renormalize:
                     self.normalize()
+                if started:
+                    self._finish_update()
                 return result
             result = self._apply_subtree_operator_impl(
                 op, where, max_bond=max_bond, cutoff=cutoff,
@@ -5702,11 +5797,17 @@ class TreeOptimizer:
                     self.tn, tree_mpo
                 )
                 region = frozenset(self.tn.steiner_nodes(active_nodes))
+                target_norm = None
+                if track_norm and self._norm_tracking_enabled:
+                    if self.center is None:
+                        self._move_center(min(region))
+                    target_norm = TreeFIT._center_norm_stripped(self.tn)[:2]
                 self._run_tree_fit(
                     target,
                     region,
                     active_support,
                     operator=tree_mpo,
+                    target_norm=target_norm,
                 )
                 if started:
                     self._finish_update()
@@ -5775,6 +5876,9 @@ class TreeOptimizer:
                             lower: physical,
                             upper: physical + "*",
                         })
+                        if self.mode == "zipup":
+                            local[nid] = [state_t, op_t]
+                            continue
                         try:
                             local[nid] = _contract_two_tensors(
                                 state_t, op_t, shared_ind=physical,
@@ -5787,6 +5891,9 @@ class TreeOptimizer:
                                 route="subtreempo",
                             )
                     else:
+                        if self.mode == "zipup":
+                            local[nid] = [state_t, op_t]
+                            continue
                         try:
                             local[nid] = qtn.tensor_contract(state_t, op_t)
                         finally:
@@ -5800,6 +5907,15 @@ class TreeOptimizer:
                         set(local[nid].inds) - state_inds[nid]
                     )
 
+                if self.mode == "zipup":
+                    self._zipup_subtree_messages(
+                        local, state_inds, order, hub,
+                        max_bond=max_bond, cutoff=cutoff,
+                    )
+                    self._install_routed_subtree(local, snodes, hub)
+                    if started:
+                        self._finish_update()
+                    return self
                 self._route_subtree_messages(
                     local,
                     state_inds,
@@ -7619,14 +7735,16 @@ class TreeOptimizer:
             compression_seed=self.compression_seed,
             fit_block_size=self.fit_block_size,
             fit_n_iter=self.fit_n_iter,
+            fit_adaptive_sweeps=self.fit_adaptive_sweeps,
             fit_min_iter=self.fit_min_iter,
-            fit_rtol=self.fit_rtol,
+            fit_rtol=("auto" if self._fit_rtol_requested == "auto" else self.fit_rtol),
             fit_patience=self.fit_patience,
             fit_init_strategy=self.fit_init_strategy,
             fit_init_rand_strength=self.fit_init_rand_strength,
             fit_init_seed=self.fit_init_seed,
             fit_sweep_sequence=self.fit_sweep_sequence,
             fit_overlap_diagnostics=self.fit_overlap_diagnostics,
+            fit_finite_check=self.fit_finite_check,
             structure=self.structure,
             max_arity=self.max_arity,
             top_arity=self.top_arity,

@@ -934,7 +934,7 @@ def test_tree_mpo_gate_modes_use_tree_mpo_not_chain_submpo(monkeypatch):
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
-@pytest.mark.parametrize("mode", ("auto", "direct", "dm", "sdc", "src", "mpo"))
+@pytest.mark.parametrize("mode", ("auto", "direct", "dm", "sdc", "src", "zipup", "mpo", "dmrg2"))
 def test_tree_ordinary_gate_modes_all_lower_to_subtreempo(monkeypatch, mode):
     """Every ordinary gate mode shares the TreeMPO active-region kernel."""
     cnot = np.array(

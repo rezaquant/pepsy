@@ -335,8 +335,10 @@ def _build_layered_operator_state_target(state, operator):
         state_tensors.append(state_tensor)
         operator_tensors.append(operator_tensor)
 
-    state_layer = qtn.TensorNetwork(state_tensors)
-    operator_layer = qtn.TensorNetwork(operator_tensors)
+    # These tensor wrappers are already private. Transfer them through the
+    # temporary layers without copying their metadata again.
+    state_layer = qtn.TensorNetwork(state_tensors, virtual=True)
+    operator_layer = qtn.TensorNetwork(operator_tensors, virtual=True)
     state_layer.reindex_({
         index: qtn.rand_uuid() for index in state_layer.inner_inds()
     })
@@ -346,7 +348,7 @@ def _build_layered_operator_state_target(state, operator):
     target = qtn.TensorNetwork([
         *state_layer.tensors,
         *operator_layer.tensors,
-    ])
+    ], virtual=True)
     target.exponent = (
         _exponent_value(state) + _exponent_value(operator)
     )
@@ -437,6 +439,13 @@ class TreeFIT:
     copy_target : bool, default=True
         Copy ``tn`` before private virtual-index reindexing. Set to ``False``
         only when the target is disposable and ownership is transferred.
+    target_norm : float or (float, float), optional
+        Known exact target norm, or its (mantissa, base-ten exponent) pair.
+        Enables normalized local fidelity for a lazy layered target without
+        contracting it. Omit when unknown; the retained norm remains available.
+    finite_check : bool, default=False
+        Check active tensor entries for finite values once per sweep. The
+        default does not scan arrays or numerically revalidate every isometry.
     """
 
     def __init__(
@@ -455,8 +464,18 @@ class TreeFIT:
         info=None,
         warning=False,
         copy_target=True,
+        target_norm=None,
+        finite_check=False,
     ):
         self._validate_geometry(tn, p)
+        if any(
+            tensor.isfermionic() and tensor.data.parity
+            for network in (tn, p) for tensor in network.tensors
+        ):
+            raise NotImplementedError(
+                "TreeFIT does not support odd-parity fermionic tensors; "
+                "use TreeOptimizer mode='direct' or mode='zipup'"
+            )
         if max_bond is not None:
             if isinstance(max_bond, bool) or not isinstance(max_bond, Integral):
                 raise TypeError("max_bond must be an integer or None")
@@ -478,6 +497,14 @@ class TreeFIT:
             raise ValueError("split_seed must be non-negative")
 
         self.p = p if inplace else p.copy()
+        self.finite_check = bool(finite_check)
+        if target_norm is not None:
+            target_norm = ((float(target_norm), 0.0) if np.isscalar(target_norm)
+                           else tuple(float(x) for x in target_norm))
+            if (len(target_norm) != 2 or target_norm[0] < 0
+                    or not all(np.isfinite(x) for x in target_norm)):
+                raise ValueError("target_norm must be a non-negative norm or (mantissa, exponent)")
+        self._known_target_norm = target_norm
         self.tn = tn.copy() if copy_target else tn
         self.max_bond = max_bond
         self.cutoffs = cutoffs
@@ -493,8 +520,8 @@ class TreeFIT:
         self._target_tensors = self._collect_target_groups()
         if retag:
             self._retag_target()
-        self._components = {
-            (u, v): self._component(u, v) for u in self.nodes for v in _neighbors_of(self.p, u)
+        self._neighbors = {
+            node: tuple(sorted(_neighbors_of(self.p, node))) for node in self.nodes
         }
         self._target_physical = {
             node: _physical_ind(self.p, node) for node in self.nodes
@@ -507,7 +534,6 @@ class TreeFIT:
             else "layered"
         )
         self._target_bonds = {}
-        self._private_target_bonds = {}
         self._prepare_private_target_indices()
 
         self._messages = {}
@@ -521,6 +547,7 @@ class TreeFIT:
         self.last_norm = None
         self.last_overlap = None
         self.final_center_site = None
+        self.sweep_sequence = None
         self.local_norm_trace = []
         self.local_norm_stripped_trace = []
         self.sweep_norm_trace = []
@@ -796,17 +823,8 @@ class TreeFIT:
                         f"target node groups {node!r} and {neighbor!r} must "
                         "share at least one virtual bond"
                     )
-                fitted_bond = self.p.bond(node, neighbor)
                 self._target_bonds[(node, neighbor)] = target_bond
                 self._target_bonds[(neighbor, node)] = target_bond
-                self._private_target_bonds[(node, neighbor)] = (
-                    target_bond,
-                    fitted_bond,
-                )
-                self._private_target_bonds[(neighbor, node)] = (
-                    target_bond,
-                    fitted_bond,
-                )
 
     def clear_environment_cache(self):
         """Discard cached branch entanglement environments."""
@@ -826,28 +844,49 @@ class TreeFIT:
         }
 
     def _message(self, outside, inside):
-        """Construct or retrieve one directed target/state branch message."""
+        """Assemble a directed environment from local tensors and messages.
+
+        The explicit postorder stack avoids Python recursion on deep trees.
+        Each cache miss contracts one node and its incoming environments;
+        no full branch tensor network or per-edge component set is built.
+        """
 
         key = (outside, inside)
         cached = self._messages.get(key)
         if cached is not None:
             self.environment_cache_hits += 1
             return cached
-        self.environment_cache_misses += 1
-        component = self._components[key]
-        target_tensors = [
-            tensor.copy()
-            for node in component
-            for tensor in self._target_tensors[node]
-        ]
-        state_tensors = [_tensor_of(self.p, node).H for node in component]
-        target_bonds, fitted_bond = self._private_target_bonds[key]
-        message = qtn.TensorNetwork([*target_tensors, *state_tensors]).contract(
-            output_inds=(*target_bonds, fitted_bond),
-            optimize=self.contraction_opt,
-        )
-        self._messages[key] = message
-        return message
+        pending = [(outside, inside, False)]
+        while pending:
+            node, destination, ready = pending.pop()
+            edge = (node, destination)
+            if edge in self._messages:
+                self.environment_cache_hits += 1
+                continue
+            incoming = tuple(
+                (neighbor, node) for neighbor in self._neighbors[node]
+                if neighbor != destination
+            )
+            if not ready:
+                pending.append((node, destination, True))
+                pending.extend((u, v, False) for u, v in reversed(incoming))
+                continue
+            tensors = [
+                *self._target_tensors[node],
+                _tensor_of(self.p, node).H,
+                *(self._messages[edge] for edge in incoming),
+            ]
+            # Canonicalization can rename fitted bonds; only the target's
+            # private virtual indices remain fixed throughout the fit.
+            output_inds = (
+                *self._target_bonds[edge], self.p.bond(node, destination),
+            )
+            self._messages[edge] = qtn.tensor_contract(
+                *tensors, output_inds=output_inds,
+                optimize=self.contraction_opt, preserve_tensor=True, drop_tags=True,
+            )
+            self.environment_cache_misses += 1
+        return self._messages[key]
 
     def _boundary_edges(self, block):
         """Return sorted edges crossing from ``block`` to its exterior."""
@@ -871,13 +910,13 @@ class TreeFIT:
             return cached.copy()
         self.environment_cache_misses += 1
         tensors = [
-            tensor.copy()
+            tensor
             for node in block
             for tensor in self._target_tensors[node]
         ]
         boundary = self._boundary_edges(block)
         for inside, outside in boundary:
-            tensors.append(self._message(outside, inside).copy())
+            tensors.append(self._message(outside, inside))
         output_inds = tuple(
             self._target_physical[node]
             for node in sorted(block)
@@ -885,9 +924,12 @@ class TreeFIT:
         ) + tuple(
             self.p.bond(inside, outside) for inside, outside in boundary
         )
-        effective = qtn.TensorNetwork(tensors).contract(
+        effective = qtn.tensor_contract(
+            *tensors,
             output_inds=output_inds,
             optimize=self.contraction_opt,
+            preserve_tensor=True,
+            drop_tags=True,
         )
         self._effective_cache[key] = effective.copy()
         return effective
@@ -896,17 +938,24 @@ class TreeFIT:
         """Invalidate only messages whose component contains an updated node."""
 
         block = frozenset(block)
-        for key, component in tuple(self._components.items()):
-            if component.intersection(block):
-                self._messages.pop(key, None)
-        for key in tuple(self._effective_cache):
-            effective_block = frozenset(key)
-            depends_on_changed_message = any(
-                self._components[(outside, inside)].intersection(block)
-                for inside, outside in self._boundary_edges(effective_block)
+        if not block:
+            return
+        pending = [
+            (node, neighbor) for node in block for neighbor in self._neighbors[node]
+        ]
+        while pending:
+            node, destination = pending.pop()
+            if self._messages.pop((node, destination), None) is None:
+                # Every cached message retains its dependencies. If this
+                # input is absent, no downstream cached message can use it.
+                continue
+            pending.extend(
+                (destination, neighbor) for neighbor in self._neighbors[destination]
+                if neighbor != node
             )
-            if effective_block.intersection(block) or depends_on_changed_message:
-                self._effective_cache.pop(key, None)
+        # Every effective tensor depends on the fitted exterior or on the
+        # indices of its own block, so any state update invalidates it.
+        self._effective_cache.clear()
 
     def _canonicalize_for_block(self, block, center):
         """Prepare isometric exterior branches and move the centre."""
@@ -1046,6 +1095,10 @@ class TreeFIT:
                 tags=live.tags,
                 left_inds=left_inds,
             )
+        # The effective block projects the target's raw tensors onto an
+        # isometric exterior. Its represented scale therefore belongs to the
+        # target, independently of the initial guess's extracted exponent.
+        self.p.exponent = _exponent_value(self.tn)
         self.p._canonical_region = frozenset({center})
         if validate:
             self.p.validate(check_canonical=True)
@@ -1142,14 +1195,14 @@ class TreeFIT:
         """Return the target norm without contracting its full overlap path.
 
         Fused native tree targets can be moved to ``center`` and read from one
-        tensor just like the fitted state.  A plain or layered Quimb target
-        does not own tree canonical metadata, so it uses one cached norm
-        fallback.  The fallback is outside the per-sweep fitted-state path
-        and is never used for the routine local norm readout itself.
+        tensor just like the fitted state. A plain or layered target requires
+        a supplied norm or the cached explicit canonical-QR diagnostic.
         """
 
         if self._target_norm_stripped is not None:
             return self._target_norm_stripped
+        if self._known_target_norm is not None:
+            return self._known_target_norm
 
         target = self.tn
         if (
@@ -1169,16 +1222,63 @@ class TreeFIT:
             )
             return self._target_norm_stripped
 
-        # Layered and plain tagged targets can have more than one tensor or
-        # more than one bond crossing a structural edge, so they cannot use a
-        # TreeTensorNetwork centre readout without first changing their
-        # topology.  Cache this exceptional compatibility fallback once.
-        mantissa, exponent = target.norm(strip_exponent=True)
+        # An opaque layered target has no known canonical norm. Do not turn
+        # routine diagnostics into a doubled target contraction.
+        raise ValueError("layered target norm is unknown; supply target_norm")
+
+    def _canonical_target_norm(self, center):
+        """Explicit diagnostic fallback: lossless leaf QR, then one hub norm.
+
+        Never form <target|target>. Only requested exact-overlap diagnostics
+        may do this extra pass; normal FIT retains its lazy target throughout.
+        """
+        parent = {center: None}
+        order = [center]
+        for node in order:
+            for neighbor in _neighbors_of(self.p, node):
+                if neighbor not in parent:
+                    parent[neighbor] = node
+                    order.append(neighbor)
+        groups = {node: list(ts) for node, ts in self._target_tensors.items()}
+        for node in reversed(order[1:]):
+            destination = parent[node]
+            tensor = qtn.tensor_contract(*groups[node])
+            right_inds = self._target_bonds[(node, destination)]
+            left_inds = tuple(ix for ix in tensor.inds if ix not in right_inds)
+            splitter = getattr(self.p, "_native_qr_split", None)
+            if splitter is None:
+                if ar.infer_backend(tensor.data) == "symmray":
+                    raise NotImplementedError("native target QR requires the tree QR policy")
+                _, message = tensor.split(left_inds, method="qr", get="tensors")
+            else:
+                _, message = splitter(tensor, left_inds=left_inds, get="tensors")
+            groups[destination].append(message)
+        hub = qtn.tensor_contract(*groups[center])
+        if ar.infer_backend(hub.data) == "symmray":
+            network = qtn.TensorNetwork([hub])
+            squared = (network.H | network).contract(all)
+        else:
+            squared = qtn.tensor_contract(hub.H, hub, output_inds=[])
         self._target_norm_stripped = (
-            float(abs(_scalar_value(mantissa))),
-            float(exponent),
+            float(np.sqrt(max(0.0, float(np.real(_scalar_value(squared)))))),
+            _exponent_value(self.tn),
         )
-        return self._target_norm_stripped
+
+    def _check_finite(self, region):
+        """Optional backend-native finite checks on the updated tensors."""
+        flags = []
+        owners = []
+        for node in region:
+            data = _tensor_of(self.p, node).data
+            arrays = data.blocks.values() if ar.infer_backend(data) == "symmray" else (data,)
+            for array in arrays:
+                flags.append(ar.do("all", ar.do("isfinite", array)))
+                owners.append(node)
+        if flags:
+            finite = np.asarray(ar.to_numpy(ar.do("stack", flags)), dtype=bool)
+            bad = np.flatnonzero(~finite)
+            if bad.size:
+                raise FloatingPointError(f"non-finite TreeFIT tensor at node {owners[bad[0]]}")
 
     def _local_norm_fidelity(self):
         """Return MPS-style retained-centre-norm fidelity for the latest sweep."""
@@ -1230,31 +1330,28 @@ class TreeFIT:
 
     @staticmethod
     def _log_stripped_norm(network):
-        """Return ``log(norm)`` without materializing a large scale."""
-
-        mantissa, exponent = network.norm(strip_exponent=True)
-        mantissa = abs(_scalar_value(mantissa))
-        if mantissa == 0.0:
-            return -np.inf
-        return float(np.log(mantissa) + float(exponent) * np.log(10.0))
+        """Return a canonical tree log norm without a doubled network."""
+        return TreeFIT._log_norm_pair(TreeFIT._center_norm_stripped(network)[:2])
 
     def _network_norm(self, network):
         """Read a represented tree norm without changing its gauge."""
 
-        mantissa, exponent = network.norm(strip_exponent=True)
-        return float(abs(_scale_stripped(
-            _scalar_value(mantissa), float(exponent)
-        )))
+        mantissa, exponent, _ = self._center_norm_stripped(network)
+        return float(abs(_scale_stripped(mantissa, exponent)))
 
-    def _normalized_overlap_fidelity(self):
+    def _normalized_overlap_fidelity(self, overlap_pair=None):
         """Return normalized target overlap using stripped exponents."""
 
-        overlap, overlap_exponent = self._global_overlap_stripped()
+        overlap, overlap_exponent = (
+            self._global_overlap_stripped() if overlap_pair is None else overlap_pair
+        )
         log_overlap = -np.inf if abs(overlap) == 0.0 else float(
             np.log(abs(overlap)) + overlap_exponent * np.log(10.0)
         )
-        log_target = self._log_stripped_norm(self.tn)
-        log_fitted = self._log_stripped_norm(self.p)
+        log_target = self._log_norm_pair(
+            self._target_norm_stripped_for_center(self.final_center_site)
+        )
+        log_fitted = self._log_norm_pair(self._center_norm_stripped(self.p)[:2])
         log_fidelity = 2.0 * (log_overlap - log_target - log_fitted)
         if not np.isfinite(log_fidelity):
             return 0.0 if log_fidelity < 0.0 else 1.0
@@ -1402,6 +1499,19 @@ class TreeFIT:
             for edge, target in targets
         )
 
+    @staticmethod
+    def _normalize_sweep_sequence(sequence):
+        """Return a tree-oriented name while accepting legacy chain aliases."""
+        key = str(sequence).strip().lower().replace("-", "").replace("_", "")
+        if key in {"inwardoutward", "inout", "rl"}:
+            return "inward-outward"
+        if key in {"outwardinward", "outin", "lr"}:
+            return "outward-inward"
+        raise ValueError(
+            "sweep_sequence must be 'inward-outward' or 'outward-inward' "
+            "(legacy 'RL', 'LR', 'INOUT', and 'OUTIN' are also accepted)"
+        )
+
     def run_gate(
         self,
         region,
@@ -1409,7 +1519,7 @@ class TreeFIT:
         verbose=False,
         *,
         block_size=2,
-        sweep_sequence="RL",
+        sweep_sequence="inward-outward",
         min_iter=None,
         rtol=None,
         patience=1,
@@ -1420,8 +1530,11 @@ class TreeFIT:
         """Run cached tree FIT sweeps over a connected active region.
 
         ``block_size`` is the number of connected structural tree nodes in a
-        local update. ``sweep_sequence`` accepts ``"RL"``/``"LR"`` (the
-        MPS-compatible spellings) and maps them to inward/outward tree sweeps.
+        local update. ``sweep_sequence`` selects ``"inward-outward"`` or
+        ``"outward-inward"``; legacy ``"RL"``/``"LR"`` remain aliases.
+        One iteration includes both directional passes. These directions are
+        measured relative to the active region's medial node, not necessarily
+        the structural root of the whole tree.
         The target remains fixed and the fitted state is updated in place.
         ``adaptive_block_sweeps`` enables the MPS-compatible larger-block
         warm-up followed by one-site refinement. ``adaptive_until_rank``
@@ -1459,15 +1572,12 @@ class TreeFIT:
         # three-node update on a two-node region is an ordinary two-node
         # update, and a one-node region is necessarily one-site.
         block_size = min(int(block_size), len(region))
-        sequence = str(sweep_sequence).strip().upper().replace("-", "")
-        if sequence not in {"RL", "LR", "INOUT", "OUTIN"}:
-            raise ValueError("sweep_sequence must be 'RL', 'LR', 'INOUT', or 'OUTIN'")
+        sequence = self._normalize_sweep_sequence(sweep_sequence)
         directions = {
-            "RL": ("in", "out"),
-            "LR": ("out", "in"),
-            "INOUT": ("in", "out"),
-            "OUTIN": ("out", "in"),
+            "inward-outward": ("in", "out"),
+            "outward-inward": ("out", "in"),
         }[sequence]
+        self.sweep_sequence = sequence
         if min_iter is None:
             min_iter = 1
         if int(min_iter) < 1:
@@ -1565,7 +1675,8 @@ class TreeFIT:
             self.iterations_run = iteration
             self.final_direction = directions[-1]
             self.final_center_site = getattr(self.p, "orthogonality_center", None)
-            self.p.validate(check_canonical=True)
+            if self.finite_check:
+                self._check_finite(region)
             local_pair = self._record_local_norm()
             local_norm_log = self._log_norm_pair(local_pair)
             if verbose:
@@ -1655,7 +1766,8 @@ class TreeFIT:
                 self.final_center_site = getattr(
                     self.p, "orthogonality_center", None
                 )
-                self.p.validate(check_canonical=True)
+                if self.finite_check:
+                    self._check_finite(region)
                 self._record_local_norm()
                 if verbose:
                     self.fidelity_trace.append(self._local_norm_fidelity())
@@ -1669,7 +1781,7 @@ class TreeFIT:
         verbose=False,
         *,
         block_size=1,
-        sweep_sequence="RL",
+        sweep_sequence="inward-outward",
         min_iter=None,
         rtol=None,
         patience=1,
@@ -1699,7 +1811,7 @@ class TreeFIT:
         verbose=False,
         *,
         block_size=1,
-        sweep_sequence="RL",
+        sweep_sequence="inward-outward",
         min_iter=None,
         rtol=None,
         patience=1,
@@ -1733,7 +1845,8 @@ class TreeFIT:
         """Return a copy-safe summary of the latest tree FIT run.
 
         ``local_fidelity`` is the MPS-compatible retained-centre-norm
-        fidelity and is always available when a canonical centre can be read.
+        fidelity when both the retained canonical norm and target norm are
+        known. It is None for opaque layered targets without ``target_norm``.
         ``overlap=True`` additionally requests the expensive genuine overlap
         with the full target; that value is reported as ``target_fidelity``
         and never replaces the local norm diagnostic.
@@ -1783,18 +1896,33 @@ class TreeFIT:
             "adaptive_sweeps": int(self.adaptive_sweeps_run),
             "one_site_refinement_sweeps": int(self.one_site_sweeps_run),
             "block_size_trace": tuple(self.block_size_trace),
+            "sweep_sequence": self.sweep_sequence,
             "target_layout": self.target_layout,
             "cache": self.environment_cache_info(),
         }
         if overlap:
             try:
+                try:
+                    self._target_norm_stripped_for_center(self.final_center_site)
+                except ValueError:
+                    self._canonical_target_norm(self.final_center_site)
+                local_fidelity = self._local_norm_fidelity()
+                result.update({
+                    "local_fidelity": local_fidelity,
+                    "local_infidelity": (
+                        None if local_fidelity is None
+                        else float(max(0.0, 1.0 - local_fidelity))
+                    ),
+                })
                 overlap_mantissa, overlap_exponent = (
                     self._global_overlap_stripped()
                 )
                 overlap_value = _scale_stripped(
                     overlap_mantissa, overlap_exponent
                 )
-                target_fidelity = self._normalized_overlap_fidelity()
+                target_fidelity = self._normalized_overlap_fidelity(
+                    (overlap_mantissa, overlap_exponent)
+                )
                 result.update({
                     "overlap": overlap_value,
                     "target_fidelity": float(target_fidelity),

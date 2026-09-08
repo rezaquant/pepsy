@@ -222,9 +222,29 @@ one-node case.
 - `TreeOptimizer` mirrors all of this: `canonical_region` property,
   `canonize_subtree(nodes, span=...)`, `canonize_around_qubits(qubits)`,
   `is_subtree_canonical_form(nodes)` — all thin delegates to the state.
+## Ordinary gate routing and local FIT
 
+Ordinary gate streams in `auto`, `direct`, `dm`, `sdc`, `src`, `zipup`,
+`mpo`, and DMRG modes build a TreeMPO and use `apply_subtreempo`. Explicit
+`submpo` still declares chain-MPO entries. Keep the target and disposable
+FIT guess separate; `guess-zipup` is an opt-in tree warm start.
+TreeFIT rejects odd-parity fermionic tensors because their graded local
+projection is unsupported; use native `direct` or `zipup` for those states.
 
-## Two-qubit gate = exact threading + one compression sweep
+- `direct` QR-routes the complete operator before canonical SVD compression.
+  `dm` changes the local split to `svd:eig`; `src` uses randomized edge SVD.
+  Tree `sdc` currently shares the deterministic SVD sweep with `direct`.
+- `zipup` contracts node layers with arriving child messages and truncates
+  each outgoing message immediately. Do not add a full-target materialization
+  or canonical precompression. Its intermediate cuts have noncanonical
+  unvisited environments, so discarded weights are not global error bounds.
+- TreeFIT uses incremental neighboring messages and `inward-outward` passes.
+  TreeOptimizer's `fit_rtol="auto"` follows the state dtype; `None` disables
+  tolerance stopping. Keep finite scans and exact overlap diagnostics opt-in.
+  Read [`references/fit-environments.md`](references/fit-environments.md)
+  before changing environment reuse, guess ownership, or stopping policy.
+
+## Low-level two-qubit gate = exact threading + one compression sweep
 
 This is the paper's accuracy point (Figs. 3-6) -- do not regress it.
 
@@ -402,8 +422,8 @@ canonicalization/compression, or independent/coalesced trajectory replay.
 
 ## Performance and layout
 
-The public performance defaults are ``mode="auto"`` (direct two-site
-threading), ``threads=1`` and ``subtree_workers=1`` (small-TTN operations avoid
+The public performance defaults are ``mode="auto"`` (TreeMPO routing),
+``threads=1`` and ``subtree_workers=1`` (small-TTN operations avoid
 oversubscription), ``profile=False``, and ``track_truncation=False`` (no
 diagnostic spectrum SVDs). The low-level
 ``TreeTensorNetwork.compress_edge_`` default is the same ``cutoff_mode="rsum2"``
@@ -421,19 +441,19 @@ non-binary layout contract is in
 it before changing those paths.
 
 ## Gotchas / teaching notes
-
 - `convergence_sweep` observable `max_drift` can show a **false plateau**: a
   garbage low-`chi` state can have small drift while fidelity is ~0.01. Trust
   fidelity (small `n`) or push `chi`; drift alone lies.
-- Do not truncate while threading -- it breaks the "each truncation sees the
-  whole gate" accuracy property.
+- Do not truncate while threading in the direct route -- it breaks the
+  "each truncation sees the whole gate" accuracy property. The explicit
+  `zipup` route deliberately makes its approximation during message routing.
 - Do not pass `canonize=` to `compress_between`.
 - 2q gate reshape order is `(out_a, out_b, in_a, in_b)`.
 
 ## Roadmap / not yet implemented
-
-- Chain-only MPS execution modes (`svd`, `dmrg`, `mpo`, `swap`, `perm`, `su`,
-  and `mix`) are not meaningful on arbitrary tree geometry. Native structured
+- Chain-only MPS execution modes (`svd`, `swap`, `perm`, `su`, and `mix`)
+  are not exposed on arbitrary tree geometry. `dmrg` uses native TreeFIT;
+  `mpo` and `zipup` have tree-specific routes described above. Native structured
   sub-MPO payloads are routed through the Quimb MPO site interface; only
   payloads that do not expose that interface use the guarded dense fallback.
   Pauli and computational-basis measurement helpers are dense two-level qubit

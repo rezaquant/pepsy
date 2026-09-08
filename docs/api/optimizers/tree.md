@@ -653,6 +653,23 @@ The combined `tree_mpo_direct` and `tree_mpo_dm` names select both the true
 TreeMPO route and its compression method, so a conflicting explicit
 `compression_mode` is rejected.
 
+`mode="zipup"` uses the same `apply_subtreempo` entry point, but contracts
+one layered operator/state node only when its incoming child messages are
+ready. An SVD immediately caps the outgoing state leg at `chi` before the
+message reaches its parent. This avoids constructing the fully enlarged
+tree before truncation. The unvisited environment is not canonical, so
+zipup's intermediate discarded weights are not global error estimates; its
+accuracy can differ from `direct` at the same `chi`. It uses direct SVD,
+rejects a conflicting `compression_mode`, and leaves a canonical hub.
+Dense NumPy/Torch and native fermionic arrays retain their backend and dtype.
+Provably lossless zero-cutoff messages use the shared QR policy instead of
+SVD. Bond-size history is recorded, but zipup does not report intermediate
+discarded spectra as canonical truncation errors, even with
+`track_truncation=True`; those error fields remain unavailable.
+On a native fermionic tree, an overly small cap can remove every compatible
+charge path. Zipup raises before installing such an empty state; increase
+`chi` or choose `direct`, whose cuts see the complete operator environment.
+
 `compression_mode="sdc"` selects the deterministic successive tree-edge
 sweep already used by the tree canonical-compression machinery. It is the
 tree-safe analogue of Quimb's 1D SDC environment compressor, not a claim that
@@ -662,6 +679,8 @@ selects a successive randomized-SVD split on each dense tree edge and accepts
 `src` because an ungraded randomized sketch cannot preserve Symmray charge
 sectors. These modes expose safe tree behavior; they do not yet implement the
 paper's full projected Cholesky (CBC) precomputation for general TTNs.
+At present, `sdc` and `direct` use the same deterministic SVD tree sweep;
+they are not independent algorithms to compare in a tree benchmark.
 
 ### Tree-native FIT / DMRG
 
@@ -679,7 +698,7 @@ fit.run_gate(
     active_nodes,
     n_iter=4,
     block_size=2,       # 1, 2, or 3 connected tree nodes
-    sweep_sequence="RL",
+    sweep_sequence="inward-outward",
 )
 updated = fit.p
 report = fit.fit_diagnostics(overlap=True)
@@ -688,22 +707,69 @@ report = fit.fit_diagnostics(overlap=True)
 Before each local solve, the kernel moves the orthogonality centre along the
 unique tree path. Only messages whose branch intersects a changed local block
 or centre path are invalidated, so untouched branches retain their cached
-entanglement environments. `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
+entanglement environments. Each missing directed message contracts only its
+node's target tensors, fitted bra tensor, and incoming neighbor messages.
+An iterative postorder traversal avoids recursive calls on deep trees.
+Invalidation follows those dependencies outward; there is no table of full
+branch-node sets. Temporary messages carry indices and data without
+accumulating branch-wide tags. `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
 engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names. Generic
 `dmrg` uses `fit_block_size` (two by default) and its configured adaptive
 warm-up. `dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
-three-node warm-up blocks; all named modes then refine with one-node sweeps.
+three-node warm-up blocks; remaining iterations refine with one-node sweeps.
+With the default two iterations and two warm-up iterations, `dmrg2`/`dmrg3`
+do not reach one-node refinement. Four iterations give `(2, 2, 1, 1)` or
+`(3, 3, 1, 1)` respectively.
+
+`fit_sweep_sequence="inward-outward"` is the TreeOptimizer default. Use
+`"outward-inward"` to reverse the order. Each iteration includes both passes,
+ordered relative to the active region's medial node, which need not be the
+whole tree's root. `RL`/`INOUT` and `LR`/`OUTIN` remain compatible aliases
+for the two orders. Standalone TreeFIT uses the same names and default;
+diagnostics report the normalized `sweep_sequence`.
 
 The optimizer options `fit_n_iter`, `fit_adaptive_sweeps`, `fit_min_iter`, `fit_rtol`,
 `fit_patience`, `fit_sweep_sequence`, `fit_init_strategy`,
 `fit_init_rand_strength`, and `fit_init_seed` are forwarded to TreeFIT.
 `fit_init_strategy="direct"` keeps the current state as the initial guess;
-`"guess-src"`, `"guess-sdc"`, and `"guess-dm"` use a disposable compressed
+`"guess-src"`, `"guess-sdc"`, `"guess-zipup"`, and `"guess-dm"` use a disposable compressed
 warm start; `"random"` perturbs only active tensors and `"random_expand"`
 also grows active bonds towards the exact target rank, capped by `chi`.
 Randomized guesses remain deterministic for a fixed seed. Dense TreeFIT
 updates preserve canonical metadata and the represented exponent; no implicit
 normalization is performed on a non-unitary target.
+
+Disposable compressed guesses copy the state once through the ordinary state
+handoff. They do not clone the parent optimizer's queued gates, replay history,
+or diagnostic records. They retain the previous single child-seed draw from
+the parent RNG, preserving later measurement sequences; randomized
+compression still uses `fit_init_seed`. Public `TreeOptimizer.copy()` preserves independent
+histories, replay configuration, and a derived child RNG; it also preserves the
+configured `fit_adaptive_sweeps`.
+
+TreeOptimizer defaults to `fit_rtol="auto"` and `fit_min_iter=2`:
+
+| State precision | `cutoff="auto"` | `fit_rtol="auto"` |
+| --- | --- | --- |
+| 16-bit | `1e-3` | `1e-3` |
+| float32 / complex64 | `1e-6` | `1e-5` |
+| float64 / complex128 | `1e-12` | `1e-9` |
+
+The tolerances resolve from the installed state's dtype at construction,
+matching MpsOptimizer's numerical policy. `cutoff_mode="auto"` retains
+`"rsum2"`. Explicit numbers remain unchanged, and `fit_rtol=None` disables
+tolerance stopping. `fit_patience=1` means one stable comparison of two
+same-phase norm samples; the counter resets when the block size changes.
+`fit_n_iter` remains the iteration budget, and rank-growth/warm-up conditions
+still gate early stopping. This criterion measures relative change in the
+retained canonical-center norm, not a bound on the global state error.
+
+As with MpsOptimizer's non-unitary policy, automatic tolerance stopping is
+disabled during `run(non_unitary=True)`. It is also disabled for updates with
+`track_norm=False`, whose target norm is not assumed known. Explicit numeric
+`fit_rtol` remains honored in those cases. Optimizer FIT diagnostics report
+both `fit_rtol_requested` and the effective `fit_rtol` for each update.
+Standalone TreeFIT retains `rtol=None` by default.
 
 TreeFIT accepts `retag=True` for structural node-tag alignment and
 `copy_target=False` for an explicitly disposable target. Its target may be a
@@ -720,6 +786,14 @@ physical input/output legs are connected. This keeps the DMRG target aligned
 with the layered FIT representation while leaving the direct TreeMPO route
 unchanged.
 
+All ordinary DMRG gate entries now use `apply_subtreempo` too. The optimizer
+transfers ownership of its disposable layered target to TreeFIT with
+`copy_target=False`. `fit_finite_check=False` is the default; enable it to
+check active tensor entries once per sweep. Standalone TreeFIT uses
+`finite_check=False`. Trusted local updates no longer recompute every
+outside isometry after each sweep; explicit `state.validate(check_canonical=True)`
+remains available. The existing `track_infidelity` default is unchanged.
+
 TreeFIT's `local_fidelity` is the clipped squared ratio of the retained
 terminal canonical-centre norm to the fixed target norm, matching MPS FIT's
 local norm diagnostic. `local_norm_trace` contains one such centre readout per
@@ -727,11 +801,29 @@ completed sweep and `local_norm_stripped_trace` preserves its mantissa and
 base-ten exponent. It is distinct from the optimizer's `norm_diagnostics()`
 local and cumulative retained-norm proxy, which is computed from
 canonical-centre norm ratios and stored in logarithmic form to avoid
-underflow. `fit_diagnostics(overlap=True)` is a separate opt-in full target
-contraction; its genuine directional overlap is reported as `target_fidelity`,
+underflow. For lazy targets, pass the known exact `target_norm` (a norm or
+mantissa/exponent pair) to obtain this normalized ratio without additional
+target work. TreeOptimizer supplies the pre-update canonical norm when
+`track_norm=True`, the unitary-update contract. For non-unitary updates use
+`track_norm=False`; an unknown lazy target norm yields `local_fidelity=None`
+while the retained norm and convergence trace remain available.
+Routine fitting never contracts `target.norm()` or a doubled target network.
+`fit_diagnostics(overlap=True)` separately requests a genuine directional
+overlap. If the target norm is unknown, this explicit diagnostic uses a
+lossless leaf-to-hub QR pass and one hub norm, never `<target|target>`.
+Its directional overlap is reported as `target_fidelity`,
 with MPS-compatible `fit_overlap_fidelity` aliases, not as `local_fidelity`.
 Thus an MPO/TreeMPO identity normalization scale is not silently treated as
 compression fidelity.
+Each completed local fit also carries the target's stored exponent into the
+fitted state, preserving its represented scale when the guess has a different
+exponent.
+Optional norm or overlap diagnostic failures are reported in
+`fit_overlap_error`; they do not invalidate or prevent installation of a
+successful fit.
+TreeFIT rejects odd-parity fermionic tensors: its local projection does not
+yet preserve their graded signs. Use the native `direct` or `zipup` routes
+for those states. This restriction applies to DMRG modes as well.
 
 `TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
 Tree-edge SVD. Its defaults, `cutoff="auto"` and `cutoff_mode="auto"`, resolve
