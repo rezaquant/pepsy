@@ -267,6 +267,20 @@ Before changing `optimizer.py`, verify the following ownership boundaries:
   remain available to select its schedule.
 - `_execute_mode` receives backend-prepared payloads and dispatches only gate
   or sub-MPO events. `_run_segmented` owns control-event boundaries.
+- Conditional actions reuse the full validated segment settings. Never replace
+  the caller's sweep budget, named DMRG schedule, FIT guess, normalization, or
+  diagnostic policy with a special one-gate default.
+- Caps keep their raw contraction scale and invalidate the unitary norm
+  baseline without clearing accumulated compression survival. Keep cap history
+  separate from truncation events; do not add norm scans solely to record a cap.
+- Trajectory caps flush earlier work and update leakage labels only after
+  successful removal. Remove the capped flag and shift higher logical labels,
+  including `perm` and selected nested conditional caps. Conditional controls
+  must use the same branching and leakage handlers as unconditional controls.
+- Coalesced terminal samples with different register lengths use `-1` right
+  padding plus per-row `lengths`; valid bits, lengths, probabilities, and leaf
+  indices must remain aligned during shuffle. Uniform batches retain their
+  existing shape and values.
 - DMRG builds an isolated exact target and selects an owned guess or a direct
   live-state guess. Rollback retains the original only for an isolated dense
   guess; direct/native paths require a copy. A fallback must restore both

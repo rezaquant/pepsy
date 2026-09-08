@@ -6230,11 +6230,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             record_where = where
         self._ensure_mps_state()
         self._ensure_tracked_center()
-        execution_where = (
-            tuple(int(site) for site in where)
-            if where_is_physical
-            else self._logical_to_physical_where(where)
-        )
         if name == "conditional":
             record_index, expected = _resolve_conditional(
                 payload, len(self.measurements)
@@ -6276,22 +6271,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     [action_type],
                     logical_where_seq=[action_where],
                     progbar=False,
-                    n_iter=1,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    k_2q_batch=1,
-                    normalize_every=None,
-                    normalize_final=False,
-                    normalize_eps=1e-12,
-                    non_unitary=False,
-                    submpo_method="direct",
-                    finite_check=mode_kwargs.get("finite_check", False),
-                    fit_overlap_diagnostics=mode_kwargs.get(
-                        "fit_overlap_diagnostics",
-                        False,
-                    ),
+                    # The predicate selects a gate, not a new solver policy.
+                    # Reuse the same validated settings as ordinary segments,
+                    # including named DMRG schedules and explicit FIT guesses.
+                    **mode_kwargs,
                 )
             return
+        # Resolve physical sites only for an executed control. A false
+        # conditional may mention a site removed by a preceding cap.
+        execution_where = (
+            tuple(int(site) for site in where)
+            if where_is_physical
+            else self._logical_to_physical_where(where)
+        )
         if name == "measure":
             self._apply_measure_event(
                 payload["pauli"],
@@ -7141,6 +7133,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         self.p = self._install_represented_norm(capped)
         self.info_c["cur_orthog"] = (new_center, new_center)
+        # A raw cap can change the physical norm without any truncation.
+        # Preserve accumulated compression loss, but let the next unitary
+        # segment establish its baseline from this shorter state. No extra
+        # norm contraction or diagnostic scan is needed at the cap boundary.
+        self._invalidate_unitary_norm_baseline()
         self._mps_length_history.append(int(self.p.L))
         self.cap_history.append(
             {

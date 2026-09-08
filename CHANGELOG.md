@@ -14,6 +14,14 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Fixed conditional MPS gates to inherit the configured DMRG/FIT schedule,
+  guess, and replay options. Trajectory controls now share ordinary branching
+  and cap handling, including nested conditionals and mixed leakage leaves.
+- Fixed dynamic caps to renumber per-trajectory leakage flags and rebase
+  unitary norm accounting without treating physical contraction scale as
+  compression loss. Added mixed-length coalesced terminal samples with `-1`
+  padding and aligned per-row `lengths`, preserving uniform output behavior.
+
 - Reduced MpsOptimizer metadata overhead with replay-scoped physical rank
   ceilings and weak network classification caches, one mixed FIT-window
   preparation per transaction, and reuse of validated maximum bonds.

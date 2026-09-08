@@ -1239,11 +1239,23 @@ class CoalescedSampleResult:
     :class:`CoalescedTrajectoryLeaf` produced ``configs[row]``. ``probs`` is
     available for ordinary MPS leaves and is ``None`` for STN leaves, whose
     scalable ``sample_bits`` path intentionally returns configurations only.
+    ``lengths[row]`` gives the number of surviving sites. When conditional
+    caps produce different lengths, shorter rows are padded on the right
+    with ``-1``; only ``configs[row, :lengths[row]]`` contains measured bits.
     """
 
     configs: np.ndarray
     leaf_indices: np.ndarray
     probs: np.ndarray | None = None
+    lengths: np.ndarray | None = None
+
+    def __post_init__(self):
+        # Keep the existing three-argument constructor useful for uniform
+        # batches. Sampling supplies explicit lengths for a ragged register.
+        if self.lengths is None:
+            object.__setattr__(self, "lengths", np.full(
+                self.configs.shape[0], self.configs.shape[1], dtype=np.int64
+            ))
 
     @property
     def shots(self) -> int:
@@ -3437,6 +3449,36 @@ class _LeakageState:
     leak2depolar: bool = False
 
 
+def _resolve_trajectory_conditional(optimizer, entry):
+    """Return the selected concrete action, or None for a false predicate."""
+    while True:
+        parts = MpsOptimizer.control_event_parts(entry)
+        if parts is None or parts[0] != "conditional":
+            return entry
+        _name, payload, _where = parts
+        record_index, expected = _resolve_conditional(
+            payload, len(getattr(optimizer, "measurements", ()))
+        )
+        record = optimizer.measurements[record_index]
+        outcome = int(getattr(record, "outcome", record[2]))
+        if int(outcome < 0) != expected:
+            return None
+        entry = payload["action"]
+
+
+def _apply_trajectory_cap(optimizer, entry, where, state, run_kwargs, shot_stream):
+    """Commit a structural cap before remapping classical leakage labels."""
+    _run_trajectory_entries(optimizer, (entry,), run_kwargs)
+    # Site labels after a cap refer to the shortened logical chain, including
+    # in perm mode. A cap removes even a leaked site's placeholder tensor.
+    # Update only after successful replay; failed caps retain the old labels.
+    (removed,) = where
+    state.leaked = {
+        site - (site > removed) for site in state.leaked if site != removed
+    }
+    shot_stream.append(entry)
+
+
 def _single_leakage_site(where) -> int:
     where = _trajectory_where(where)
     if len(where) != 1:
@@ -3962,23 +4004,36 @@ def _run_coalesced_entries(
         parts = MpsOptimizer.control_event_parts(entry)
         if parts is not None and parts[0] == "conditional":
             flush()
-            _name, payload, _where = parts
+            selected = []
             for node in nodes:
-                record_index, expected = _resolve_conditional(
-                    payload, len(getattr(node.optimizer, "measurements", ()))
+                action = _resolve_trajectory_conditional(node.optimizer, entry)
+                if action is None:
+                    selected.append(node)
+                else:
+                    # Selected controls use the same branching/cap/leakage
+                    # path as unconditional controls. Retain the concrete
+                    # stream once, not both the action and its wrapper.
+                    selected.extend(_run_coalesced_entries(
+                        [node], [(event_index, action)], run_kwargs, rng,
+                        max_branches=max_branches,
+                        max_branch_factor=max_branch_factor,
+                        parallel_workers=parallel_workers,
+                        parallel_backend=parallel_backend,
+                    ))
+                if max_branches is not None and len(selected) > max_branches:
+                    raise _CoalescedBranchCapExceeded(
+                        f"coalesced trajectory branch cap ({max_branches}) exceeded "
+                        "during conditional replay."
+                    )
+            nodes = selected
+            continue
+        if parts is not None and parts[0] == "cap":
+            flush()
+            for node in nodes:
+                _apply_trajectory_cap(
+                    node.optimizer, entry, parts[2], node.leakage_state,
+                    run_kwargs, node.gate_stream,
                 )
-                record = node.optimizer.measurements[record_index]
-                outcome = int(getattr(record, "outcome", record[2]))
-                if (
-                    int(outcome < 0) == expected
-                    and not _entry_touches_leaked_qubit(
-                        payload["action"], node.leakage_state
-                    )
-                ):
-                    _run_trajectory_entries(
-                        node.optimizer, (payload["action"],), run_kwargs
-                    )
-                node.gate_stream.append(entry)
             continue
         if parts is None or parts[0] not in {"measure", "reset", "measure_reset"}:
             pending.append((event_index, entry))
@@ -4526,6 +4581,7 @@ def _coalesced_control_event(
                 event_index,
                 parts,
                 run_kwargs,
+                rng,
                 entry=entry,
                 absorb_basis=absorb_basis,
                 max_branches=max_branches,
@@ -4670,6 +4726,7 @@ def sample_coalesced_bits(
     configs = []
     probs = []
     leaf_indices = []
+    lengths = []
     all_have_probs = True
     for leaf_index, (leaf, child_seed) in enumerate(zip(leaves, child_seeds)):
         count = int(leaf.count)
@@ -4699,17 +4756,33 @@ def sample_coalesced_bits(
             probs.append(np.asarray(batch.probs, dtype=float))
         configs.append(batch_configs)
         leaf_indices.append(np.full(count, leaf_index, dtype=np.int64))
+        lengths.append(np.full(count, batch_configs.shape[1], dtype=np.int64))
 
-    configs = np.concatenate(configs, axis=0)
+    max_length = max(batch.shape[1] for batch in configs)
+    if all(batch.shape[1] == max_length for batch in configs):
+        configs = np.concatenate(configs, axis=0)
+    else:
+        # Rectangular output remains convenient without inventing measured
+        # zeros for removed sites. Avoid padded copies of each leaf batch.
+        padded = np.full((sum(batch.shape[0] for batch in configs), max_length),
+                         -1, dtype=np.int8)
+        offset = 0
+        for batch in configs:
+            stop = offset + batch.shape[0]
+            padded[offset:stop, :batch.shape[1]] = batch
+            offset = stop
+        configs = padded
     leaf_indices = np.concatenate(leaf_indices, axis=0)
+    lengths = np.concatenate(lengths, axis=0)
     probabilities = np.concatenate(probs, axis=0) if all_have_probs else None
     if shuffle and len(configs) > 1:
         permutation = np.random.default_rng(seed).permutation(len(configs))
         configs = configs[permutation]
         leaf_indices = leaf_indices[permutation]
+        lengths = lengths[permutation]
         if probabilities is not None:
             probabilities = probabilities[permutation]
-    return CoalescedSampleResult(configs, leaf_indices, probabilities)
+    return CoalescedSampleResult(configs, leaf_indices, probabilities, lengths)
 
 
 def run_trajectory_shots(
@@ -5022,7 +5095,23 @@ def run_trajectory_shots(
                     )
                     continue
                 control_parts = MpsOptimizer.control_event_parts(entry)
+                if control_parts is not None and control_parts[0] == "conditional":
+                    # Resolve after the preceding measurement is committed.
+                    # The concrete action then follows ordinary control and
+                    # leakage dispatch, including nested conditional caps.
+                    flush_pending()
+                    entry = _resolve_trajectory_conditional(optimizer, entry)
+                    if entry is None:
+                        continue
+                    control_parts = MpsOptimizer.control_event_parts(entry)
                 if control_parts is not None:
+                    if control_parts[0] == "cap":
+                        flush_pending()
+                        _apply_trajectory_cap(
+                            optimizer, entry, control_parts[2], leakage_state,
+                            run_kwargs, shot_stream,
+                        )
+                        continue
                     if control_parts[0] == "reset":
                         flush_pending()
                         _apply_leakage_reset_control(

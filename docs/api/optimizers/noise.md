@@ -67,6 +67,13 @@ leaked-qubit measurement as bit `1`. The sampled diagnostics live in
 streams support independent and coalesced replay; coalescing branches only when
 the classical leakage outcome changes the represented state.
 
+An MPS `cap` is a structural boundary in both strategies. It always removes
+the selected site, including a leaked site's placeholder, then removes that
+site's leakage flag and shifts higher logical labels down by one. Subsequent
+gate suppression, reset, and measurement use those updated labels. Conditional
+caps apply this update only to the selected branches; persistent layouts still
+reject caps, while `perm` maintains its shortened logical mapping.
+
 `PauliErrorModel` remains a convenience macro for clean deterministic streams.
 It samples independent **physical Pauli trajectories**, not a density matrix.
 Each non-identity X/Y/Z fault is inserted into a concrete gate stream after every
@@ -232,6 +239,15 @@ assert samples.shots == result.shots
 # samples.configs: (shots, n) computational-basis rows
 # samples.leaf_indices: source coalesced leaf for each row
 ```
+
+Conditional caps can leave different register lengths across leaves. In that
+case `samples.configs` has width equal to the longest surviving register and
+pads shorter rows on the right with `-1`. `samples.lengths[row]` gives the valid
+prefix length, so use `samples.configs[row, :samples.lengths[row]]` for measured
+bits. Columns use each leaf's current logical numbering after its caps, not
+the original register labels. Lengths, leaf indices, and probabilities remain
+aligned when rows are shuffled. Uniform-length batches keep their previous
+configuration values and shape, and also expose `lengths`.
 
 ### Conservative automatic strategy
 
@@ -649,6 +665,10 @@ available directly. In a hand-written stream, `("if", record, bit, action)`
 uses computational bits (`+1 -> 0`, `-1 -> 1`), with negative records counting
 back from the latest measurement. Independent and coalesced trajectory replay
 resolve the predicate separately for every shot/leaf before applying `action`.
+Selected actions inherit the configured replay/FIT settings. Trajectory
+runners retain the concrete executed action rather than both an action and its
+conditional wrapper; nested conditional controls use normal measurement,
+reset, and cap handling, including coalesced branching and leakage updates.
 The `PauliErrorModel` convenience macro treats the conditional wrapper as a
 control event and automatically samples ordinary named or matrix gate actions
 only on the branch where the predicate is true. Conditional measurements,

@@ -174,7 +174,11 @@ measures each target in `basis`, records the result, then resets it to the
 `+1` eigenstate. The aliases `("mrx", where[, outcome])`, `("mry", ...)`, and
 `("mrz", ...)` are accepted. `("cap", where, vec[, absorb])` contracts one
 physical leg with `vec`, absorbs it into the selected neighbour, and shortens
-the MPS by one site.
+the MPS by one site. Later events use the shortened chain's labels: sites
+above the removed site shift down by one. Caps preserve the raw contracted
+norm rather than normalizing or performing a partial trace. They invalidate
+the next unitary segment's norm baseline without changing accumulated
+compression fidelity; `cap_history` records the structural operation.
 
 Classical feed-forward is represented by `("if", record, bit, action)` (the
 aliases `"conditional"`, `"condition"`, `"feed_forward"`, and
@@ -194,6 +198,10 @@ stream = [
 Mapping form accepts `kind`/`type`/`event`, `record`, `bit` (or `value`), and
 `then` (or `action`). The same event is evaluated per noisy trajectory and per
 coalesced leaf, so the selected action follows that shot's measurement record.
+Conditional gates inherit the ordinary segment's validated replay options,
+including `n_iter`, the named DMRG block schedule, FIT guess, sweep directions,
+cutoffs, normalization, and diagnostic controls. Selected conditional controls
+follow the same cap/reset/measurement handling as unconditional events.
 
 ### Shot-aware replay
 
