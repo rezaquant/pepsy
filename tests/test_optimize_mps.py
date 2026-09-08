@@ -64,6 +64,48 @@ def _tensor_data_norm(mps, site):
     return float(np.linalg.norm(np.asarray(mps[site].data)))
 
 
+def test_mps_optimizer_effective_length_is_gate_active_and_cap_reduced():
+    """L_eff is a lightweight stream-support ledger, not a rank probe."""
+    product = qtn.MPS_computational_state("000", dtype="complex128")
+
+    empty = py.MpsOptimizer(product, gates=[], chi=8, mode="mpo")
+    assert empty.L_eff == 0
+    empty.run(cutoff=0.0, progbar=False)
+    assert empty.L_eff == 0
+
+    one_site = py.MpsOptimizer(
+        product,
+        gates=[(qu.hadamard(), (1,))],
+        chi=8,
+        mode="mpo",
+    )
+    one_site.run(cutoff=0.0, progbar=False)
+    assert one_site.L_eff == 1
+    assert one_site.mps_length_diagnostics()["L_eff_history"] == (0, 1)
+
+    nonlocal_gate = py.MpsOptimizer(
+        product,
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=8,
+        mode="mpo",
+    )
+    nonlocal_gate.run(cutoff=0.0, progbar=False)
+    assert nonlocal_gate.L_eff == 3
+
+    capped = py.MpsOptimizer(
+        product,
+        gates=[
+            (qu.hadamard(), (1,)),
+            ("cap", 1, np.array([1.0, 1.0]), "left"),
+        ],
+        chi=8,
+        mode="mpo",
+    )
+    capped.run(cutoff=0.0, progbar=False)
+    assert capped.L_eff == 0
+    assert capped.mps_length_diagnostics()["L_eff_history"] == (0, 1, 0)
+
+
 def _nonuniform_product_mps():
     """Return a non-translationally-invariant complex product state."""
     return qtn.MPS_product_state(

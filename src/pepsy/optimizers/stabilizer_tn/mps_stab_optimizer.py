@@ -50,8 +50,10 @@ from __future__ import annotations
 import math
 import time
 import warnings
+from contextlib import contextmanager
 from copy import deepcopy
 from collections.abc import Mapping
+from dataclasses import replace
 from numbers import Integral
 from typing import List, Optional
 
@@ -852,6 +854,9 @@ class MpsStabOptimizer:
         self._norm_log_survival = 0.0
         self.dtype = self.state.dtype
         self._rng = np.random.default_rng(seed)
+        self._initial_mps_length = int(self.state.n)
+        self._mps_length_history = [self._initial_mps_length]
+        self.cap_history = []
         self.logical_order = list(range(self.state.n))
         self._logical_to_mps = {q: q for q in self.logical_order}
         self.layout_plan = None
@@ -1103,6 +1108,31 @@ class MpsStabOptimizer:
     @property
     def n(self) -> int:
         return self.state.n
+
+    @property
+    def L_eff(self) -> int:
+        """Return the current effective coefficient-MPS register length."""
+        return int(self.state.n)
+
+    @property
+    def effective_mps_length(self) -> int:
+        """Descriptive alias for :attr:`L_eff`."""
+        return self.L_eff
+
+    def mps_length_diagnostics(self):
+        """Return the active-register length and dynamic-cap ledger."""
+        history = tuple(int(length) for length in self._mps_length_history)
+        return {
+            "initial_length": int(self._initial_mps_length),
+            "peak_length": int(max(history, default=0)),
+            "minimum_length": int(min(history, default=0)),
+            "L_eff": int(self.L_eff),
+            "effective_length": int(self.L_eff),
+            "removed_sites": int(self._initial_mps_length - self.L_eff),
+            "caps": len(self.cap_history),
+            "length_history": history,
+            "cap_events": deepcopy(self.cap_history),
+        }
 
     @property
     def p(self):
@@ -4300,6 +4330,9 @@ class MpsStabOptimizer:
             for event in self.norm_events
         ]
         copied._localizer_cache = dict(self._localizer_cache)
+        copied._initial_mps_length = self._initial_mps_length
+        copied._mps_length_history = list(self._mps_length_history)
+        copied.cap_history = deepcopy(self.cap_history)
         copied.logical_order = list(self.logical_order)
         copied._refresh_layout_map()
         copied.layout_plan = deepcopy(self.layout_plan)
@@ -5086,7 +5119,42 @@ class MpsStabOptimizer:
             self._apply_entry(payload["action"])
         return self
 
+    @contextmanager
+    def _compatible_torch_linalg(self):
+        """Use a dtype-compatible Torch QR/SVD policy for one replay entry.
+
+        Torch linalg registrations are process-global.  A preceding real-valued
+        autodiff model can therefore leave Pepsy's real stabilized QR rule
+        installed while this optimizer is replaying a complex coefficient MPS.
+        The real rule must reject such inputs; temporarily switching only the
+        policy mode keeps the replay correct and restores the caller's policy
+        immediately afterwards.
+        """
+        sample = self._state_backend_like()
+        is_complex_torch = (
+            self.backend == "torch"
+            and callable(getattr(sample, "is_complex", None))
+            and bool(sample.is_complex())
+        )
+        if not is_complex_torch:
+            yield
+            return
+
+        from ...backends import get_torch_linalg_config
+
+        active = get_torch_linalg_config()
+        if active is None or active.mode == "complex":
+            yield
+            return
+
+        with replace(active, mode="complex").activated():
+            yield
+
     def _apply_entry(self, entry) -> None:
+        with self._compatible_torch_linalg():
+            self._apply_entry_unscoped(entry)
+
+    def _apply_entry_unscoped(self, entry) -> None:
         conditional = conditional_event_parts(entry)
         if conditional is not None:
             self._apply_conditional_entry(entry)
@@ -6530,6 +6598,15 @@ class MpsStabOptimizer:
             self.backend_info()
             self._localizer_cache.clear()
             self._invalidate_infidelity()
+            self._mps_length_history.append(int(self.state.n))
+            self.cap_history.append(
+                {
+                    "physical_site": int(q),
+                    "old_length": int(n),
+                    "new_length": int(self.state.n),
+                    "absorb": str(absorb),
+                }
+            )
             self._record()
             return self
 
@@ -6560,6 +6637,15 @@ class MpsStabOptimizer:
         self.backend_info()
         self._localizer_cache.clear()
         self._invalidate_infidelity()
+        self._mps_length_history.append(int(self.state.n))
+        self.cap_history.append(
+            {
+                "physical_site": int(q),
+                "old_length": int(n),
+                "new_length": int(self.state.n),
+                "absorb": str(absorb),
+            }
+        )
         self._record()
         return self
 

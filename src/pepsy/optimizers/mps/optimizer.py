@@ -2108,6 +2108,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.inplace = bool(inplace)
         self.p = self._install_represented_norm(p if self.inplace else p.copy())
+        # Dynamic cap streams shorten the live MPS during replay. Keep a
+        # small structural ledger separate from norm/compression diagnostics so
+        # callers can inspect the effective register length without inferring
+        # it from tensor tags or a private event queue.
+        self._initial_mps_length = int(getattr(self.p, "L", 0))
+        self._mps_length_history = [self._initial_mps_length]
+        self.cap_history = []
+        # ``L_eff`` is an operation-active support ledger, not a dense-state
+        # or Schmidt-rank measurement. A product MPS starts at zero; replay
+        # events activate their current site interval and caps remap/remove
+        # that support as the register shrinks.
+        self._effective_active_positions = set()
+        self._effective_length_history = [0]
+        self._effective_site_history = [()]
+        self._effective_event_history = []
         self._initial_p = self.p.copy() if _capture_initial else None
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None.")
@@ -2159,6 +2174,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._norm_log_survival = 0.0
         self.quality_checks = []
         self.last_layout_plan = self._persistent_layout_plan
+        self.scheduled_layout_plan = None
+        self.scheduled_site_order = None
         self.mix_history = []
         self.last_mix_summary = None
         self.last_run_timing = None
@@ -3182,6 +3199,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         self.p = new_p
         self._initial_p = self.p.copy()
+        self._initial_mps_length = int(getattr(self.p, "L", 0))
+        self._mps_length_history = [self._initial_mps_length]
+        self.cap_history = []
+        self._effective_active_positions = set()
+        self._effective_length_history = [0]
+        self._effective_site_history = [()]
+        self._effective_event_history = []
         self._unitary_previous_norm = None
         self.norm_events = []
         self._norm_log_survival = 0.0
@@ -3368,6 +3392,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # second MPS copy for that internal path; public ``copy()`` retains
         # the constructor-state template needed by ``run(shots=...)``.
         copied._initial_p = self.p.copy() if capture_initial else None
+        copied._initial_mps_length = self._initial_mps_length
+        copied._mps_length_history = list(self._mps_length_history)
+        copied.cap_history = deepcopy(self.cap_history)
+        copied._effective_active_positions = set(self._effective_active_positions)
+        copied._effective_length_history = list(self._effective_length_history)
+        copied._effective_site_history = deepcopy(self._effective_site_history)
+        copied._effective_event_history = deepcopy(self._effective_event_history)
         copied._stream_plan = self._stream_plan
         copied._gate_stream = tuple(self._gate_stream)
         copied._has_trajectory_events = self._has_trajectory_events
@@ -3381,6 +3412,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied._persistent_layout_plan = deepcopy(self._persistent_layout_plan)
         copied.layout_plan = deepcopy(self.layout_plan)
         copied.last_layout_plan = deepcopy(self.last_layout_plan)
+        copied.scheduled_layout_plan = deepcopy(self.scheduled_layout_plan)
+        copied.scheduled_site_order = deepcopy(self.scheduled_site_order)
         copied.normalizations = deepcopy(self.normalizations)
         copied.norm_events = deepcopy(self.norm_events)
         copied._norm_log_survival = self._norm_log_survival
@@ -3618,6 +3651,112 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return self._gate_stream
 
     @property
+    def allocated_length(self) -> int:
+        """Return the current allocated MPS register length."""
+        return int(getattr(self.p, "L", self._mps_length_history[-1]))
+
+    @property
+    def effective_active_sites(self) -> tuple[int, ...]:
+        """Return current operation-active MPS positions."""
+        L = self.allocated_length
+        return tuple(
+            int(position)
+            for position in sorted(self._effective_active_positions)
+            if 0 <= position < L
+        )
+
+    def _record_effective_event(self, where, *, event_type="gate"):
+        """Record active support without inspecting tensor ranks or Schmidt values."""
+        if event_type == "cap":
+            raise ValueError("cap support must be remapped with _apply_effective_cap")
+        positions = tuple(int(site) for site in where)
+        if positions:
+            left, right = min(positions), max(positions)
+            self._effective_active_positions.update(range(left, right + 1))
+        active = self.effective_active_sites
+        self._effective_length_history.append(len(active))
+        self._effective_site_history.append(active)
+        self._effective_event_history.append(
+            {
+                "event_type": str(event_type),
+                "where": tuple(positions),
+                "L_eff": int(len(active)),
+                "active_sites": active,
+            }
+        )
+
+    def _apply_effective_cap(self, position):
+        """Remap operation-active positions after a structural cap."""
+        position = int(position)
+        self._effective_active_positions = {
+            active_position - (active_position > position)
+            for active_position in self._effective_active_positions
+            if active_position != position
+        }
+        active = self.effective_active_sites
+        self._effective_length_history.append(len(active))
+        self._effective_site_history.append(active)
+        self._effective_event_history.append(
+            {
+                "event_type": "cap",
+                "where": (position,),
+                "L_eff": int(len(active)),
+                "active_sites": active,
+            }
+        )
+
+    @property
+    def L_eff(self) -> int:
+        """Return operation-active support length, with product start equal to zero.
+
+        This is intentionally a lightweight replay ledger. It estimates the
+        MPS support made active by the gate stream and reduced by caps; it does
+        not compute Schmidt values, bond entropies, or dense-state ranks.
+        """
+        return len(self.effective_active_sites)
+
+    @property
+    def effective_mps_length(self) -> int:
+        """Descriptive alias for :attr:`L_eff`."""
+        return self.L_eff
+
+    def mps_length_diagnostics(self):
+        """Return allocated-register and operation-active length diagnostics.
+
+        ``length_history`` is the allocated MPS register after construction
+        and successful caps. ``L_eff`` and ``effective_length_history`` are a
+        separate operation-active support ledger: they start at zero, grow
+        when gate sites/intervals are replayed, and shrink when caps remove
+        those positions. No Schmidt-rank or SVD inspection is performed.
+        """
+        history = tuple(int(length) for length in self._mps_length_history)
+        effective_history = tuple(
+            int(length) for length in self._effective_length_history
+        )
+        return {
+            "initial_length": int(self._initial_mps_length),
+            "peak_length": int(max(history, default=0)),
+            "minimum_length": int(min(history, default=0)),
+            "L_eff": int(self.L_eff),
+            "effective_length": int(self.L_eff),
+            "removed_sites": int(self._initial_mps_length - self.allocated_length),
+            "caps": len(self.cap_history),
+            "length_history": history,
+            "cap_events": deepcopy(self.cap_history),
+            "allocated_length": int(self.allocated_length),
+            "allocated_length_history": history,
+            "initial_effective_length": 0,
+            "peak_effective_length": int(max(effective_history, default=0)),
+            "minimum_effective_length": int(min(effective_history, default=0)),
+            "effective_length_history": effective_history,
+            "L_eff_history": effective_history,
+            "effective_active_sites": self.effective_active_sites,
+            "effective_site_history": deepcopy(self._effective_site_history),
+            "effective_event_history": deepcopy(self._effective_event_history),
+            "effective_length_model": "active-operation-envelope",
+        }
+
+    @property
     def has_trajectory_events(self):
         """Whether this optimizer owns a stream requiring shot replay."""
         return bool(self._has_trajectory_events)
@@ -3694,6 +3833,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 optimizer.last_layout_plan = deepcopy(self.last_layout_plan)
                 optimizer.logical_order = list(self.logical_order)
                 optimizer.qubits = list(self.qubits)
+            optimizer.scheduled_layout_plan = deepcopy(self.scheduled_layout_plan)
+            optimizer.scheduled_site_order = deepcopy(self.scheduled_site_order)
             return optimizer
 
         return make_optimizer
@@ -3990,6 +4131,67 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._validate_normalized_gate_queue(normalized_queue)
         self._shared_backend_cache = False
         self._install_stream_plan(plan, normalized_queue=normalized_queue)
+        self.scheduled_layout_plan = None
+        self.scheduled_site_order = None
+        return self
+
+    def set_gate_schedule(self, schedule, *, reorder_product_state=True):
+        """Install a precompiled lifetime-aware gate-stream schedule.
+
+        ``schedule`` is intentionally duck-typed so Pepsy does not depend on
+        Tensy's scheduler package.  It must provide ``stream`` and may provide
+        ``site_order`` / ``layout_plan`` as returned by Tensy's
+        ``schedule_gate_stream``.  The stream already contains physical MPS
+        positions and cap events shifted after each removal, so no layout
+        replay is requested here (layout replay and cap replay are separate
+        operations).
+
+        A non-identity initial layout can be installed exactly only for a
+        product input MPS.  For an entangled input, the caller must first
+        supply the state in ``schedule.site_order`` or use an explicitly
+        controlled lossy reorder.
+        """
+        if self.mode == "perm":
+            raise ValueError(
+                "scheduled streams use fixed physical positions after caps; "
+                "mode='perm' cannot apply its own lazy permutation on top."
+            )
+        if self._persistent_layout_plan is not None:
+            raise ValueError(
+                "install a scheduled stream on a fresh optimizer; persistent "
+                "layouts and dynamic cap positions are separate operations."
+            )
+        stream = getattr(schedule, "stream", None)
+        if stream is None:
+            raise TypeError("schedule must provide a compiled 'stream'.")
+        site_order = tuple(
+            getattr(schedule, "site_order", tuple(range(int(self.p.L))))
+        )
+        if len(site_order) != int(self.p.L) or set(site_order) != set(range(int(self.p.L))):
+            raise ValueError(
+                "schedule.site_order must be a permutation of the current MPS sites."
+            )
+        identity = tuple(range(int(self.p.L)))
+        if site_order != identity:
+            if not reorder_product_state:
+                raise ValueError(
+                    "schedule has a non-identity site_order; set "
+                    "reorder_product_state=True or provide the state in that order."
+                )
+            if self._effective_max_bond(self.p) != 1:
+                raise ValueError(
+                    "installing a scheduled non-identity layout requires a "
+                    "product input MPS; reorder it explicitly before replay."
+                )
+            self._relabel_product_mps(site_order, current_order=identity)
+            # Shot replay must start from the reordered product state, not the
+            # pre-schedule order captured by the constructor.
+            self._initial_p = self.p.copy()
+
+        self.set_gates(stream)
+        self.scheduled_site_order = site_order
+        layout_plan = getattr(schedule, "layout_plan", None)
+        self.scheduled_layout_plan = deepcopy(layout_plan)
         return self
 
     def add_gates(self, gates):
@@ -4011,6 +4213,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalized_queue = self._normalize_stream_plan_queue(plan)
         self._validate_normalized_gate_queue(normalized_queue)
         self._install_stream_plan(plan, normalized_queue=normalized_queue)
+        self.scheduled_layout_plan = None
+        self.scheduled_site_order = None
         return self
 
     @staticmethod
@@ -5980,6 +6184,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 payload["vec"],
                 payload.get("absorb", "left"),
             )
+            self._apply_effective_cap(physical_site)
             self._update_permutation_after_cap(logical_site, physical_site)
         elif name == "reset":
             self._apply_reset_event(
@@ -6000,6 +6205,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         else:  # pragma: no cover - guarded by parsing
             raise ValueError(f"Unknown control event {name!r}.")
+
+        if name != "cap":
+            self._record_effective_event(execution_where, event_type=name)
 
     def _ensure_mps_state(self):
         """Ensure ``self.p`` is a :class:`qtn.MatrixProductState`.
@@ -6804,6 +7012,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         self.p = self._install_represented_norm(capped)
         self.info_c["cur_orthog"] = (new_center, new_center)
+        self._mps_length_history.append(int(self.p.L))
+        self.cap_history.append(
+            {
+                "physical_site": int(q),
+                "old_length": int(L),
+                "new_length": int(self.p.L),
+                "absorb": str(absorb),
+            }
+        )
         return self.p
 
     def _validate_event_stream_for_run(self, G_seq, where_seq, event_seq):
@@ -10372,6 +10589,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 repair=quality_check_repair,
             )
 
+            self._record_effective_event(last_where, event_type="gate")
+
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
@@ -10683,6 +10902,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if event is not None:
                 last_normalized_step = idx
 
+            self._record_effective_event(where, event_type=event_type)
+
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
@@ -10857,6 +11078,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if event is not None:
                 last_normalized_step = idx
 
+            self._record_effective_event(last_where, event_type="gate")
+
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
@@ -11023,6 +11246,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if event is not None:
                 last_normalized_step = idx
 
+            self._record_effective_event(last_where, event_type="gate")
+
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
@@ -11096,6 +11321,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
             )
+            self._record_effective_event(where, event_type="gate")
 
             if len(where) == 1:
                 if pbar is not None:
