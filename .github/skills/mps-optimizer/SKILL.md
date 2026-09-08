@@ -54,14 +54,16 @@ than hiding policy in a mode-specific helper.
   refinement, then latches one-site updates after all full-chain attainable
   bond ceilings are reached. `dmrg2` uses its required two-site warm-up (two
   sweeps by default) followed by one-site refinement, and `dmrg3` uses the
-  same fixed warm-up policy with three-site updates. Generic `dmrg` remains
+  same fixed warm-up policy with three-site updates, then one two-site
+  transition sweep before one-site refinement. Generic `dmrg` remains
   rank-adaptive until its active-bond ceilings are reached; rank stagnation is
   not an early exit there. A `dmrg1` window already at its attainable ceilings
   starts directly with one-site FIT. An under-capacity non-adjacent `dmrg1`
   window requires `n_iter >= 3`: two block sweeps plus at least one refinement
   sweep. Its default `fit_patience=2` is a two-sample same-phase norm window,
   i.e. one stable comparison. A two-site window is a structural special case for
-  `dmrg1`, `dmrg2`, and `dmrg3`: perform exactly one two-site update, no
+  `dmrg2` by default, or other schedules with `fit_single_pair_fast_path=True`:
+  perform exactly one two-site update, no
   one-site refinement, then advance to the next gate without consuming the
   remaining `n_iter` budget. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
@@ -147,8 +149,8 @@ before rebuilding an open MPS.
   expectation before contracting the already-materialized FIT target. Batch
   fallback work belongs in the `infidelity.target_norm` timing stage.
 - Preserve unclipped norm-ratio diagnostics. A significant retained-norm
-  overshoot is a broken orthogonal-projection invariant and must raise rather
-  than being silently clipped to fidelity one.
+  overshoot is a broken orthogonal-projection invariant and must raise when
+  diagnostic validation is enabled with `finite_check=True`.
 
 After a mutation that invalidates canonicality, either canonicalize explicitly
 or invalidate the cache before any canonical-only operation. Unitary one-site
@@ -213,7 +215,7 @@ clear disconnected-sector error rather than hiding the failure behind a dense
 conversion or global warm start. Dense two-/three-site growth windows select
 their disposable FIT `p` with `fit_init_strategy`: direct current MPS,
 fixed-rank deterministic random perturbation, active-bond random expansion,
-or isolated `guess-<method>` replay (default `guess-zipup`). The underscore
+or isolated `guess-<method>` replay (default `guess-src`). The underscore
 spelling remains accepted for compatibility. In `auto`, only active bonds below their attainable
 physical/`chi` rank are expanded, and the exact gate target remains separate as
 `p_g`. Native Symmray/fermionic paths keep their graded sector-growth route and
@@ -223,6 +225,12 @@ explicit mode overrides it. Interior oversampled zipup and `fit-*` replay keep
 the local sub-MPO partition and disable nested full-chain array permutation.
 
 ## Profiling contract
+
+`finite_check=False` is the default in every mode. Tensor scans and scalar
+non-finite/norm-consistency guards are optional diagnostics, not required
+for normal optimization. Enabling them warns once per replay about their
+cost; owned FIT calls share that warning. Convergence calculations and
+explicit quality/overlap diagnostics remain independent.
 
 `run(timing=False)` performs no replay profiling clock reads, accelerator
 barriers, or timing-record allocation; mixed summaries leave elapsed time

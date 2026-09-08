@@ -39,12 +39,14 @@ class _SweepEnvironmentCache:
 
     A cache is directional. It can supply fixed environments only to an
     opposite-direction sweep. Equal block sizes have matching minimal
-    boundary coverage. When the next reversed sweep is one-site, the producer
-    extends that minimal mapping by only the one or two terminal boundaries
-    needed after a two- or three-site sweep, respectively.
+    boundary coverage. For a smaller reversed block, the producer extends the
+    mapping by only the missing terminal boundaries: one for 3-to-2 or
+    2-to-1, and two for 3-to-1.
     """
 
-    __slots__ = ("boundaries", "block_size", "direction", "one_site_ready")
+    __slots__ = (
+        "boundaries", "block_size", "direction", "one_site_ready", "two_site_ready"
+    )
 
     def __init__(
         self,
@@ -53,10 +55,12 @@ class _SweepEnvironmentCache:
         direction,
         block_size,
         one_site_ready=None,
+        two_site_ready=False,
     ):
         self.boundaries = boundaries
         self.direction = direction
         self.block_size = int(block_size)
+        self.two_site_ready = bool(two_site_ready)
         self.one_site_ready = (
             self.block_size == 1
             if one_site_ready is None
@@ -70,6 +74,9 @@ class _SweepEnvironmentCache:
         block_size = int(block_size)
         if self.block_size == block_size or (
             block_size == 1 and self.one_site_ready
+        ) or (
+            block_size == 2 and self.block_size == 3
+            and (self.two_site_ready or self.one_site_ready)
         ):
             return self.boundaries
         return None
@@ -424,6 +431,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self._fermionic_right_exterior_environment = None
         self._timing_sync_device = False
         self._timing_synchronizer = None
+        # An owning optimizer may already have warned for the whole replay.
+        # Standalone FIT calls emit their own diagnostic-cost warning.
+        self._finite_check_warning_handled = False
         # Preserve an explicitly supplied empty dictionary: callers may use
         # ``info`` as a live diagnostics channel during and after a run.
         self.info: Dict[str, Any] = info if info is not None else {}
@@ -1231,7 +1241,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     and next_block_size == 1
                     and sweep_sequence[next_sweep % len(sweep_sequence)] != direction
                 ):
-                    self._extend_block_cache_for_one_site(
+                    self._extend_block_cache_for_smaller_block(
                         psi,
                         boundaries,
                         0,
@@ -1803,7 +1813,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 environments[site] = prior
         return environments
 
-    def _extend_block_cache_for_one_site(
+    def _extend_block_cache_for_smaller_block(
         self,
         psi,
         boundaries,
@@ -1812,24 +1822,24 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         direction,
         *,
         block_size,
+        next_block_size=1,
         timing_record=None,
     ):
-        """Complete only the terminal boundaries needed by reversed 1-site FIT.
+        """Complete only the boundaries needed by a smaller reversed block.
 
         A minimal reversed block cache stops ``block_size - 1`` sites before
         the terminal center. Those tensors are already canonical after the
-        final block split, so extending through them costs only one overlap
-        contraction for a two-site producer and two for a three-site producer.
-        This avoids rebuilding the complete fixed side at a 2/3-to-1
-        transition while retaining no unused terminal environments between
-        equal-size block sweeps.
+        final block split. Extend through ``block_size - next_block_size``
+        of them: one for 3-to-2 or 2-to-1 and two for 3-to-1. This avoids
+        rebuilding the complete fixed side without retaining unused terminal
+        environments between equal-size block sweeps.
         """
-        if block_size not in {2, 3}:
+        if block_size not in {2, 3} or not 1 <= next_block_size < block_size:
             return
 
         started = self._timing_mark() if timing_record is not None else None
         if direction == "R":
-            sites = range(stop - block_size + 1, stop)
+            sites = range(stop - block_size + 1, stop - next_block_size + 1)
             for site in sites:
                 boundaries[site] = self._overlap_environment_site(
                     psi,
@@ -1839,7 +1849,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     prior=boundaries.get(site - 1),
                 )
         else:
-            sites = range(start + block_size - 1, start, -1)
+            sites = range(start + block_size - 1, start + next_block_size - 1, -1)
             for site in sites:
                 boundaries[site] = self._overlap_environment_site(
                     psi,
@@ -2005,6 +2015,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         Symmray blocks) to backend boolean scalars before the transfer. If rtol
         also needs the retained norm, that scalar shares the same transfer.
         """
+        if not check_finite:
+            if not read_norm:
+                return True, None
+            # A scalar-only convergence read needs no stack/vector allocation.
+            # The caller retains the same scalar finite check and stop policy.
+            norm = np.asarray(ar.to_numpy(ar.do("real", final_norm))).item()
+            return True, float(norm)
         scalars = []
         finite_count = 0
         if check_finite:
@@ -2954,26 +2971,27 @@ class FIT:  # pylint: disable=too-many-instance-attributes
     @_native_fermionic_bra_fit
     def run_gate(
         self,
-        n_iter=6,
+        n_iter=8,
         verbose=False,
         *,
-        block_size=1,
-        sweep_sequence="R",
+        block_size=2,
+        sweep_sequence="RL",
         max_bond=None,
         cutoff=None,
         cutoff_mode="rsum2",
-        min_iter=None,
-        rtol=None,
-        patience=1,
+        min_iter=2,
+        rtol="auto",
+        patience=2,
         finite_check=False,
-        timing=None,
+        timing=False,
         timing_sync_device=False,
         single_pair_fast_path=False,
         three_site_sweeps=1,
-        adaptive_block_sweeps=None,
+        adaptive_block_sweeps=2,
         adaptive_until_rank=False,
+        two_site_transition_sweeps=1,
         final_one_site_sweeps=0,
-        collect_split_diagnostics=True,
+        collect_split_diagnostics=False,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run fitting restricted to ``range_int`` with gate-style sweeps.
 
@@ -2998,10 +3016,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         norm changes by at most ``rtol`` across a ``patience``-sample window.
         Thus ``patience=2`` means one stable comparison between two same-phase
         sweep norms; ``patience=1`` retains the same minimum comparable pair.
-        ``finite_check=False`` is the default. Enabling it emits a performance
-        warning; ``finite_check=True`` reduces all active tensor blocks to native
+        ``finite_check=False`` is the default: these optional diagnostics are
+        not required for normal optimization. Enabling them emits a performance
+        warning unless the owning optimizer has already warned for this replay.
+        ``finite_check=True`` reduces all active tensor blocks to native
         finite-status scalars and transfers one tiny vector per sweep. The
-        terminal retained norm used by ``rtol`` shares that transfer. A callable
+        terminal retained norm used by ``rtol`` shares that transfer.
+        With ``finite_check=False``,
+        the non-finite norm guard is skipped while ``rtol`` still reads the
+        scalar and compares convergence. A callable
         retains the general state-check callback behavior. ``timing=True``
         records one wall-clock entry per sweep and per active-site update.
         Accelerator timings become kernel-complete when
@@ -3016,11 +3039,18 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         active bond reaches its physical ``max_bond`` ceiling. There is no
         rank-stability early exit: if a target remains rank-deficient, the
         larger block is retained until ``n_iter`` is exhausted. This is the
-        schedule used by the named MPS DMRG modes.
+        optional rank-adaptive schedule; named MPS DMRG modes use fixed phases.
+        Three-site fits insert ``two_site_transition_sweeps`` two-site sweeps
+        after the block phase, within the same ``n_iter`` budget, before
+        one-site refinement. Set this to zero for a direct three-to-one handoff.
+        The default gate fit uses eight alternating RL sweeps, two initial
+        two-site sweeps, and dtype-aware ``rtol="auto"`` convergence with
+        ``min_iter=2`` and ``patience=2``. Explicit ``rtol=None`` uses fixed
+        sweeps. Split diagnostics are disabled by default.
         For ordinary dense arrays, an opposite-direction sweep reuses the
         compatible partial environments produced by the preceding sweep. A
-        two-site cache also serves reversed one-site refinement; incompatible
-        transitions such as three-site to one-site rebuild once.
+        smaller reversed block extends that cache only through the missing
+        terminal tensors, including three-to-two and two-/three-to-one changes.
         ``single_pair_fast_path=True`` stops a two-site interval after its one
         exact variational update; additional sweeps cannot change that local
         optimum. ``final_one_site_sweeps`` optionally adds fixed-rank one-site
@@ -3074,11 +3104,24 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
         adaptive_until_rank = bool(adaptive_until_rank)
         if (
+            not isinstance(two_site_transition_sweeps, Integral)
+            or int(two_site_transition_sweeps) < 0
+        ):
+            raise ValueError("two_site_transition_sweeps must be a non-negative integer.")
+        two_site_transition_sweeps = int(two_site_transition_sweeps)
+        if (
             not isinstance(final_one_site_sweeps, Integral)
             or int(final_one_site_sweeps) < 0
         ):
             raise ValueError("final_one_site_sweeps must be a non-negative integer.")
         final_one_site_sweeps = int(final_one_site_sweeps)
+        if rtol == "auto":
+            dtype_names = [str(t.data.dtype).lower() for t in self.p.tensors]
+            rtol = (
+                1e-3 if any("16" in d for d in dtype_names)
+                else 1e-5 if any("32" in d or "complex64" in d for d in dtype_names)
+                else 1e-9
+            )
         if min_iter is None:
             min_iter = n_iter if rtol is None else 1
         if not isinstance(min_iter, Integral) or int(min_iter) < 1:
@@ -3093,10 +3136,17 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         patience = int(patience)
         if finite_check not in (None, False, True) and not callable(finite_check):
             raise TypeError("finite_check must be bool, callable, or None.")
-        if finite_check is True or callable(finite_check):
+        # Validation is diagnostic only; normal fitting does not need it.
+        # Warn once at the owning replay boundary, or here for standalone FIT.
+        if (
+            (finite_check is True or callable(finite_check))
+            and not self._finite_check_warning_handled
+        ):
             warnings.warn(
-                "FIT finite_check is enabled: checking active tensors every "
-                "sweep adds work and can synchronize accelerator devices.",
+                "FIT finite_check is enabled: this optional diagnostic is "
+                "off by default and is not required for normal optimization. "
+                "It adds validation work and can synchronize accelerator "
+                "devices; use finite_check=False to avoid this overhead.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -3184,6 +3234,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             else None
         )
 
+        block_phase_end = None if not adaptive_phase_done else adaptive_block_sweeps
+
         def block_size_for_sweep(sweep_number):
             """Resolve the active block after any live rank-phase update."""
             if block_size not in {2, 3}:
@@ -3194,7 +3246,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
             else:
                 use_block = sweep_number <= adaptive_block_sweeps
-            return block_size if use_block else 1
+            if use_block:
+                return block_size
+            if (
+                block_size == 3
+                and block_phase_end is not None
+                and sweep_number <= block_phase_end + two_site_transition_sweeps
+            ):
+                return 2
+            return 1
 
         for sweep in range(1, n_iter + 1):
             direction = sweep_sequence[(sweep - 1) % len(sweep_sequence)]
@@ -3240,6 +3300,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if fixed_environments is not None:
                 self._sweep_environment_reuse_count += 1
             one_site_ready = active_block_size == 1
+            two_site_ready = False
             try:
                 if active_block_size == 1:
                     boundaries = self._run_gate_one_site_sweep(
@@ -3338,7 +3399,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     should_stop = True
                 if rtol is not None:
                     self.sweep_norm_trace.append(sweep_norm)
-                    if not math.isfinite(sweep_norm):
+                    # Convergence still needs the norm when diagnostics are
+                    # off; detecting non-finite values is a separate opt-in.
+                    if (
+                        (finite_check is True or callable(finite_check))
+                        and not math.isfinite(sweep_norm)
+                    ):
                         error = FloatingPointError(
                             f"FIT gate sweep {sweep} produced a non-finite local norm."
                         )
@@ -3397,6 +3463,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                                 warmup_incomplete
                                 or warmup_finished_with_refinement
                                 or adaptive_rank_incomplete
+                                or (
+                                    block_size == 3
+                                    and two_site_transition_sweeps > 0
+                                    and active_block_size != 1
+                                    and sweep < n_iter
+                                )
                             ):
                                 self.converged = True
                                 self.convergence_reason = "relative_tolerance"
@@ -3429,6 +3501,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     )
                     if sweep >= adaptive_block_sweeps and rank_ready:
                         adaptive_phase_done = True
+                        block_phase_end = sweep
                         # The first one-site sweep is a new numerical phase;
                         # do not compare its norm with the last SVD sweep.
                         previous_sweep_norm = None
@@ -3451,21 +3524,24 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 if (
                     self._allow_sweep_environment_reuse
                     and active_block_size in {2, 3}
-                    and next_block_size == 1
+                    and next_block_size is not None
+                    and next_block_size < active_block_size
                     and next_sweep is not None
                     and sweep_sequence[(next_sweep - 1) % len(sweep_sequence)]
                     != direction
                 ):
-                    self._extend_block_cache_for_one_site(
+                    self._extend_block_cache_for_smaller_block(
                         psi,
                         boundaries,
                         start,
                         stop,
                         direction,
                         block_size=active_block_size,
+                        next_block_size=next_block_size,
                         timing_record=sweep_timing,
                     )
-                    one_site_ready = True
+                    one_site_ready = next_block_size == 1
+                    two_site_ready = next_block_size <= 2
             except BaseException as error:
                 self.convergence_reason = "failed"
                 if sweep_timing is not None:
@@ -3478,6 +3554,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     direction=direction,
                     block_size=active_block_size,
                     one_site_ready=one_site_ready,
+                    two_site_ready=two_site_ready,
                 )
                 if sweep_timing is not None:
                     self._finish_timing_record(sweep_timing, status="complete")

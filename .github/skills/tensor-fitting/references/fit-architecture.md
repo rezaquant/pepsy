@@ -28,11 +28,12 @@
 - `fit_target_strategy={"auto", "layered", "mps"}`: lazy exact gate layers
   for ordinary arrays versus a materialized/native-routed target MPS.
 - `fit_init_strategy={"auto", "direct", "random", "random_expand", "guess_<method>"}`:
-  disposable FIT initial guess policy, defaulting to `guess_zipup`;
+  disposable FIT initial guess policy, defaulting to `guess_src`;
   `fit_init_seed` makes random policies reproducible without a global backend
   RNG.
 - `fit_init_rand_strength`: scale of deterministic random initialization.
-- `fit_single_pair_fast_path=True`: one update for an adjacent active pair.
+- `fit_single_pair_fast_path=True`: opt-in one update for an adjacent active pair;
+  named `dmrg2` enables this automatically.
 - `cutoff`, `cutoff_mode`, `chi`: output split/truncation controls.
 - Quimb guess methods follow the native 1D registry, including `direct`, `dm`,
   `zipup`, SDC/SRC/SRCMPS and their oversampling variants, `fit`,
@@ -61,8 +62,8 @@ copy_target=False)`, then calls `run_gate`. Ordinary dense targets default to
 small spatially split gate tensors layered over one owned MPS copy. The
 optimizer selects a disposable FIT initial state: direct current MPS,
 fixed-rank deterministic random perturbation, active-bond random expansion,
-or isolated `guess_<method>` replay (default `guess_zipup`). In `auto`, only under-capacity dense active
-bonds receive random expansion; saturated bonds use the current MPS directly.
+or isolated `guess_<method>` replay (default `guess_src`). `auto` also selects
+SRC, including on saturated bonds; the exact target remains separate.
 FIT never installs the exact target as `fit.p` and never performs a global
 target warm start. This avoids intermediate target-MPS rank growth in the
 normal objective path. Symmray
@@ -85,7 +86,9 @@ block. Completed block sweeps retain the minimal cumulative boundaries needed
 by an equal-size reversed sweep. Immediately before a reversed one-site
 transition, FIT extends that cache through one terminal tensor for a two-site
 producer or two terminal tensors for a three-site producer; it never rebuilds
-the complete fixed side. A terminal single-pair fast path needs no
+the complete fixed side. A 3-to-2 transition similarly extends through one
+terminal tensor and marks the cache ready for a reversed two-site sweep.
+A terminal single-pair fast path needs no
 active-window environment. Layered targets
 cache boundary index names discovered from neighboring site tensors rather
 than scanning the global target index map; this cache owns no tensor data.
@@ -95,10 +98,9 @@ reference and performs compatibility checks once per sweep; update kernels
 continue to use direct dictionary lookups with no wrapper in their hot loops.
 
 An active interval containing one adjacent pair reaches its complete local
-optimum after that split. MpsOptimizer enables the single-pair fast path even
-when tolerance stopping is disabled. Thus `dmrg1`, `dmrg2`, and `dmrg3` each
-perform one two-site update for a two-site window, skip one-site refinement,
-and advance to the next gate regardless of the remaining `n_iter` budget.
+optimum after that split. Named `dmrg2` enables the single-pair fast path even
+when tolerance stopping is disabled. Other modes require
+`fit_single_pair_fast_path=True` for this shortcut.
 After any final sweep, FIT's retained norm and center tensor are authoritative
 for infidelity and unitary stabilization; recanonicalizing the interval is
 redundant. Non-unitary scale control likewise normalizes that singleton center
@@ -113,10 +115,25 @@ The two-site phase is bounded at two sweeps; it does not extend because of
 rank stagnation. Once every full-chain bond reaches its physical/``chi``
 ceiling, the optimizer latches one-site updates for later windows in the same
 replay. Named `dmrg2` and `dmrg3` are fixed warm-up schedules: they perform
-exactly `fit_adaptive_sweeps` two- or three-site sweeps (two by default), then
-spend the remaining `n_iter` budget on one-site refinement subject to
+exactly `fit_adaptive_sweeps` two- or three-site sweeps (two by default).
+`dmrg3` then performs one two-site transition sweep. Both spend the remaining
+`n_iter` budget on one-site refinement subject to
 `fit_rtol`. Generic `dmrg` remains available for rank-adaptive block
 scheduling.
+
+Standalone `FIT.run_gate` defaults are eight sweeps, block size two, RL
+directions, two adaptive block sweeps, automatic dtype-aware tolerance,
+minimum two sweeps, patience two, and disabled split diagnostics/finite scans.
+With `finite_check=False`, scalar non-finite convergence checks are disabled
+too; norm calculations and convergence comparisons still run. MpsOptimizer
+scopes tensor and scalar-norm validation to its opt-in `finite_check` flag
+across every mode, including mixed commit checks. These are optional
+diagnostics, not required for normal optimization. MpsOptimizer warns once
+per replay when enabled; its owned FIT calls suppress only the duplicate
+warning, while standalone FIT still warns. Explicit quality and
+overlap diagnostics remain separate opt-ins.
+`two_site_transition_sweeps=1` applies to three-site fits; MpsOptimizer enables
+it only for named `dmrg3`. All block-size changes reset convergence history.
 
 `run_eff` is a separate global full-chain fit used by boundary/sampling code.
 Do not substitute it for the gate-window solver.

@@ -14,10 +14,31 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Made runtime non-finite detection opt-in across all MpsOptimizer modes,
+  including FIT convergence norms and mixed-mode commit checks. Enabling
+  `finite_check=True` warns once per replay and validates final tensor data
+  in every mode. Code comments, API docs, and warnings clarify that this is
+  an optional diagnostic, disabled by default and unnecessary for normal
+  optimization; nested FIT calls do not repeat the warning.
+  Mixed sticky non-finite handling now defaults to False. Convergence/norm
+  calculations, input validation, and explicit diagnostics remain available.
+
+- Reduced gate FIT overhead by reusing environments across 3-to-2 sweeps,
+  skipping unused rank checks for SRC guesses, caching copy capabilities only
+  within a replay, and reading scalar convergence norms without stacked
+  vectors. Preserved SRC initialization and sweep budgets.
+
+- Updated gate FIT defaults to eight alternating RL sweeps with two-site
+  blocks, two warm-up sweeps, dtype-aware convergence tolerance, and disabled
+  split diagnostics. Named `dmrg3` now uses two three-site sweeps, one
+  two-site transition sweep, then one-site refinement within the same sweep
+  budget. `dmrg2` retains its two-site-to-one-site schedule and adjacent-pair
+  shortcut. SRC remains the default optimizer initialization.
+
 - Added opt-in `MpsOptimizer.run(finite_check=True)` validation for DMRG,
   mixed-mode FIT, and measurement/shot FIT. Per-sweep active-array scans are
   disabled by default; enabling them emits a performance warning. Scalar
-  convergence/norm guards and periodic quality checks remain independent.
+  convergence/norm calculations and periodic quality checks remain independent.
 - Reduced dense DMRG rollback and SRC-guess copy traffic by isolating array
   data only in the active window, with independent tensor metadata and
   read-only exterior sharing. Preserved canonical `left_inds`, Torch gradient

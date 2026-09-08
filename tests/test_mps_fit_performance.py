@@ -15,9 +15,11 @@ def _state():
     return qtn.MPS_rand_state(8, 2, dtype="complex128", seed=714)
 
 
-@pytest.mark.parametrize("mode", ["dmrg2", "mix"])
-def test_finite_scan_is_opt_in_even_with_timing(monkeypatch, mode):
-    """Timing must not turn array scans on; enabling them warns and scans."""
+@pytest.mark.parametrize("mode, timing", [
+    ("dmrg2", False), ("dmrg3", True), ("mix", False),
+])
+def test_finite_scan_is_opt_in_even_with_timing(monkeypatch, mode, timing):
+    """Enabling diagnostics warns once across multiple FIT calls and scans."""
     original = py.FIT._sweep_diagnostics_to_host
     checks = []
 
@@ -27,7 +29,7 @@ def test_finite_scan_is_opt_in_even_with_timing(monkeypatch, mode):
 
     monkeypatch.setattr(py.FIT, "_sweep_diagnostics_to_host", staticmethod(observe))
     p = _state()
-    gates = [(qu.CNOT(), (2, 4))]
+    gates = [(qu.CNOT(), (2, 4)), (qu.CNOT(), (1, 5))]
     default = py.MpsOptimizer(p, gates, chi=2, mode=mode)
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
@@ -37,8 +39,12 @@ def test_finite_scan_is_opt_in_even_with_timing(monkeypatch, mode):
 
     checks.clear()
     checked = py.MpsOptimizer(p, gates, chi=2, mode=mode)
-    with pytest.warns(RuntimeWarning, match="finite_check is enabled"):
-        checked.run(n_iter=3, finite_check=True)
+    with pytest.warns(RuntimeWarning, match="finite_check is enabled") as recorded:
+        checked.run(n_iter=3, finite_check=True, timing=timing)
+    finite_warnings = [w for w in recorded if "finite_check" in str(w.message)]
+    assert len(finite_warnings) == 1
+    assert "optional diagnostic is off by default" in str(finite_warnings[0].message)
+    assert "not required for normal optimization" in str(finite_warnings[0].message)
     assert checks and all(checks)
     np.testing.assert_allclose(default.p.to_dense(), checked.p.to_dense(), atol=1e-11)
     assert default.info_c == checked.info_c
@@ -71,9 +77,11 @@ def test_fit_finite_scan_detects_bad_array_and_warns(monkeypatch):
     p = _state()
     fit = py.FIT(p.copy(), p=p, range_int=[2, 4])
     monkeypatch.setattr(fitting, "_iter_backend_arrays", lambda _t: (np.array([np.nan]),))
-    with pytest.warns(RuntimeWarning, match="finite_check is enabled"):
+    with pytest.warns(RuntimeWarning, match="finite_check is enabled") as recorded:
         with pytest.raises(FloatingPointError, match="non-finite tensor data"):
-            fit.run_gate(n_iter=1, finite_check=True)
+            fit.run_gate(n_iter=1, adaptive_block_sweeps=None, finite_check=True)
+    assert len(recorded) == 1
+    assert "optional diagnostic is off by default" in str(recorded[0].message)
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch", "jax"])

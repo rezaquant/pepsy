@@ -1,8 +1,12 @@
 # `pepsy.fitting.local`
 
 `FIT.run_gate(finite_check=False)` skips per-sweep active-array finite scans
-by default. Enabling `finite_check=True` (or a custom checking callback) emits
-a performance warning. The optional scan is independent of timing and the
+and scalar non-finite detection by default. These optional diagnostics are
+not required for normal optimization. Enabling `finite_check=True` (or a
+custom checking callback) emits a warning explaining the extra validation
+work and possible accelerator synchronization. `MpsOptimizer` warns once per
+replay and suppresses duplicate warnings from its owned FIT calls.
+The optional scan is independent of timing and the
 terminal scalar norm used for convergence. `MpsOptimizer.run(finite_check=...)`
 forwards this policy to its FIT calls, including measurements and shot replay.
 
@@ -143,27 +147,40 @@ direct-`FIT.run_gate` control. `MpsOptimizer` uses its separate adaptive
 `fit_adaptive_sweeps`/rank-ceiling schedule and does not add this legacy polish
 pass automatically.
 
-For direct gate-window fits, `three_site_sweeps=1` (the default) uses one
-larger three-site warm-up sweep and then switches to one-site refinement for
-any remaining requested sweeps. Set `three_site_sweeps=2` for two directional
-warm-up passes. Supplying `adaptive_block_sweeps=N` instead applies the same
-minimum block warm-up to two- or three-site FIT. With
+Direct `FIT.run_gate()` defaults to `n_iter=8`, `block_size=2`,
+`sweep_sequence="RL"`, `adaptive_block_sweeps=2`, `min_iter=2`,
+`rtol="auto"`, and `patience=2`. Automatic tolerance is `1e-3` for 16-bit,
+`1e-5` for float32/complex64, and `1e-9` for higher precision.
+Split diagnostics default to `False`; callers that need them must enable
+`collect_split_diagnostics=True`. `rtol=None` requests fixed sweeps.
+Standalone FIT does not classify the gate as unitary or non-unitary; unlike
+MpsOptimizer's non-unitary replay policy, it always resolves `rtol="auto"`
+to a numeric tolerance.
+With `block_size=3`, `two_site_transition_sweeps=1` inserts one two-site sweep
+after the three-site phase, before one-site refinement. Set it to zero for
+the previous direct handoff. The transition consumes the same `n_iter` budget.
+The legacy `three_site_sweeps` control applies when `adaptive_block_sweeps=None`.
+With
 `adaptive_until_rank=True`, the block phase continues until all active bonds
 reach their physical ceilings; rank stagnation is deliberately not an early
 exit. Remaining requested sweeps use one-site FIT. One-site refinement
 preserves the bond dimensions opened by the larger block and is cheaper than
 repeating the larger SVD block.
 
-The MPS optimizer passes `adaptive_block_sweeps=fit_adaptive_sweeps` and
-`adaptive_until_rank=True` for its rank-growing generic `dmrg` and `dmrg1`
-paths. Before constructing a `dmrg1` fit, the optimizer checks the active
+The MPS optimizer passes `adaptive_block_sweeps=fit_adaptive_sweeps` and enables
+`adaptive_until_rank` only for eligible generic `dmrg` windows.
+Before constructing a `dmrg1` fit, the optimizer checks the active
 attainable bond ceilings: an already-capped window starts with one-site FIT,
 while an under-capacity non-adjacent window requires `n_iter >= 3` for two
 two-site growth sweeps and at least one one-site refinement sweep. `dmrg2`
 and `dmrg3` use exactly the configured two- or three-site block warm-up (two
-sweeps by default) and then refine with one-site FIT. The direct FIT
+sweeps by default); `dmrg3` adds one two-site transition sweep. Both then
+refine with one-site FIT. The direct FIT
 diagnostics `adaptive_sweeps_run` and `one_site_sweeps_run` count both
 scheduled block sweeps and any explicit `final_one_site_sweeps` polish passes.
+`adaptive_sweeps_run` includes the two-site transition: a completed default
+DMRG3 warm-up therefore contributes three block sweeps in total. Timing
+records expose each sweep's individual block size when timing is enabled.
 
 For tolerance-controlled `run_gate`, `patience` counts same-phase retained-norm
 samples, not norm differences. Thus `patience=2` needs two comparable
@@ -181,6 +198,11 @@ rtol norm are transferred as one compact vector per sweep. A callable keeps the
 general user-defined state-check behavior. Reusing one `FIT` instance clears
 per-run norm/fidelity traces and split diagnostics before the next invocation;
 `run`, `run_eff`, and `run_gate` all require a positive integer `n_iter`.
+With finite scans disabled, tolerance stopping transfers just the terminal
+norm scalar without allocating a stacked diagnostic vector. It retains the
+same convergence calculations, but non-finite scalar detection is also
+disabled by default. `finite_check=True` enables both tensor and scalar
+checks; reads required for convergence are not deferred during warm-up.
 
 Ordinary dense arrays and native bosonic or fermionic Symmray arrays reuse the
 compatible partial overlap environments produced by the preceding
@@ -192,7 +214,9 @@ the same size. If the next reversed sweep changes to one-site refinement, FIT
 extends that cache through exactly one terminal tensor after a two-site sweep,
 or two terminal tensors after a three-site sweep. Both 2-to-1 and 3-to-1
 transitions therefore avoid a complete fixed-side rebuild without constructing
-unused terminal environments during block warm-up. Fresh sweeps construct only
+unused terminal environments during block warm-up. The 3-to-2 transition
+extends through exactly one terminal tensor and reuses the resulting cache.
+Fresh sweeps construct only
 the fixed boundaries that their active block can query. Explicitly generic or
 mixed-backend bosonic Symmray fits retain the conservative rebuild policy;
 automatic/native Symmray fits use the audited zero-copy cache.

@@ -3239,6 +3239,10 @@ class MpoOptimizer:
                 "cutoff": cutoff,
                 "cutoff_mode": cutoff_mode,
                 "three_site_sweeps": fit_three_site_sweeps,
+                # MPO replay owns its schedule independently of standalone
+                # FIT defaults and the MPS DMRG3 transition policy.
+                "adaptive_block_sweeps": adaptive_block_sweeps,
+                "two_site_transition_sweeps": 0,
                 "min_iter": fit_min_iter,
                 "rtol": fit_rtol,
                 "patience": fit_patience,

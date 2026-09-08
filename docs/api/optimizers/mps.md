@@ -303,7 +303,11 @@ FIT. If every active bond is already at its attainable ceiling before the fit,
 reaches its physical/`chi` ceiling, the optimizer latches one-site updates for
 later windows in the same replay. `"dmrg2"` uses two-site FIT for the required
 warm-up (two sweeps by default) and then one-site FIT; `"dmrg3"` follows the
-same fixed warm-up schedule with three-site FIT and then one-site FIT.
+same fixed warm-up schedule with three-site FIT, then one two-site transition
+sweep, then one-site FIT. All phases share the `n_iter` budget: with eight
+fixed sweeps the schedules are `2,2,1,1,1,1,1,1` and `3,3,2,1,1,1,1,1`.
+Tolerance comparisons reset whenever the block size changes. The adjacent
+two-site `dmrg2` exact-update exception remains active.
 For dense DMRG windows, FIT starts from a disposable compressed guess. The
 default is `fit_init_strategy="guess-src"`; the exact FIT target and named
 schedules are unchanged. The strategy can be `direct`, `random`,
@@ -424,24 +428,30 @@ the complete variational problem. The default
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
 non-finite sweep; for compatibility, non-unitary DMRG retains fixed sweeps
 when `fit_rtol="auto"`, while an explicit numeric tolerance enables
-adaptive stopping there too. Mixed DMRG and direct/MPO warm-up transactions
-validate the retained canonical-center norm and represented exponent before
-commit. The normal path therefore avoids a full tensor-data scan; enable
+adaptive stopping there too. With `finite_check=True`, mixed DMRG and
+direct/MPO warm-up transactions validate the retained canonical-center norm
+and represented exponent before commit. Default replay skips that validation; enable
 `quality_check_every=N` when periodic full finite-data and canonical-gauge
-checks are needed. A transactional MPO fallback is still norm-checked before
-commit. Torch and CuPy quality checks process one tensor at a time, combine
+checks are needed. Transactional MPO fallbacks are norm-checked only when
+`finite_check=True`. Torch and CuPy quality checks process one tensor at a time, combine
 scalar results on the device, and transfer one Boolean to the host.
 
-`run(finite_check=False)` is the default: FIT does not scan active tensor
-arrays for non-finite entries after every sweep. Set `finite_check=True` for
-that diagnostic; FIT emits a `RuntimeWarning` because scanning all active
-arrays adds work and can synchronize an accelerator. This applies to ordinary
-DMRG, mixed-mode FIT, and multi-site measurement FIT, and is forwarded to shot
-workers (an explicit `run_kwargs["finite_check"]` takes precedence).
-Scalar canonical-center norm checks used by convergence and unitary norm
-accounting remain active. Reading those scalars can still synchronize an
-accelerator even with timing and full finite scans disabled.
-`quality_check_every` remains the independent periodic whole-state check.
+`run(finite_check=False)` disables runtime non-finite detection by default
+in every MpsOptimizer mode, including DMRG1/2/3, mixed, MPO/direct/SRC/SDC,
+swap/permutation/SVD, SU, and exact replay. This is an optional diagnostic
+feature, not a requirement for normal optimization. Leave it off to avoid
+extra validation work and possible accelerator synchronization.
+FIT array scans, scalar non-finite
+convergence checks, mixed commit validation, and unitary norm-consistency
+validation are opt-in. `finite_check=True` enables these checks and a final
+tensor-data scan in every mode, and emits one performance warning per replay.
+Nested FIT calls share that warning instead of warning again for every gate.
+Standalone FIT calls still warn when their checks are enabled. Shot workers
+inherit the flag unless `run_kwargs["finite_check"]` overrides it.
+Convergence and norm accounting still calculate/read the required scalars,
+which can synchronize an accelerator. Input validation, zero-divisor guards,
+and explicitly requested quality/overlap diagnostics retain their own policies.
+Backend linear algebra can still raise its own numerical errors.
 
 Dense DMRG SRC guesses and rollback snapshots copy tensor metadata across the
 chain but allocate independent array data only inside the active endpoint
@@ -450,6 +460,11 @@ replaces arrays in the private copy. Active copies retain `left_inds`, backend,
 dtype/device, and Torch autograd connections. Native Symmray/fermionic and
 unrecognized array backends retain full deep copies. The public standalone
 `guess(..., inplace=False)` contract is unchanged.
+During a replay, the copy helper classifies each network/array type once and
+reuses that decision across backend-preserving updates. The cache is cleared
+on replay exit (including failure), invalidated by `set_p`, and never reused
+by standalone helper calls. SRC selection also skips rank-ceiling checks
+that only affect random initialization policies.
 
 The expensive direct FIT-target overlap contraction is opt-in through
 `fit_overlap_diagnostics=True`. Its result is reported in
@@ -485,7 +500,8 @@ The named `dmrg1`, `dmrg2`, and `dmrg3` schedules are backend-independent:
 native U1, U1xU1, and Z2 fermionic states use the same schedules as ordinary
 arrays. `dmrg1` uses its bounded two-sweep warm-up and sticky one-site phase,
 while `dmrg2` and `dmrg3` perform their fixed block warm-up before one-site
-refinement. Ordinary dense MPS replay keeps the exact gate target `p_g` separate
+refinement, with one intervening two-site sweep for `dmrg3`.
+Ordinary dense MPS replay keeps the exact gate target `p_g` separate
 from FIT's initial state. For a two- or three-site growth window,
 `fit_init_strategy` selects the disposable guess: `direct` uses the current
 MPS, `random` adds deterministic small noise without changing ranks,
@@ -594,7 +610,7 @@ Mixed-mode DMRG trials isolate only the active FIT window and the canonicalizati
 path leading to it. Untouched MPS tensors are shared until a successful trial is
 committed, avoiding a full deep copy for every transaction while preserving
 rollback safety for the active update. After a non-finite DMRG result,
-`mix_sticky_nonfinite=True` keeps the remainder
+`mix_sticky_nonfinite=True` (default `False`) keeps the remainder
 of the current `run()` call on MPO rather than retrying an unhealthy FIT for
 every gate. An ordinary exception still falls back only for its transaction.
 The initial MPS must satisfy `p.max_bond() <= chi`. The mixed replay history is

@@ -2181,6 +2181,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.last_mix_summary = None
         self.last_run_timing = None
         self._timing_state = None
+        self._fit_copy_policy_cache = None
+        # Optional diagnostics, disabled for normal replay in every mode.
+        # run(finite_check=True) enables them only for that replay and warns.
+        self._finite_check_enabled = False
         self._mix_dmrg_disabled_reason = None
         self._mix_dmrg_failed_sweep = None
         self._last_dmrg_fit_diagnostics = None
@@ -2884,11 +2888,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return result
 
         start, stop = self._normalize_span(where)
-        needs_growth = not FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
-            p,
-            start,
-            stop,
-            self.chi,
+        needs_growth = requested_strategy in {"random", "random_expand"} and not (
+            FIT._active_bonds_at_rank_targets(p, start, stop, self.chi)  # pylint: disable=protected-access
         )
         if requested_strategy == "auto":
             selected_strategy = _DEFAULT_FIT_INIT_STRATEGY
@@ -3199,6 +3200,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             state=new_p,
         )
         self.p = new_p
+        if self._fit_copy_policy_cache is not None:
+            self._fit_copy_policy_cache.clear()
         self._initial_p = self.p.copy()
         self._initial_mps_length = int(getattr(self.p, "L", 0))
         self._mps_length_history = [self._initial_mps_length]
@@ -3320,7 +3323,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             scale_abs = ar.do("abs", scale)
             scale_float = self._real_float(scale_abs)
-            if scale_float == 0.0 or not math.isfinite(scale_float):
+            if scale_float == 0.0 or (
+                self._finite_check_enabled and not math.isfinite(scale_float)
+            ):
                 raise FloatingPointError(
                     "Cannot normalize an MPS with a zero or non-finite "
                     "canonical-center norm."
@@ -3342,7 +3347,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 # not expose the MPS ``normalize`` helper. Scale the network
                 # directly while retaining the same previous-norm contract.
                 scale = self._real_float(self.p.norm())
-                if scale == 0.0 or not math.isfinite(scale):
+                if scale == 0.0 or (
+                    self._finite_check_enabled and not math.isfinite(scale)
+                ):
                     raise FloatingPointError(
                         "Cannot normalize an exact state with a zero or "
                         "non-finite norm."
@@ -3422,6 +3429,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied.mix_history = deepcopy(self.mix_history)
         copied.last_mix_summary = deepcopy(self.last_mix_summary)
         copied.last_run_timing = deepcopy(self.last_run_timing)
+        copied._fit_copy_policy_cache = None
+        copied._finite_check_enabled = False
         copied._mix_dmrg_disabled_reason = self._mix_dmrg_disabled_reason
         copied._mix_dmrg_failed_sweep = self._mix_dmrg_failed_sweep
         copied._dmrg1_one_site_locked = self._dmrg1_one_site_locked
@@ -4743,7 +4752,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mix_fit_min_iter=_DEPRECATED_OPTION,
         mix_fit_rtol=_DEPRECATED_OPTION,
         mix_fit_patience=_DEPRECATED_OPTION,
-        mix_sticky_nonfinite=True,
+        mix_sticky_nonfinite=False,
         *,
         fit_min_iter=2,
         fit_rtol="auto",
@@ -4899,7 +4908,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Deprecated compatibility aliases for ``fit_min_iter``,
             ``fit_rtol``, and ``fit_patience``. New code should use the
             mode-neutral keyword-only names below.
-        mix_sticky_nonfinite : bool, default=True
+        mix_sticky_nonfinite : bool, default=False
             After a mixed DMRG trial produces NaN or Inf, use MPO for the
             remainder of this :meth:`run` call instead of retrying DMRG on
             every subsequent gate.
@@ -5040,12 +5049,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_stabilize_unitary : optional
             Deprecated compatibility alias for ``stabilize_unitary``.
         finite_check : bool, default=False
-            Scan active FIT arrays for non-finite values after every sweep.
-            Enabling this emits a RuntimeWarning because the scan adds work
-            and can synchronize accelerators. Applies to DMRG, mixed-mode
-            FIT, and measurement FIT. Shot workers inherit this flag unless
-            ``run_kwargs`` overrides it. Scalar norm-convergence and
-            norm-accounting guards remain independent.
+            Optional diagnostic tensor and scalar-norm validation, not
+            required for normal optimization. Leave False to avoid the extra
+            checks and possible accelerator synchronization. False disables
+            FIT finite scans, non-finite convergence-norm checks, mixed-mode
+            commit validation, and unitary norm-consistency validation.
+            True also checks the final tensor data in every replay mode and
+            emits one performance warning per replay, shared by all nested
+            FIT calls. Shot workers inherit this flag
+            unless ``run_kwargs`` overrides it. Norm calculations needed for
+            convergence/accounting and explicit quality/overlap diagnostics
+            remain independent, as do input validation and zero-divisor guards.
         timing : bool, default=False
             Record wall-clock replay timing in :attr:`last_run_timing` without
             printing. Timing is fully opt-in: disabled runs retain the normal
@@ -5228,9 +5242,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self._refresh_su_physical_state()
                 return self.p
 
-            return self._run_with_timing(
+            return self._run_with_fit_copy_policy(
                 run_empty,
                 enabled=timing,
+                finite_check=finite_check,
                 event_count=0,
                 sync_device=timing_sync_device,
             )
@@ -5545,7 +5560,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if has_control:
             try:
-                return self._run_with_timing(
+                return self._run_with_fit_copy_policy(
                     lambda: self._run_segmented(
                         G_seq,
                         where_seq,
@@ -5559,6 +5574,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         mode_kwargs=mode_kwargs,
                     ),
                     enabled=timing,
+                    finite_check=finite_check,
                     event_count=len(G_seq),
                     sync_device=timing_sync_device,
                 )
@@ -5571,7 +5587,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self._normalize_visible_mps_order()
 
         try:
-            return self._run_with_timing(
+            return self._run_with_fit_copy_policy(
                 lambda: self._execute_mode(
                     G_seq,
                     where_seq,
@@ -5581,6 +5597,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     **mode_kwargs,
                 ),
                 enabled=timing,
+                finite_check=finite_check,
                 event_count=len(G_seq),
                 sync_device=timing_sync_device,
             )
@@ -5591,6 +5608,44 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     current_order=layout_current_order,
                 )
                 self._normalize_visible_mps_order()
+
+    def _run_with_fit_copy_policy(self, executor, *, finite_check=False, **timing_options):
+        """Scope copy capabilities and runtime validation to one replay.
+
+        State replacement and control boundaries may change the MPS object,
+        but validated replay preserves its array backend. Classify each
+        network/array type once, lazily, and release the cache on all exits.
+        Calls outside replay always inspect their actual input state for
+        copy capabilities. Runtime non-finite validation is opt-in in all modes.
+        """
+        previous_cache = self._fit_copy_policy_cache
+        previous_finite_check = self._finite_check_enabled
+        self._fit_copy_policy_cache = {}
+        self._finite_check_enabled = bool(finite_check)
+        try:
+            if finite_check:
+                # Diagnostic validation is off by default. Warn once for this
+                # replay; owned FIT instances suppress only their duplicate.
+                warnings.warn(
+                    "MpsOptimizer finite_check is enabled: this optional "
+                    "diagnostic is off by default and is not required for "
+                    "normal optimization. It adds tensor/norm checks and can "
+                    "synchronize devices; use finite_check=False to avoid "
+                    "this overhead.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                def checked_executor():
+                    result = executor()
+                    if not self._mps_data_is_finite(self.p):
+                        raise FloatingPointError("Replay produced non-finite MPS data.")
+                    return result
+
+                return self._run_with_timing(checked_executor, **timing_options)
+            return self._run_with_timing(executor, **timing_options)
+        finally:
+            self._fit_copy_policy_cache = previous_cache
+            self._finite_check_enabled = previous_finite_check
 
     def _run_with_timing(
         self,
@@ -5794,7 +5849,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_min_iter=2,
         fit_rtol=None,
         fit_patience=2,
-        mix_sticky_nonfinite=True,
+        mix_sticky_nonfinite=False,
         fit_block_size=2,
         fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
@@ -7126,19 +7181,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._unitary_previous_norm = None
 
     @staticmethod
-    def _fidelity_ratio_from_norms(observed_norm, expected_norm):
+    def _fidelity_ratio_from_norms(observed_norm, expected_norm, *, finite_check=False):
         """Return raw and clipped fidelity measured from two norms."""
         observed_norm = float(abs(observed_norm))
         expected_norm = float(abs(expected_norm))
         if (
             expected_norm <= 0.0
             or observed_norm < 0.0
-            or not np.isfinite(expected_norm)
-            or not np.isfinite(observed_norm)
+            or (finite_check and (
+                not np.isfinite(expected_norm) or not np.isfinite(observed_norm)
+            ))
         ):
             return None, None
         raw = (observed_norm / expected_norm) ** 2
-        return raw, min(1.0, max(0.0, raw))
+        return raw, min(max(raw, 0.0), 1.0)
 
     def _unitary_norm_overshoot_tolerance(self):
         """Return the dtype-aware tolerance for small norm overshoots.
@@ -7176,10 +7232,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         compression survival product.
         """
         raw, survival = self._fidelity_ratio_from_norms(
-            observed_norm, expected_norm
+            observed_norm, expected_norm, finite_check=self._finite_check_enabled
         )
         if (
-            kind == "unitary_compression"
+            self._finite_check_enabled
+            and kind == "unitary_compression"
             and raw is not None
         ):
             overshoot_tolerance = self._unitary_norm_overshoot_tolerance()
@@ -7220,7 +7277,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if survival is not None:
             if survival == 0.0:
                 self._norm_log_survival = -np.inf
-            elif np.isfinite(self._norm_log_survival):
+            elif self._norm_log_survival != -np.inf:
                 self._norm_log_survival += math.log(survival)
             cumulative = (
                 0.0
@@ -7622,6 +7679,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         return p_target
 
+    def _fit_window_copy_supported(self, p):
+        """Inspect array capabilities once before sharing exterior data."""
+        if self._has_symmray_data(p) or p.isfermionic():
+            return False
+        return all(
+            ar.infer_backend(t.data) in {"numpy", "torch", "jax"}
+            for t in p.tensors
+        )
+
     def _copy_fit_window_state(self, p, where):
         """Copy active FIT data, retaining read-only exterior arrays.
 
@@ -7631,12 +7697,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         span so an in-place failure cannot corrupt the source or rollback.
         Native/unknown array types retain the conservative full deep copy.
         """
-        if self._has_symmray_data(p) or p.isfermionic():
-            return p.copy(deep=True)
-        if any(
-            ar.infer_backend(t.data) not in {"numpy", "torch", "jax"}
-            for t in p.tensors
-        ):
+        cache = self._fit_copy_policy_cache
+        if cache is None:
+            supported = self._fit_window_copy_supported(p)
+        else:
+            key = (type(p), type(p[0].data))
+            if key not in cache:
+                cache[key] = self._fit_window_copy_supported(p)
+            supported = cache[key]
+        if not supported:
             return p.copy(deep=True)
         start, stop = min(where), max(where)
         copied = p.copy()
@@ -8035,11 +8104,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             min(site for where in wheres for site in where),
             max(site for where in wheres for site in where),
         ))
-        needs_growth = not FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
-            p,
-            start,
-            stop,
-            self.chi,
+        needs_growth = requested_strategy in {"random", "random_expand"} and not (
+            FIT._active_bonds_at_rank_targets(p, start, stop, self.chi)  # pylint: disable=protected-access
         )
         is_named_svd_window = len(gates) == 1 and self._dmrg_mode_alias in {
             "dmrg1",
@@ -8159,8 +8225,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     @staticmethod
     def _event_old_norm_from_log10(log10_old_norm):
         """Return a float old-norm value from its base-10 log when possible."""
-        if not np.isfinite(log10_old_norm):
-            return np.inf if log10_old_norm > 0.0 else 0.0
         max_log10 = np.log10(np.finfo(float).max)
         if log10_old_norm > max_log10:
             return np.inf
@@ -8234,7 +8298,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             scale = self._canonical_span_norm(p, span)
             center = int(span[1])
         scale_float = self._real_float(ar.do("abs", scale))
-        if scale_float == 0.0 or not np.isfinite(scale_float):
+        if scale_float == 0.0 or (
+            self._finite_check_enabled and not np.isfinite(scale_float)
+        ):
             return None
 
         p[center].modify(data=p[center].data / scale)
@@ -8421,8 +8487,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if (
             current_float == 0.0
             or target_float == 0.0
-            or not np.isfinite(current_float)
-            or not np.isfinite(target_float)
+            or (self._finite_check_enabled and (
+                not np.isfinite(current_float) or not np.isfinite(target_float)
+            ))
         ):
             raise FloatingPointError(
                 "Cannot stabilize a unitary FIT state with a zero or non-finite norm."
@@ -8751,7 +8818,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return trial_p, sites
 
     def _validate_mix_norm(self, where, *, operation):
-        """Validate the cheap retained norm used by mixed-mode commits.
+        """Validate mixed-mode commit norms only when finite_check is enabled.
 
         Mixed replay already leaves a tracked canonical center after each
         compression. Reading that center's Frobenius norm is sufficient for
@@ -8759,6 +8826,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         every transaction. Full tensor-data checks remain available through
         ``quality_check_every``.
         """
+        if not self._finite_check_enabled:
+            return None
         try:
             retained_norm, _ = self._retained_center_norm(self.p, where)
             norm_value = self._real_float(ar.do("abs", retained_norm))
@@ -9544,6 +9613,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``run_eff`` here would refit the complete MPS after every gate and
         would no longer implement local DMRG-style compression.
         """
+        kwargs.setdefault(
+            "two_site_transition_sweeps", 1 if self._dmrg_mode_alias == "dmrg3" else 0
+        )
+        # FIT is owned by this optimizer and discarded after the call. The
+        # active replay already warned about diagnostics; keep every check
+        # enabled without emitting another warning for each gate or segment.
+        fit._finite_check_warning_handled = self._finite_check_enabled
         if self._timing_state is None:
             return fit.run_gate(**kwargs)
         kwargs.setdefault("timing", True)

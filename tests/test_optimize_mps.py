@@ -1861,7 +1861,7 @@ def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
     monkeypatch.setattr(py.MpsOptimizer, "_run_dmrg", nonfinite_dmrg)
     opt = py.MpsOptimizer(p0, gates=gates, chi=2, mode="mix", inplace=True)
 
-    opt.run(progbar=False, cutoff=1e-12)
+    opt.run(progbar=False, cutoff=1e-12, finite_check=True)
 
     assert opt.mix_history[0]["backend"] == "mpo"
     assert opt.mix_history[0]["reason"] == "dmrg_fallback"
@@ -1909,7 +1909,7 @@ def test_fit_gate_cheap_finite_check_transfers_one_vector_per_sweep(monkeypatch)
 
     monkeypatch.setattr(mps_optimizer_module.ar, "to_numpy", counted_to_numpy)
 
-    fit.run_gate(n_iter=3, finite_check=True)
+    fit.run_gate(rtol=None, n_iter=3, finite_check=True)
 
     assert fit.iterations_run == 3
     assert len(conversions) == 3
@@ -1927,7 +1927,7 @@ def test_fit_gate_timing_records_sweep_and_site_steps():
     )
     fit = py.FIT(state.copy(), p=state, range_int=[0, 2])
 
-    fit.run_gate(n_iter=2, timing=True)
+    fit.run_gate(block_size=1, n_iter=2, timing=True)
 
     records = fit.get_timing()
     assert [record["sweep"] for record in records] == [1, 2]
@@ -2332,6 +2332,7 @@ def test_fit_gate_three_site_native_splits_and_keeps_outside_bonds():
     fit = py.FIT(target, p=initial, range_int=[0, 3])
 
     fit.run_gate(
+        collect_split_diagnostics=True,
         n_iter=2,
         block_size=3,
         sweep_sequence="RL",
@@ -2366,6 +2367,8 @@ def test_fit_gate_three_site_warmup_then_one_site_refinement():
     fit = py.FIT(target, p=initial, range_int=[0, 3])
 
     fit.run_gate(
+        adaptive_block_sweeps=None, two_site_transition_sweeps=0,
+        collect_split_diagnostics=True,
         n_iter=3,
         block_size=3,
         three_site_sweeps=1,
@@ -2388,6 +2391,7 @@ def test_fit_gate_polish_sweeps_update_iteration_diagnostics():
     fit = py.FIT(target, p=initial, range_int=[0, 3])
 
     fit.run_gate(
+        adaptive_block_sweeps=None, two_site_transition_sweeps=0, rtol=None,
         n_iter=1,
         block_size=3,
         three_site_sweeps=1,
@@ -2410,6 +2414,7 @@ def test_fit_gate_two_site_warmup_then_one_site_refinement():
     fit = py.FIT(target, p=initial, range_int=[0, 3])
 
     fit.run_gate(
+        collect_split_diagnostics=True,
         n_iter=4,
         block_size=2,
         adaptive_block_sweeps=2,
@@ -2620,7 +2625,7 @@ def test_dmrg3_optional_svd_guess(fit_mpo_guess):
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [3, 3, 1]
+    ] == [3, 3, 2]
 
 
 def test_dmrg1_latches_one_site_phase_after_full_chain_saturation():
@@ -2849,9 +2854,9 @@ def test_dmrg3_rtol_can_stop_after_three_site_warmup():
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [3, 3, 1, 1]
+    ] == [3, 3, 2, 1, 1]
     diagnostics = optimizer._last_dmrg_fit_diagnostics
-    assert diagnostics["adaptive_sweeps"] == 2
+    assert diagnostics["adaptive_sweeps"] == 3
     assert diagnostics["one_site_refinement_sweeps"] == 2
     assert diagnostics["convergence_reason"] == "relative_tolerance"
 
@@ -2878,6 +2883,7 @@ def test_fit_gate_large_window_block_sizes_compare_with_timing(block_size):
     fit = py.FIT(target, p=initial, range_int=[0, length - 1], cutoffs=1.0e-10)
 
     fit.run_gate(
+        adaptive_block_sweeps=None, two_site_transition_sweeps=0,
         n_iter=2,
         block_size=block_size,
         sweep_sequence="RL",
@@ -3071,6 +3077,7 @@ def test_fit_gate_builds_only_fixed_environments_reachable_by_block(
 
     monkeypatch.setattr(fit, "_overlap_environment_site", count_overlap)
     fit.run_gate(
+        adaptive_block_sweeps=None,
         n_iter=1,
         block_size=block_size,
         sweep_sequence=direction,
@@ -3182,6 +3189,7 @@ def test_fit_reuses_reversed_three_site_cache_for_one_site_refinement(
         5, bond_dim=3, phys_dim=2, dtype="complex128", seed=609
     )
     options = {
+        "two_site_transition_sweeps": 0,
         "n_iter": 3,
         "block_size": 3,
         "adaptive_block_sweeps": 2,
@@ -3230,7 +3238,7 @@ def test_fit_auto_cutoff_is_dtype_aware():
     target.gate_nonlocal_(qu.CNOT(), (0, 2), max_bond=None, cutoff=0.0)
     fit = py.FIT(target, p=initial, range_int=[0, 2])
 
-    fit.run_gate(n_iter=1, block_size=2, cutoff="auto")
+    fit.run_gate(adaptive_block_sweeps=None, n_iter=1, block_size=2, cutoff="auto")
 
     assert fit.info["cutoff_requested"] == "auto"
     assert fit.info["cutoff_resolved"] == pytest.approx(1.0e-6)
@@ -3283,7 +3291,7 @@ def test_fit_retag_resolves_environment_and_preserves_info_object():
         info=info,
         environment_strategy="mps-direct",
     )
-    fit.run_gate(n_iter=1, block_size=2, max_bond=2)
+    fit.run_gate(adaptive_block_sweeps=None, collect_split_diagnostics=True, n_iter=1, block_size=2, max_bond=2)
 
     assert fit.environment_strategy == "mps-direct"
     assert fit.info is info
@@ -3707,6 +3715,7 @@ def test_fit_gate_two_site_final_polish_only_spans_large_windows():
     )
     fit = py.FIT(state.copy(), p=state, range_int=[0, 2])
     fit.run_gate(
+        adaptive_block_sweeps=None,
         n_iter=1,
         block_size=2,
         sweep_sequence="RL",
@@ -3723,6 +3732,7 @@ def test_fit_gate_two_site_final_polish_only_spans_large_windows():
 
     pair = py.FIT(state.copy(), p=state, range_int=[1, 2])
     pair.run_gate(
+        adaptive_block_sweeps=None,
         n_iter=1,
         block_size=2,
         final_one_site_sweeps=1,
@@ -3753,8 +3763,8 @@ def test_fit_alternating_sweeps_reuse_opposite_canonical_form(monkeypatch):
     # Two separate calls intentionally force the old, conservative
     # preparation pass before the L sweep and provide a numerical reference.
     reference = py.FIT(target, p=initial.copy(), range_int=[0, 3])
-    reference.run_gate(n_iter=1, sweep_sequence="R", **options)
-    reference.run_gate(n_iter=1, sweep_sequence="L", **options)
+    reference.run_gate(adaptive_block_sweeps=None, n_iter=1, sweep_sequence="R", **options)
+    reference.run_gate(adaptive_block_sweeps=None, n_iter=1, sweep_sequence="L", **options)
 
     counts = {"left": 0, "right": 0}
     original_left = qtn.MatrixProductState.left_canonize_site
@@ -3916,6 +3926,8 @@ def test_unitary_norm_overshoot_tolerance_is_dtype_aware():
     assert complex128._unitary_norm_overshoot_tolerance() == pytest.approx(
         1.0e-6
     )
+    complex64._finite_check_enabled = True
+    complex128._finite_check_enabled = True
 
     event = complex64._record_norm_event(
         "unitary_compression",
@@ -4023,6 +4035,7 @@ def test_fit_gate_three_site_symmray_uses_native_block_splits():
     fit = py.FIT(state.copy(), p=state, range_int=[0, 2])
 
     fit.run_gate(
+        adaptive_block_sweeps=None, collect_split_diagnostics=True,
         n_iter=1,
         block_size=3,
         sweep_sequence="R",
@@ -4349,8 +4362,8 @@ def test_fit_fermionic_block_cache_feeds_one_site_refinement(
     with monkeypatch.context() as patcher:
         for array_type in array_types:
             patcher.setattr(array_type, "to_dense", fail_dense)
-        cached.run_gate(**options)
-        conservative.run_gate(**options)
+        cached.run_gate(two_site_transition_sweeps=0, **options)
+        conservative.run_gate(two_site_transition_sweeps=0, **options)
 
     assert cached._sweep_environment_reuse_count == 2
     assert conservative._sweep_environment_reuse_count == 0
@@ -4441,8 +4454,8 @@ def test_fit_bosonic_symmray_reuses_native_reversed_environments(
     with monkeypatch.context() as patcher:
         for array_type in array_types:
             patcher.setattr(array_type, "to_dense", fail_dense)
-        cached.run_gate(**options)
-        conservative.run_gate(**options)
+        cached.run_gate(two_site_transition_sweeps=0, **options)
+        conservative.run_gate(two_site_transition_sweeps=0, **options)
 
     assert cached.environment_strategy == "symmray-native"
     assert cached._allow_sweep_environment_reuse is True
@@ -4495,6 +4508,7 @@ def test_fit_fermionic_failure_restores_physical_ket(monkeypatch):
     monkeypatch.setattr(fit, "_run_gate_two_site_sweep", fail_sweep)
     with pytest.raises(RuntimeError, match="injected native sweep failure"):
         fit.run_gate(
+            adaptive_block_sweeps=None,
             n_iter=1,
             block_size=2,
             sweep_sequence="R",
@@ -4880,8 +4894,8 @@ def test_mps_optimizer_named_dmrg_long_range_fermions_stay_native_and_exact(
         == 3
     )
     if mode in {"dmrg2", "dmrg3"}:
-        assert diagnostics["adaptive_sweeps"] == 2
-        assert diagnostics["one_site_refinement_sweeps"] == 1
+        assert diagnostics["adaptive_sweeps"] == (3 if mode == "dmrg3" else 2)
+        assert diagnostics["one_site_refinement_sweeps"] == (0 if mode == "dmrg3" else 1)
     assert float(
         np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-9)
@@ -5690,7 +5704,7 @@ def test_mps_optimizer_fit_mode_is_clear_dmrg_alias():
     [
         ("dmrg1", [2, 2, 1]),
         ("dmrg2", [2, 2, 1]),
-        ("dmrg3", [3, 3, 1]),
+        ("dmrg3", [3, 3, 2]),
     ],
 )
 def test_mps_optimizer_dmrg_mode_aliases_select_block_size(mode, expected_blocks):
@@ -5955,7 +5969,7 @@ def test_mps_optimizer_mix_nonfinite_sweep_disables_later_dmrg(monkeypatch):
         mode="mix",
     )
 
-    opt.run(progbar=False, n_iter=8)
+    opt.run(progbar=False, n_iter=8, finite_check=True, mix_sticky_nonfinite=True)
 
     first, second = opt.mix_history
     assert first["reason"] == "dmrg_fallback"
@@ -8696,6 +8710,7 @@ def test_fit_run_gate_reuse_resets_per_run_traces_and_split_diagnostics():
     fit = py.FIT(state.copy(), p=state, range_int=[0, 2])
 
     fit.run_gate(
+        adaptive_block_sweeps=None,
         n_iter=2,
         verbose=True,
         block_size=2,
@@ -8706,6 +8721,7 @@ def test_fit_run_gate_reuse_resets_per_run_traces_and_split_diagnostics():
     assert len(fit.info["two_site_splits"]) == 4
 
     fit.run_gate(
+        adaptive_block_sweeps=None,
         n_iter=1,
         verbose=True,
         block_size=2,
