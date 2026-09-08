@@ -716,10 +716,15 @@ accumulating branch-wide tags. `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
 engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names. Generic
 `dmrg` uses `fit_block_size` (two by default) and its configured adaptive
 warm-up. `dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
-three-node warm-up blocks; remaining iterations refine with one-node sweeps.
-With the default two iterations and two warm-up iterations, `dmrg2`/`dmrg3`
-do not reach one-node refinement. Four iterations give `(2, 2, 1, 1)` or
-`(3, 3, 1, 1)` respectively.
+three-node warm-up blocks followed by a two-node transition and one-node
+refinement. The default `fit_n_iter=4` permits eight directional passes and
+reaches refinement: `(2, 2, 1, 1)` for `dmrg2`, `(3, 3, 2, 1)` for `dmrg3`.
+Tree warm-up still counts complete iterations, so this is not an identical
+sequence of local updates to eight MPS sweeps. Explicit smaller budgets
+remain honored. `fit_two_site_transition_sweeps=1` controls the `dmrg3`
+transition within that budget; zero restores its previous three-to-one schedule.
+Every block-size change resets the tolerance history, and tolerance stopping
+cannot skip a pending transition or refinement phase.
 
 `fit_sweep_sequence="inward-outward"` is the TreeOptimizer default. Use
 `"outward-inward"` to reverse the order. Each iteration includes both passes,
@@ -728,16 +733,67 @@ whole tree's root. `RL`/`INOUT` and `LR`/`OUTIN` remain compatible aliases
 for the two orders. Standalone TreeFIT uses the same names and default;
 diagnostics report the normalized `sweep_sequence`.
 
-The optimizer options `fit_n_iter`, `fit_adaptive_sweeps`, `fit_min_iter`, `fit_rtol`,
+FIT reuses each traversal order within a run. Before a block update, it moves
+the canonical center only as far as needed to make the exterior isometric;
+an existing center inside the block needs no preparatory QR. Local
+factorization still establishes the requested final center, including explicit
+endpoint centers for three-node `TreeFIT.fit_block` updates.
+
+`fit_traversal="depth-first"` groups updates by branch to reduce canonical
+center travel and environment invalidation. It visits the same connected
+blocks as the default `"depth"` ordering; inward reverses outward. The medial
+node anchors an iterative depth-first walk, and a multi-node block is ordered
+by its node nearest that hub. This is opt-in because update order can change
+finite-bond fidelity and convergence. Standalone TreeFIT calls this option
+`traversal`.
+
+For native Symmray states, `fit_environment_strategy="native-blockwise"`
+uses graded blockwise contractions for FIT messages and effective tensors,
+avoiding repeated charge-block fusion/unfusion. It retains Quimb/Cotengra
+contraction planning, backend/device, and fermionic phases. The default is
+`"default"`; the alternative requires native target/state arrays and checks
+actual upstream API support. No global dispatch is changed. Standalone
+TreeFIT calls this option `environment_strategy`. Performance depends on the
+sector sizes and backend; blockwise is not universally faster.
+
+`fit_single_node_fast_path=True` is automatic for a truly one-node active
+region. It skips the compressed/random guess and performs one local
+projection, preserving the parent RNG sequence. Diagnostics report one
+iteration, `block_size_trace=(1,)`, `guess_used=False`, and
+`convergence_reason="single_node_exact"`. This remains exact for a local
+nonunitary gate and records its resulting norm; it does not depend on
+`fit_rtol` or `fit_min_iter`. Set the flag to `False` to restore repeated
+sweeps. A multi-node region using one-node updates still needs iteration.
+For standalone `TreeFIT.run_gate`, `single_node_fast_path=True` solves the
+local least-squares problem with its exterior held fixed; it does not promise
+global fidelity one for an arbitrary target. Complete-tree `run`/`run_eff`
+retain fixed iteration defaults with `single_node_fast_path=False`.
+
+Small CPU measurements and compatibility probes are recorded in the
+[FIT execution review](../../development/notes/tree_fit_execution.md).
+
+The optimizer options `fit_n_iter`, `fit_adaptive_sweeps`,
+`fit_two_site_transition_sweeps`, `fit_min_iter`, `fit_rtol`,
 `fit_patience`, `fit_sweep_sequence`, `fit_init_strategy`,
 `fit_init_rand_strength`, and `fit_init_seed` are forwarded to TreeFIT.
+`fit_init_strategy="auto"` is the default: it selects `guess-src` for dense
+trees and `guess-direct` for native fermionic trees, whose randomized SRC
+compression is unsupported. This preserves the previous dense numerical
+policy. Explicit unsupported native `guess-src`/`guess-dm` requests still
+raise; `auto` does not change the requested output compression method.
 `fit_init_strategy="direct"` keeps the current state as the initial guess;
-`"guess-src"`, `"guess-sdc"`, `"guess-zipup"`, and `"guess-dm"` use a disposable compressed
+`"guess-direct"`, `"guess-src"`, `"guess-sdc"`, `"guess-zipup"`, and `"guess-dm"` use a disposable compressed
 warm start; `"random"` perturbs only active tensors and `"random_expand"`
 also grows active bonds towards the exact target rank, capped by `chi`.
 Randomized guesses remain deterministic for a fixed seed. Dense TreeFIT
 updates preserve canonical metadata and the represented exponent; no implicit
 normalization is performed on a non-unitary target.
+`guess-direct` applies the operator to a private copy and compresses it;
+it is distinct from the unchanged current-state `direct` initialization.
+Native even-parity fermionic projections apply the graded metric correction
+on dual open environment legs before local factorization. This preserves an
+already representable state at each local update, including one-node refinement.
+Odd-parity fermionic FIT remains explicitly unsupported.
 
 Disposable compressed guesses copy the state once through the ordinary state
 handoff. They do not clone the parent optimizer's queued gates, replay history,
@@ -769,7 +825,9 @@ disabled during `run(non_unitary=True)`. It is also disabled for updates with
 `track_norm=False`, whose target norm is not assumed known. Explicit numeric
 `fit_rtol` remains honored in those cases. Optimizer FIT diagnostics report
 both `fit_rtol_requested` and the effective `fit_rtol` for each update.
-Standalone TreeFIT retains `rtol=None` by default.
+Standalone TreeFIT retains `rtol=None` and its fixed-block defaults. All three
+entry points accept `two_site_transition_sweeps=0`; set this to one with
+`block_size=3, adaptive_block_sweeps=2` to request the new transition explicitly.
 
 TreeFIT accepts `retag=True` for structural node-tag alignment and
 `copy_target=False` for an explicitly disposable target. Its target may be a
@@ -789,8 +847,15 @@ unchanged.
 All ordinary DMRG gate entries now use `apply_subtreempo` too. The optimizer
 transfers ownership of its disposable layered target to TreeFIT with
 `copy_target=False`. `fit_finite_check=False` is the default; enable it to
-check active tensor entries once per sweep. Standalone TreeFIT uses
-`finite_check=False`. Trusted local updates no longer recompute every
+check active tensor entries once per iteration. `run(finite_check=True)` also
+checks active FIT tensors and scans the final state in every replay mode,
+including empty streams. This setting is scoped to that replay and inherited
+by shot workers unless `run_kwargs` overrides it. Enabled replay warns once
+about the optional diagnostic cost; nested FIT calls share that warning.
+Standalone TreeFIT uses `finite_check=False` and warns when scans are enabled.
+Scalar convergence, scale bookkeeping, and explicit overlap diagnostics remain
+independent; the existing scale/zero guards retain their semantics.
+Trusted local updates no longer recompute every
 outside isometry after each sweep; explicit `state.validate(check_canonical=True)`
 remains available. The existing `track_infidelity` default is unchanged.
 

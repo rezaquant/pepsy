@@ -5,6 +5,14 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
 
 ## Performance and stability
 
+- FIT offers opt-in `fit_traversal="depth-first"` for branch-grouped updates
+  and native `fit_environment_strategy="native-blockwise"` for local
+  contractions without charge-block fusion. Both retain legacy defaults;
+  the traversal can change truncated results and blockwise speed depends on
+  sector structure. A truly one-node FIT region automatically uses one exact
+  local projection. See `fit-environments.md` for the execution contract and
+  `docs/development/notes/tree_fit_execution.md` for measured tradeoffs.
+
 - **BLAS thread cap is the biggest performance lever.** Tree tensors are
   moderate-rank (set by local arity and an optional root physical leg, with
   dimensions bounded by `chi`), so multi-threaded BLAS/OpenMP is dominated by
@@ -74,8 +82,10 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   operator absorption use a direct backend ``tensordot``; Symmray retains its
   graded fermionic contraction semantics and unsupported hyperedges fall back
   to Quimb's general contraction path.
-- **Public performance defaults.** ``mode="auto"`` selects the direct
-  two-site kernel, ``threads=1`` and ``subtree_workers=1`` avoid oversubscription
+- **Public performance defaults.** Ordinary ``mode="auto"`` gates use the
+  TreeMPO active-subtree route and deterministic compression. The dedicated
+  two-site kernel remains available through the lower-level explicit APIs.
+  ``threads=1`` and ``subtree_workers=1`` avoid oversubscription
   on small tree tensors, ``profile=False`` avoids timing overhead, and
   ``track_truncation=False`` avoids diagnostic spectrum probes. The low-level
   ``TreeTensorNetwork.compress_edge_`` API uses the same ``rsum2`` cutoff-mode
@@ -107,6 +117,21 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   bonds, this is an accuracy diagnostic rather than an exact-gauge check.
 - `copy()` shares the immutable `TreePlan`, owns `self.tn.copy()`, resets the
   tid cache, and derives a deterministic child seed for an independent RNG.
+- FIT prepares only the exterior of each active block: retain a center already
+  inside the block, otherwise move it only to the first node on the entering
+  geodesic. Factorization establishes the requested final block center. Do not
+  add interior QR moves before replacing all active tensors.
+- Reuse immutable FIT block traversal orders within a run. Preserve the order
+  and scope the cache to its fixed region; geometry-based reordering changes
+  the variational schedule and needs an explicit numerical comparison.
+- Compression-hook signature capabilities are cached for the current hook
+  function, with one entry per optimizer. Replacing a legacy/custom hook must
+  trigger fresh inspection; never retain bound-method owners in a global cache.
+- CPU profiles and mode/accuracy comparisons are recorded in
+  `docs/development/notes/tree_modes_review.md`. At small chi, FIT environment
+  contractions and center movement dominate local SVDs; direct routes spend
+  substantial time in QR/compression and TreeMPO construction. Do not infer
+  GPU or high-chi performance from those small CPU measurements.
 
 ## Layout (`TreeLayoutFinder` / `TreePlan`)
 

@@ -18,7 +18,10 @@ either optimizer here.
 from __future__ import annotations
 
 from itertools import combinations
+from functools import lru_cache
+import inspect
 import math
+import warnings
 from numbers import Integral
 
 import autoray as ar
@@ -28,6 +31,32 @@ import quimb.tensor as qtn
 from .._internal.random import backend_random_array
 
 __all__ = ["TreeFIT"]
+
+
+def _native_blockwise_tensordot(a, b, axes):
+    """Use Symmray's graded contraction without fusing its charge blocks."""
+    import symmray as sr
+
+    return sr.tensordot(a, b, axes=axes, mode="blockwise")
+
+
+@lru_cache(maxsize=1)
+def _native_environment_implementation():
+    """Capability-gate the optional, per-contraction upstream implementation."""
+    import cotengra as ctg
+    import symmray as sr
+
+    if (
+        "mode" not in inspect.signature(sr.AbelianArray.tensordot).parameters
+        or "implementation" not in inspect.signature(
+            ctg.ContractionTree.get_contractor
+        ).parameters
+    ):
+        raise NotImplementedError(
+            "native-blockwise requires Symmray tensordot(mode=...) and "
+            "Cotengra's per-contraction implementation option"
+        )
+    return sr.einsum, _native_blockwise_tensordot
 
 
 def _randomize_tree_guess(
@@ -422,6 +451,13 @@ class TreeFIT:
         Quimb singular-value cutoff convention.
     contraction_opt : object, default="auto-hq"
         Contraction optimizer forwarded to local environment contractions.
+    traversal : {"depth", "depth-first"}, default="depth"
+        Legacy depth ordering or branch-grouped depth-first local updates.
+        Both visit the same blocks; truncated results can depend on order.
+    environment_strategy : {"default", "native-blockwise"}, default="default"
+        Optional per-contraction Symmray blockwise implementation for messages
+        and effective tensors. Requires native target/state arrays and public
+        upstream support; never changes global backend dispatch.
     split_method : {"direct", "dm", "src"}, default="direct"
         Local decomposition used to split fitted blocks. ``sdc`` is accepted
         as an alias for the deterministic direct local split.
@@ -457,6 +493,8 @@ class TreeFIT:
         cutoffs=1e-12,
         cutoff_mode="rsum2",
         contraction_opt="auto-hq",
+        traversal="depth",
+        environment_strategy="default",
         split_method="direct",
         split_seed=0,
         inplace=False,
@@ -468,6 +506,22 @@ class TreeFIT:
         finite_check=False,
     ):
         self._validate_geometry(tn, p)
+        self.traversal = self._normalize_traversal(traversal)
+        self.environment_strategy = self._normalize_environment_strategy(
+            environment_strategy
+        )
+        self._environment_contract_opts = {}
+        if self.environment_strategy == "native-blockwise":
+            if any(
+                ar.infer_backend(t.data) != "symmray"
+                for net in (tn, p) for t in net.tensors
+            ):
+                raise TypeError(
+                    "native-blockwise requires native Symmray target and state tensors"
+                )
+            self._environment_contract_opts["implementation"] = (
+                _native_environment_implementation()
+            )
         if any(
             tensor.isfermionic() and tensor.data.parity
             for network in (tn, p) for tensor in network.tensors
@@ -498,6 +552,7 @@ class TreeFIT:
 
         self.p = p if inplace else p.copy()
         self.finite_check = bool(finite_check)
+        self._finite_check_warning_handled = False
         if target_norm is not None:
             target_norm = ((float(target_norm), 0.0) if np.isscalar(target_norm)
                            else tuple(float(x) for x in target_norm))
@@ -833,6 +888,20 @@ class TreeFIT:
         self._effective_cache.clear()
         return self
 
+    @staticmethod
+    def _normalize_traversal(value):
+        value = str(value).strip().lower().replace("_", "-")
+        if value not in {"depth", "depth-first"}:
+            raise ValueError("traversal must be 'depth' or 'depth-first'")
+        return value
+
+    @staticmethod
+    def _normalize_environment_strategy(value):
+        value = str(value).strip().lower().replace("_", "-")
+        if value not in {"default", "native-blockwise"}:
+            raise ValueError("environment_strategy must be 'default' or 'native-blockwise'")
+        return value
+
     def environment_cache_info(self):
         """Return cache size and hit/miss counters."""
 
@@ -884,6 +953,7 @@ class TreeFIT:
             self._messages[edge] = qtn.tensor_contract(
                 *tensors, output_inds=output_inds,
                 optimize=self.contraction_opt, preserve_tensor=True, drop_tags=True,
+                **self._environment_contract_opts,
             )
             self.environment_cache_misses += 1
         return self._messages[key]
@@ -930,7 +1000,20 @@ class TreeFIT:
             optimize=self.contraction_opt,
             preserve_tensor=True,
             drop_tags=True,
+            **self._environment_contract_opts,
         )
+        if bool(getattr(effective.data, "fermionic", False)):
+            # Open overlap-environment legs carry the graded bra metric.
+            # Convert that covector to the fitted ket basis before writeback:
+            # each dual boundary leg contributes its odd-sector parity phase.
+            # Internal target legs and true physical outputs are not boundaries.
+            boundary_inds = {self.p.bond(u, v) for u, v in boundary}
+            axes = tuple(
+                axis for axis, ind in enumerate(effective.inds)
+                if ind in boundary_inds and effective.data.indices[axis].dual
+            )
+            if axes:
+                effective.modify(data=effective.data.phase_flip(*axes))
         self._effective_cache[key] = effective.copy()
         return effective
 
@@ -964,14 +1047,16 @@ class TreeFIT:
         current_region = getattr(self.p, "canonical_region", None)
         current_center = getattr(self.p, "orthogonality_center", None)
         if current_center is not None:
-            # A single centre already makes every branch outside any
-            # connected block isometric towards that block. Moving it only
-            # changes tensors on the unique centre path, so invalidate those
-            # directed messages and retain all untouched branch environments.
-            if current_center != center:
-                path = _path_of(self.p, current_center, center)
-                self._invalidate_for_block(path)
-            self.p.shift_orthogonality_center(center, _skip_validate=True)
+            # Only the exterior must be isometric towards the active block.
+            # Its interior is replaced by the projected target, so QR moves
+            # within that block do no useful work and invalidate more messages.
+            if current_center in region:
+                return
+            path = _path_of(self.p, current_center, center)
+            entry = next(i for i, node in enumerate(path) if node in region)
+            changed_path = path[:entry + 1]
+            self._invalidate_for_block(changed_path)
+            self.p.shift_orthogonality_center(changed_path[-1], _skip_validate=True)
             return
 
         is_canonical = getattr(self.p, "is_subtree_canonical_form", None)
@@ -1042,8 +1127,12 @@ class TreeFIT:
         )
         remaining = effective
         factors = {}
-        for leaf in leaves:
-            local_inds = self._local_legs(leaf, block)
+        while leaves:
+            leaf = leaves.pop(0)
+            local_inds = self._local_legs(leaf, block) + tuple(
+                self.p.bond(leaf, child) for child in sorted(factors)
+                if parent[child] == leaf
+            )
             right_inds = tuple(ind for ind in remaining.inds if ind not in local_inds)
             if not local_inds or not right_inds:
                 raise ValueError(
@@ -1071,6 +1160,12 @@ class TreeFIT:
             )
             left.modify(tags=_tensor_of(self.p, leaf).tags)
             factors[leaf] = left
+            destination = parent[leaf]
+            if destination != center and all(
+                child in factors for child in block if parent.get(child) == destination
+            ):
+                leaves.append(destination)
+                leaves.sort()
         remaining.modify(tags=_tensor_of(self.p, center).tags)
         factors[center] = remaining
         return factors
@@ -1264,12 +1359,13 @@ class TreeFIT:
             _exponent_value(self.tn),
         )
 
-    def _check_finite(self, region):
+    @staticmethod
+    def _check_state_finite(state, region):
         """Optional backend-native finite checks on the updated tensors."""
         flags = []
         owners = []
         for node in region:
-            data = _tensor_of(self.p, node).data
+            data = _tensor_of(state, node).data
             arrays = data.blocks.values() if ar.infer_backend(data) == "symmray" else (data,)
             for array in arrays:
                 flags.append(ar.do("all", ar.do("isfinite", array)))
@@ -1279,6 +1375,9 @@ class TreeFIT:
             bad = np.flatnonzero(~finite)
             if bad.size:
                 raise FloatingPointError(f"non-finite TreeFIT tensor at node {owners[bad[0]]}")
+
+    def _check_finite(self, region):
+        self._check_state_finite(self.p, region)
 
     def _local_norm_fidelity(self):
         """Return MPS-style retained-centre-norm fidelity for the latest sweep."""
@@ -1414,6 +1513,8 @@ class TreeFIT:
         """Return one inward or outward sequence of local update blocks."""
 
         region = frozenset(region)
+        if self.traversal == "depth-first":
+            return self._depth_first_sweep_blocks(region, block_size, direction)
         if block_size == 1:
             center = self._block_center(region)
             order = sorted(
@@ -1444,6 +1545,42 @@ class TreeFIT:
             ),
             reverse=direction == "in",
         )
+
+    def _depth_first_sweep_blocks(self, region, block_size, direction):
+        """Group updates by branch using one iterative walk of the region.
+
+        A block is anchored at its node nearest the medial hub. Reversing the
+        same order gives the inward pass and preserves the exact block set.
+        """
+        hub = self._block_center(region)
+        order = {}
+        depth = {}
+        stack = [(hub, None, 0)]
+        while stack:
+            node, parent, level = stack.pop()
+            order[node] = len(order)
+            depth[node] = level
+            stack.extend(
+                (neighbor, node, level + 1)
+                for neighbor in sorted(self._neighbors[node], reverse=True)
+                if neighbor != parent and neighbor in region
+            )
+        if block_size == 1:
+            blocks = [(node,) for node in order]
+        else:
+            blocks = self._connected_triples(region) if block_size == 3 else []
+            if not blocks:
+                blocks = [
+                    (node, neighbor)
+                    for node in region for neighbor in self._neighbors[node]
+                    if neighbor in region and node < neighbor
+                ]
+            if not blocks:
+                blocks = [(node,) for node in order]
+            blocks.sort(key=lambda block: (
+                order[min(block, key=depth.__getitem__)], block,
+            ))
+        return blocks[::-1] if direction == "in" else blocks
 
     def _active_edge_rank_targets(self, region, *, state=None):
         """Return physical rank ceilings for tree edges inside ``region``.
@@ -1525,7 +1662,9 @@ class TreeFIT:
         patience=1,
         adaptive_block_sweeps=None,
         adaptive_until_rank=False,
+        two_site_transition_sweeps=0,
         final_one_site_sweeps=0,
+        single_node_fast_path=True,
     ):
         """Run cached tree FIT sweeps over a connected active region.
 
@@ -1548,6 +1687,15 @@ class TreeFIT:
         the active tree edges reach their target/max-bond ceilings, subject to
         the minimum warm-up. ``final_one_site_sweeps`` adds fixed-rank polish
         sweeps after the requested iterations.
+        ``two_site_transition_sweeps`` inserts two-node iterations between
+        three-node warm-up and one-node refinement within the same budget.
+        Its default zero preserves standalone fixed-block schedules.
+
+        ``single_node_fast_path=True`` solves a one-node region with a single
+        exact local projection, regardless of tolerance or iteration budget.
+        This is exact for the fixed exterior, not necessarily for an arbitrary
+        target outside that region. Disable it to repeat the fixed sweeps.
+        Complete-tree ``run``/``run_eff`` keep this shortcut off by default.
 
         The per-sweep ``local_norm_trace`` is read from the final canonical
         centre tensor, matching MPS FIT. It is not a full-tree contraction;
@@ -1607,6 +1755,18 @@ class TreeFIT:
             raise ValueError("final_one_site_sweeps must be a non-negative integer")
         final_one_site_sweeps = int(final_one_site_sweeps)
         adaptive_until_rank = bool(adaptive_until_rank)
+        if (
+            not isinstance(two_site_transition_sweeps, Integral)
+            or int(two_site_transition_sweeps) < 0
+        ):
+            raise ValueError("two_site_transition_sweeps must be a non-negative integer")
+        if self.finite_check and not self._finite_check_warning_handled:
+            warnings.warn(
+                "TreeFIT finite_check is enabled: optional tensor scans can "
+                "synchronize devices; leave it disabled for normal optimization.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         previous = None
         stable = 0
@@ -1625,6 +1785,23 @@ class TreeFIT:
         self.adaptive_sweeps_run = 0
         self.one_site_sweeps_run = 0
         self.block_size_trace = []
+        if single_node_fast_path and len(region) == 1:
+            # The exterior is fixed: one canonical local projection solves
+            # this region exactly, independent of the initial centre tensor.
+            self.fit_block(region, validate=False)
+            self.iterations_run = 1
+            self.one_site_sweeps_run = 1
+            self.block_size_trace = [1]
+            self.final_direction = directions[-1]
+            self.final_center_site = getattr(self.p, "orthogonality_center", None)
+            if self.finite_check:
+                self._check_finite(region)
+            self._record_local_norm()
+            if verbose:
+                self.fidelity_trace.append(self._local_norm_fidelity())
+            self.converged = True
+            self.convergence_reason = "single_node_exact"
+            return self
         active_edges = tuple(
             (node, neighbor)
             for node in sorted(region)
@@ -1644,6 +1821,18 @@ class TreeFIT:
             else None
         )
 
+        transition_start = 1 if adaptive_phase_done else None
+        block_orders = {}
+
+        def sweep_blocks(size, direction):
+            # The region and topology are fixed for this run; only tensors
+            # change. Keep the exact traversal order without recomputing its
+            # tree-medial node and pairwise paths on every iteration.
+            key = (size, direction)
+            if key not in block_orders:
+                block_orders[key] = tuple(self._sweep_blocks(region, size, direction))
+            return block_orders[key]
+
         def block_size_for_sweep(sweep_number):
             if block_size not in {2, 3}:
                 return 1
@@ -1651,7 +1840,12 @@ class TreeFIT:
                 use_block = not adaptive_phase_done
             else:
                 use_block = sweep_number <= adaptive_block_sweeps
-            return block_size if use_block else 1
+            if use_block:
+                return block_size
+            start = transition_start if adaptive_until_rank else adaptive_block_sweeps + 1
+            if block_size == 3 and sweep_number < start + two_site_transition_sweeps:
+                return 2
+            return 1
 
         for iteration in range(1, int(n_iter) + 1):
             active_block_size = block_size_for_sweep(iteration)
@@ -1670,7 +1864,7 @@ class TreeFIT:
             else:
                 self.adaptive_sweeps_run += 1
             for direction in directions:
-                for block in self._sweep_blocks(region, active_block_size, direction):
+                for block in sweep_blocks(active_block_size, direction):
                     self.fit_block(block, validate=False)
             self.iterations_run = iteration
             self.final_direction = directions[-1]
@@ -1713,6 +1907,14 @@ class TreeFIT:
                             warmup_incomplete
                             or warmup_finished_with_refinement
                             or adaptive_rank_incomplete
+                            or (
+                                active_block_size > 1
+                                and iteration < int(n_iter)
+                                and (
+                                    block_size_for_sweep(iteration + 1) != active_block_size
+                                    or (block_size == 3 and active_block_size == 2)
+                                )
+                            )
                         )
                     ):
                         stable += 1
@@ -1743,6 +1945,7 @@ class TreeFIT:
                 )
             ):
                 adaptive_phase_done = True
+                transition_start = iteration + 1
                 previous = None
                 stable = 0
                 self.last_relative_change = None
@@ -1759,7 +1962,7 @@ class TreeFIT:
                 self.block_size_trace.append(1)
                 self.one_site_sweeps_run += 1
                 for direction in directions:
-                    for block in self._sweep_blocks(region, 1, direction):
+                    for block in sweep_blocks(1, direction):
                         self.fit_block(block, validate=False)
                 self.iterations_run += 1
                 self.final_direction = directions[-1]
@@ -1787,7 +1990,9 @@ class TreeFIT:
         patience=1,
         adaptive_block_sweeps=None,
         adaptive_until_rank=False,
+        two_site_transition_sweeps=0,
         final_one_site_sweeps=0,
+        single_node_fast_path=False,
     ):
         """Fit the complete tree using the cached local environment engine."""
 
@@ -1802,7 +2007,9 @@ class TreeFIT:
             verbose=verbose,
             adaptive_block_sweeps=adaptive_block_sweeps,
             adaptive_until_rank=adaptive_until_rank,
+            two_site_transition_sweeps=two_site_transition_sweeps,
             final_one_site_sweeps=final_one_site_sweeps,
+            single_node_fast_path=single_node_fast_path,
         )
 
     def run(
@@ -1817,7 +2024,9 @@ class TreeFIT:
         patience=1,
         adaptive_block_sweeps=None,
         adaptive_until_rank=False,
+        two_site_transition_sweeps=0,
         final_one_site_sweeps=0,
+        single_node_fast_path=False,
     ):
         """Run a complete-tree FIT sweep with the chain-compatible API.
 
@@ -1838,7 +2047,9 @@ class TreeFIT:
             verbose=verbose,
             adaptive_block_sweeps=adaptive_block_sweeps,
             adaptive_until_rank=adaptive_until_rank,
+            two_site_transition_sweeps=two_site_transition_sweeps,
             final_one_site_sweeps=final_one_site_sweeps,
+            single_node_fast_path=single_node_fast_path,
         )
 
     def fit_diagnostics(self, *, overlap=False):
@@ -1897,6 +2108,8 @@ class TreeFIT:
             "one_site_refinement_sweeps": int(self.one_site_sweeps_run),
             "block_size_trace": tuple(self.block_size_trace),
             "sweep_sequence": self.sweep_sequence,
+            "traversal": self.traversal,
+            "environment_strategy": self.environment_strategy,
             "target_layout": self.target_layout,
             "cache": self.environment_cache_info(),
         }

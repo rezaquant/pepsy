@@ -516,7 +516,7 @@ class TreeOptimizer:
     fit_block_size : {1, 2, 3}, default=2
         Generic ``dmrg`` local block size. Named aliases select their own
         warm-up size; ``dmrg1`` uses two-node growth before one-node DMRG.
-    fit_n_iter : int, default=2
+    fit_n_iter : int, default=4
         Maximum TreeFIT iterations per fitted gate window. Each iteration
         includes an inward and an outward pass in the configured order.
     fit_min_iter : int or None, default=2
@@ -533,6 +533,15 @@ class TreeOptimizer:
         Order of the two passes: ``"inward-outward"`` or ``"outward-inward"``.
         The legacy ``"RL"``/``"LR"`` and ``"INOUT"``/``"OUTIN"`` aliases
         remain accepted with identical traversal order.
+    fit_traversal : {"depth", "depth-first"}, default="depth"
+        Legacy depth ordering or branch-grouped FIT updates with less center
+        travel. Update order can affect finite-bond accuracy and convergence.
+    fit_environment_strategy : {"default", "native-blockwise"}, default="default"
+        Per-FIT native Symmray blockwise environment contractions. The opt-in
+        path requires supported upstream APIs and native target/state arrays.
+    fit_single_node_fast_path : bool, default=True
+        Solve a one-node active region with one exact local projection and
+        skip disposable guess replay. False restores iterative local sweeps.
     fit_finite_check : bool, default=False
         Opt-in finite-value checks of active TreeFIT tensors after each sweep.
         Routine fitting uses the terminal canonical-centre norm for convergence
@@ -540,6 +549,14 @@ class TreeOptimizer:
     fit_adaptive_sweeps : int, default=2
         Number of larger-block warm-up sweeps for generic ``dmrg``. Named
         ``dmrg1`` uses two warm-up sweeps, matching MpsOptimizer.
+    fit_two_site_transition_sweeps : int, default=1
+        Two-node iterations between three-node warm-up and one-node refinement
+        in named ``dmrg3``, within ``fit_n_iter``. Zero skips this transition.
+    fit_init_strategy : str, default="auto"
+        Disposable FIT guess: auto selects SRC compression for dense trees
+        and graded direct compression for native fermionic trees. Explicit
+        ``direct`` starts from the current state; ``guess-direct`` first
+        applies and compresses the operator on a private state.
     max_intermediate_bond : int, optional
         Conservative preflight limit for the untruncated crossing-bond bound.
         When set, eager replay raises :class:`MemoryError` before tensor work if
@@ -744,11 +761,14 @@ class TreeOptimizer:
                  cutoff_mode=_DEFAULT_CUTOFF_MODE, mode="auto",
                  compression_mode="direct",
                  compression_seed=None,
-                 fit_block_size=2, fit_n_iter=2, fit_adaptive_sweeps=2,
+                 fit_block_size=2, fit_n_iter=4, fit_adaptive_sweeps=2,
+                 fit_two_site_transition_sweeps=1,
                  fit_min_iter=2, fit_rtol="auto", fit_patience=1,
-                 fit_init_strategy="guess-src",
+                 fit_init_strategy="auto",
                  fit_init_rand_strength=0.0, fit_init_seed=0,
                  fit_sweep_sequence="inward-outward", fit_overlap_diagnostics=False,
+                 fit_traversal="depth", fit_environment_strategy="default",
+                 fit_single_node_fast_path=True,
                  fit_finite_check=False,
                  two_site_mode=None,
                  structure="quality", max_arity=2,
@@ -954,6 +974,12 @@ class TreeOptimizer:
         ):
             raise ValueError("fit_adaptive_sweeps must be a positive integer.")
         self.fit_adaptive_sweeps = int(fit_adaptive_sweeps)
+        if (
+            not isinstance(fit_two_site_transition_sweeps, Integral)
+            or int(fit_two_site_transition_sweeps) < 0
+        ):
+            raise ValueError("fit_two_site_transition_sweeps must be a non-negative integer.")
+        self.fit_two_site_transition_sweeps = int(fit_two_site_transition_sweeps)
         if fit_min_iter is not None and (
             isinstance(fit_min_iter, bool)
             or not isinstance(fit_min_iter, Integral) or fit_min_iter < 1
@@ -977,8 +1003,15 @@ class TreeOptimizer:
             raise TypeError("fit_init_seed must be an integer.")
         self.fit_init_seed = int(fit_init_seed)
         self.fit_sweep_sequence = TreeFIT._normalize_sweep_sequence(fit_sweep_sequence)
+        self.fit_traversal = TreeFIT._normalize_traversal(fit_traversal)
+        self.fit_environment_strategy = TreeFIT._normalize_environment_strategy(
+            fit_environment_strategy
+        )
+        self.fit_single_node_fast_path = bool(fit_single_node_fast_path)
         self.fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
         self.fit_finite_check = bool(fit_finite_check)
+        self._finite_check_enabled = False
+        self._finite_check_warning_handled = False
         self.fit_diagnostics = []
         self._last_fit_diagnostics = None
         if compression_seed is not None:
@@ -2221,6 +2254,7 @@ class TreeOptimizer:
             fit_block_size=self.fit_block_size,
             fit_n_iter=self.fit_n_iter,
             fit_adaptive_sweeps=self.fit_adaptive_sweeps,
+            fit_two_site_transition_sweeps=self.fit_two_site_transition_sweeps,
             fit_min_iter=self.fit_min_iter,
             fit_rtol=("auto" if self._fit_rtol_requested == "auto" else self.fit_rtol),
             fit_patience=self.fit_patience,
@@ -2228,6 +2262,9 @@ class TreeOptimizer:
             fit_init_rand_strength=self.fit_init_rand_strength,
             fit_init_seed=self.fit_init_seed,
             fit_sweep_sequence=self.fit_sweep_sequence,
+            fit_traversal=self.fit_traversal,
+            fit_environment_strategy=self.fit_environment_strategy,
+            fit_single_node_fast_path=self.fit_single_node_fast_path,
             fit_overlap_diagnostics=self.fit_overlap_diagnostics,
             fit_finite_check=self.fit_finite_check,
             structure=self.structure,
@@ -3121,6 +3158,16 @@ class TreeOptimizer:
         """
 
         strategy = self._normalize_fit_init_strategy(self.fit_init_strategy)
+        if self.fit_init_strategy == "auto" and self.tn.fermionic:
+            # Native SRC is not charge-safe. The exact target stays separate
+            # while a graded direct replay opens compatible guess sectors.
+            strategy = "guess_direct"
+        if self.fit_single_node_fast_path and len(region) == 1:
+            if strategy.startswith("guess_") and operator is not None:
+                # Retain the old child-seed draw, without constructing a
+                # disposable optimizer whose centre would be overwritten.
+                self.rng.integers(0, 2**63, dtype=np.uint64)
+            return self.tn.copy(), strategy, None, "single_node"
         if strategy in {"random", "random_expand"}:
             guess, random_info = _randomize_tree_guess(
                 self.tn,
@@ -3132,7 +3179,7 @@ class TreeOptimizer:
                 seed=self.fit_init_seed,
             )
             return guess, strategy, random_info
-        if strategy == "direct" or strategy == "guess_direct":
+        if strategy == "direct":
             return self.tn.copy(), strategy, None
         method = strategy[6:]
         if operator is not None:
@@ -3219,10 +3266,13 @@ class TreeOptimizer:
             ),
             inplace=True,
             copy_target=False,
-            finite_check=self.fit_finite_check,
+            finite_check=self.fit_finite_check or self._finite_check_enabled,
             target_norm=target_norm,
+            traversal=self.fit_traversal,
+            environment_strategy=self.fit_environment_strategy,
         )
         active_block_size = min(block_size, len(region))
+        fit._finite_check_warning_handled = self._finite_check_warning_handled
         if (
             self._dmrg_mode_alias == "dmrg1"
             and block_size == 2
@@ -3257,7 +3307,12 @@ class TreeOptimizer:
             min_iter=self.fit_min_iter,
             rtol=fit_rtol,
             patience=self.fit_patience,
+            single_node_fast_path=self.fit_single_node_fast_path,
             adaptive_block_sweeps=adaptive_sweeps,
+            two_site_transition_sweeps=(
+                self.fit_two_site_transition_sweeps
+                if self._dmrg_mode_alias == "dmrg3" else 0
+            ),
             adaptive_until_rank=(
                 self._dmrg_mode_alias is None
                 and not (
@@ -3276,7 +3331,7 @@ class TreeOptimizer:
                 "fit_init_strategy_requested": self.fit_init_strategy,
                 "fit_rtol": fit_rtol,
                 "fit_rtol_requested": self._fit_rtol_requested,
-                "guess_used": strategy != "direct",
+                "guess_used": strategy != "direct" and guess_backend != "single_node",
                 "guess_method": (
                     strategy[6:] if strategy.startswith("guess_") else strategy
                 ),
@@ -3646,6 +3701,7 @@ class TreeOptimizer:
         normalize_every=False,
         normalize_final=False,
         normalize_eps=1e-15,
+        finite_check=False,
         seed=None,
         track_infidelity=None,
         shots=1,
@@ -3696,13 +3752,18 @@ class TreeOptimizer:
             compression, respectively. ``"dmrg"`` selects TreeFIT with the
             configured adaptive block schedule. ``"dmrg1"`` and ``"dmrg2"``
             use two-node warm-up blocks, while ``"dmrg3"`` uses three-node
-            warm-up blocks; each named schedule then performs one-node
-            refinement.
+            warm-up blocks followed by its configured two-node transition;
+            each named schedule then performs one-node refinement.
         compression_mode : {"direct", "dm", "sdc", "src"} | None, default=None
             Persistent decomposition used for TreeMPO state truncation and
             layered TreeFIT local splits.
         compression_seed : int | None, default=None
             Override the configured randomized-compression seed for this run.
+        finite_check : bool, default=False
+            Optional finite-value scans after each FIT iteration and at the
+            end of replay in every mode, including empty streams. Warns once
+            per replay; shot workers inherit it unless run_kwargs overrides
+            it. Does not alter convergence or explicit overlap diagnostics.
         non_unitary : bool, default=False
             Mark the stream as non-unitary when using automatic working-scale
             control.
@@ -3872,6 +3933,7 @@ class TreeOptimizer:
                 child_kwargs.setdefault("compression_seed", compression_seed)
             child_kwargs.setdefault("track_infidelity", track_infidelity)
             child_kwargs.setdefault("progbar", progbar)
+            child_kwargs.setdefault("finite_check", finite_check)
             stream = self._trajectory_gate_stream() if gates is None else gates
             return self._run_shots(
                 stream,
@@ -3935,6 +3997,8 @@ class TreeOptimizer:
         control_count = 0
         submpo_count = 0
         previous_norm_tracking = self._norm_tracking_enabled
+        previous_finite_check = self._finite_check_enabled
+        previous_finite_warning = self._finite_check_warning_handled
         # A non-unitary stream changes the physical norm for reasons other
         # than compression. Do not present that scale change as retained
         # compression fidelity; explicit Tree calls remain unitary by default
@@ -3942,6 +4006,16 @@ class TreeOptimizer:
         self._norm_tracking_enabled = not non_unitary
 
         try:
+            self._finite_check_enabled = bool(finite_check)
+            self._finite_check_warning_handled = bool(finite_check or self.fit_finite_check)
+            if self._finite_check_warning_handled:
+                warnings.warn(
+                    "TreeOptimizer finite_check is enabled: optional tensor "
+                    "scans can synchronize devices; leave it disabled for "
+                    "normal optimization.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             for step, (payload, where, event_type) in enumerate(zip(
                 payloads, self.where, self.event_types
             ), start=1):
@@ -4016,17 +4090,21 @@ class TreeOptimizer:
                         postfix["mpo"] = submpo_count
                     pbar.set_postfix(postfix)
                     pbar.update(1)
+            if normalize_final and self.G:
+                self._normalize_and_record_working_scale(
+                    step=len(self.G),
+                    support=(),
+                    reason="final",
+                    eps=normalize_eps,
+                )
+            if finite_check:
+                TreeFIT._check_state_finite(self.tn, self.plan.nodes())
         finally:
             self._norm_tracking_enabled = previous_norm_tracking
+            self._finite_check_enabled = previous_finite_check
+            self._finite_check_warning_handled = previous_finite_warning
             if pbar is not None:
                 pbar.close()
-        if normalize_final and self.G:
-            self._normalize_and_record_working_scale(
-                step=len(self.G),
-                support=(),
-                reason="final",
-                eps=normalize_eps,
-            )
         return self
 
     def set_gates(self, gates):
@@ -5248,27 +5326,27 @@ class TreeOptimizer:
         while the built-in hook receives the proof flag.
         """
         method = self._compress_edge_with_diagnostics
-        try:
-            parameters = inspect.signature(method).parameters.values()
-            supports_proof = any(
-                parameter.name == "reduction_proven"
-                or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
-            supports_compression_mode = any(
-                parameter.name == "compression_mode"
-                or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
-            supports_compression_seed = any(
-                parameter.name == "compression_seed"
-                or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
-        except (TypeError, ValueError):
-            supports_proof = True
-            supports_compression_mode = True
-            supports_compression_seed = True
+        # Bound method objects are recreated on access. Cache their function,
+        # not the bound owner, and refresh when an integration replaces it.
+        hook = getattr(method, "__func__", method)
+        cached = getattr(self, "_compression_hook_capabilities", None)
+        if cached is None or cached[0] is not hook:
+            try:
+                parameters = inspect.signature(method).parameters
+                variadic = any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in parameters.values()
+                )
+                capabilities = tuple(
+                    variadic or name in parameters for name in (
+                        "reduction_proven", "compression_mode", "compression_seed"
+                    )
+                )
+            except (TypeError, ValueError):
+                capabilities = (True, True, True)
+            cached = (hook, capabilities)
+            self._compression_hook_capabilities = cached
+        supports_proof, supports_compression_mode, supports_compression_seed = cached[1]
         kwargs = {
             "max_bond": max_bond,
             "cutoff": cutoff,
@@ -7736,6 +7814,7 @@ class TreeOptimizer:
             fit_block_size=self.fit_block_size,
             fit_n_iter=self.fit_n_iter,
             fit_adaptive_sweeps=self.fit_adaptive_sweeps,
+            fit_two_site_transition_sweeps=self.fit_two_site_transition_sweeps,
             fit_min_iter=self.fit_min_iter,
             fit_rtol=("auto" if self._fit_rtol_requested == "auto" else self.fit_rtol),
             fit_patience=self.fit_patience,
@@ -7743,6 +7822,9 @@ class TreeOptimizer:
             fit_init_rand_strength=self.fit_init_rand_strength,
             fit_init_seed=self.fit_init_seed,
             fit_sweep_sequence=self.fit_sweep_sequence,
+            fit_traversal=self.fit_traversal,
+            fit_environment_strategy=self.fit_environment_strategy,
+            fit_single_node_fast_path=self.fit_single_node_fast_path,
             fit_overlap_diagnostics=self.fit_overlap_diagnostics,
             fit_finite_check=self.fit_finite_check,
             structure=self.structure,

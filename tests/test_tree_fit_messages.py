@@ -84,21 +84,26 @@ def test_incremental_messages_match_complete_branches(backend, dtype, layered, m
                                    atol=tolerance, rtol=tolerance)
 
 
-def test_incremental_fit_matches_full_branch_sweeps():
+@pytest.mark.parametrize("schedule", [
+    dict(n_iter=3, block_size=2),
+    dict(n_iter=5, block_size=3, adaptive_block_sweeps=2,
+         two_site_transition_sweeps=1),
+])
+def test_incremental_fit_matches_full_branch_sweeps(schedule):
     plan = TreePlan.from_order(range(6), structure="balanced", top_arity=2)
     target = TreeTensorNetwork.rand(plan, D=3, seed=43)
     guess = TreeTensorNetwork.rand(plan, D=2, seed=44)
     fast = TreeFIT(target, guess, max_bond=2, cutoffs=0.)
     reference = TreeFIT(target, guess, max_bond=2, cutoffs=0.)
     reference._message = MethodType(_full_branch_message, reference)
-    fast.run_eff(3, block_size=2)
-    reference.run_eff(3, block_size=2)
+    fast.run_eff(**schedule)
+    reference.run_eff(**schedule)
     np.testing.assert_allclose(fast.p.to_dense(), reference.p.to_dense(), atol=1e-10)
     np.testing.assert_allclose(fast.local_norm_trace, reference.local_norm_trace, atol=1e-10)
     fast.p.validate(check_canonical=True)
 
 
-def test_incremental_fit_preserves_even_native_fermionic_state():
+def test_incremental_fit_preserves_even_native_fermionic_state(monkeypatch):
     pytest.importorskip("symmray")
     fermion = pepsy.Fermion(spinful=True, symmetry="U1U1", dtype="complex128")
     plan = TreePlan.from_order(range(4), structure="balanced")
@@ -110,7 +115,20 @@ def test_incremental_fit_preserves_even_native_fermionic_state():
     )
     optimizer.apply_subtreempo(operator)
     fit = TreeFIT(target, optimizer.tn, max_bond=16, cutoffs=0., finite_check=True)
-    fit.run_eff(2, block_size=2)
+    update = fit.fit_block
+
+    def checked_update(*args, **kwargs):
+        result = update(*args, **kwargs)
+        # Opposite phase errors can cancel over a full pass. Every individual
+        # projection must preserve an already exact, representable state.
+        assert float(pepsy.tensors.tn_fidelity(fit.p, optimizer.tn)) > 1 - 1e-10
+        return result
+
+    monkeypatch.setattr(fit, "fit_block", checked_update)
+    with pytest.warns(RuntimeWarning, match="TreeFIT finite_check"):
+        fit.run_eff(4, block_size=3, adaptive_block_sweeps=2,
+                    two_site_transition_sweeps=1)
+    assert fit.block_size_trace == [3, 3, 2, 1]
     assert float(pepsy.tensors.tn_fidelity(fit.p, optimizer.tn)) > 1 - 1e-10
     assert fit.fit_diagnostics(overlap=True)["target_fidelity"] > 1 - 1e-10
     assert all(ar.infer_backend(t.data) == "symmray" for t in fit.p.tensors)
@@ -223,3 +241,96 @@ def test_fit_guess_skips_histories_and_preserves_child_seed_sequence(monkeypatch
         np.testing.assert_array_equal(tensor.data, data)
     guess.node_tensor(guess.plan.root).modify(data=guess.node_tensor(guess.plan.root).data * 2)
     np.testing.assert_array_equal(optimizer.to_dense(), state_before)
+
+
+@pytest.mark.parametrize("backend,block_size", [("numpy", 2), ("numpy", 3), ("torch", 3)])
+def test_fit_skips_interior_qr_and_reuses_sweep_order(backend, block_size, monkeypatch):
+    plan = TreePlan.from_order(range(6), structure="balanced", top_arity=2)
+    target = TreeTensorNetwork.rand(plan, D=3, seed=716)
+    guess = TreeTensorNetwork.rand(plan, D=2, seed=717)
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        for state in (target, guess):
+            state.apply_to_arrays(lambda x: torch.as_tensor(x, dtype=torch.complex128))
+    fast = TreeFIT(target, guess, max_bond=2, cutoffs=0.)
+    reference = TreeFIT(target, guess, max_bond=2, cutoffs=0.)
+
+    def prepare_at_midpoint(block, center):
+        current = reference.p.orthogonality_center
+        assert current is not None
+        reference._invalidate_for_block(plan.node_path(current, center))
+        reference.p.shift_orthogonality_center(center, _skip_validate=True)
+
+    monkeypatch.setattr(reference, "_canonicalize_for_block", prepare_at_midpoint)
+    hops = [[], []]
+    for index, fit in enumerate((fast, reference)):
+        shift = fit.p.shift_orthogonality_center
+
+        def count(node, *, _index=index, _fit=fit, _shift=shift, **kwargs):
+            hops[_index].append(len(plan.node_path(_fit.p.orthogonality_center, node)) - 1)
+            return _shift(node, **kwargs)
+
+        monkeypatch.setattr(fit.p, "shift_orthogonality_center", count)
+    orders = []
+    sweep_blocks = fast._sweep_blocks
+
+    def count_orders(region, size, direction):
+        orders.append((size, direction))
+        return sweep_blocks(region, size, direction)
+
+    monkeypatch.setattr(fast, "_sweep_blocks", count_orders)
+    fast.run_eff(3, block_size=block_size)
+    reference.run_eff(3, block_size=block_size)
+    assert len(orders) == 2
+    assert sum(hops[0]) < sum(hops[1])
+    np.testing.assert_allclose(fast.p.to_dense(), reference.p.to_dense(), atol=1e-9)
+    np.testing.assert_allclose(fast.local_norm_trace, reference.local_norm_trace, atol=1e-9)
+    fast.p.validate(check_canonical=True)
+
+
+def test_three_node_fit_accepts_an_endpoint_center():
+    plan = TreePlan.from_order(range(4), structure="balanced")
+    state = TreeTensorNetwork.rand(plan, D=2, seed=123)
+    fit = TreeFIT(state, state, max_bond=4, cutoffs=0.)
+    block = fit._connected_triples(fit.nodes)[0]
+    endpoint = next(n for n in block if sum(v in block for v in state.neighbors(n)) == 1)
+    fit.fit_block(block, center=endpoint)
+    assert fit.p.orthogonality_center == endpoint
+    np.testing.assert_allclose(fit.p.to_dense(), state.to_dense(), atol=1e-10)
+    fit.p.validate(check_canonical=True)
+
+
+def test_guess_direct_applies_operator_without_mutating_source():
+    optimizer = TreeOptimizer(None, n=3, chi=4, cutoff=0., run=False,
+                              fit_init_strategy="guess-direct")
+    gate = np.eye(4, dtype=complex)[[3, 2, 1, 0]]
+    before = optimizer.to_dense().copy()
+    target, operator = optimizer._build_tree_fit_target(gate, (0, 2))
+    region = optimizer.tn.steiner_nodes([optimizer.plan.node_of_qubit[q] for q in (0, 2)])
+    guess, strategy, *_ = optimizer._tree_fit_initial_guess(target, region, operator=operator)
+    assert strategy == "guess_direct"
+    np.testing.assert_array_equal(optimizer.to_dense(), before)
+    expected = np.zeros(8, dtype=complex)
+    expected[5] = 1
+    np.testing.assert_allclose(guess.to_dense().reshape(-1), expected, atol=1e-12)
+
+
+@pytest.mark.parametrize("mode", ["dmrg2", "dmrg3"])
+def test_native_auto_guess_uses_graded_direct_replay(mode):
+    pytest.importorskip("symmray")
+    fermion = pepsy.Fermion(spinful=True, symmetry="U1U1", dtype="complex128")
+    plan = TreePlan.from_order(range(4), structure="balanced")
+    state = pepsy.ps_to_ttn(4, tree=plan, fermion=fermion,
+                           occupations=((1, 1), (0, 0), (1, 1), (0, 0)))
+    gates = [(fermion.hopping_gate(.17, t=1., imaginary=False), (0, 3))]
+    exact = TreeOptimizer(gates, state=state, mode="direct", chi=16, cutoff=0., run=False)
+    exact.run()
+    fitted = TreeOptimizer(gates, state=state, mode=mode, chi=16, cutoff=0., run=False).copy()
+    fitted.run()
+    assert fitted.get_fit_diagnostics()["fit_init_strategy_requested"] == "auto"
+    assert fitted.get_fit_diagnostics()["fit_init_strategy"] == "guess_direct"
+    assert float(pepsy.tensors.tn_fidelity(fitted.tn, exact.tn)) > 1 - 1e-10
+    unsupported = TreeOptimizer(gates, state=state, mode=mode, chi=2, cutoff=0.,
+                                fit_init_strategy="guess-src", run=False)
+    with pytest.raises(NotImplementedError, match="dense tree tensors only"):
+        unsupported.run()

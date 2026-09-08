@@ -25,6 +25,31 @@ Changes for the next release should be added here before the version is bumped.
 - Made two-site boundary FIT explicitly preserve its own two-site schedule
   instead of inheriting circuit FIT's block-to-one-site warm-up defaults.
 
+- Added opt-in TreeFIT branch traversal (`fit_traversal="depth-first"`) and
+  capability-gated native blockwise environment contractions
+  (`fit_environment_strategy="native-blockwise"`). Existing execution
+  defaults remain available. TreeOptimizer now solves a one-node FIT region
+  with one exact local projection, skipping disposable guess replay while
+  preserving norms and seeded RNG behavior; disable with
+  `fit_single_node_fast_path=False`.
+
+- Reduced TreeFIT preparation work by stopping canonical-center movement at
+  the active block boundary and reusing fixed traversal orders. Cached tree
+  compression-hook signature checks while preserving legacy overrides and
+  runtime hook replacement. Fixed three-node TreeFIT factorization with an
+  explicitly requested endpoint center.
+  Automatic FIT initialization now chooses SRC for dense states and graded
+  direct compression for native fermionic states. Explicit `guess-direct`
+  now applies/compresses the operator instead of retaining the initial state.
+
+- Aligned TreeOptimizer with the updated MPS FIT workflow: four complete tree
+  iterations by default, a configurable two-node transition in `dmrg3`, and
+  phase-local convergence that preserves pending refinement. Added optional
+  replay-wide `finite_check=True`, including final-state checks in every mode
+  and shot propagation, with one diagnostic-cost warning per replay.
+  Fixed missing graded metric phases on native fermionic FIT environment
+  boundaries, which could corrupt intermediate updates and one-node refinement.
+
 - Made runtime non-finite detection opt-in across all MpsOptimizer modes,
   including FIT convergence norms and mixed-mode commit checks. Enabling
   `finite_check=True` warns once per replay and validates final tensor data
