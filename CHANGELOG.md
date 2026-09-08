@@ -23,6 +23,15 @@ Changes for the next release should be added here before the version is bumped.
   read-only exterior sharing. Preserved canonical `left_inds`, Torch gradient
   connections, and conservative full copies for native symmetry arrays.
 
+- Added `pepsy.tensors.mps_to_ttn` (also `pepsy.mps_to_ttn`) for explicit
+  conversion of an entangled MPS onto a `TreePlan`. `chi=None` uses lossless
+  QR without truncation; finite `chi` imposes a TTN bond cap through
+  sequential environment-aware density-matrix projections without building
+  the full exact TTN first. The converter preserves dense-array backend,
+  device, dtype, physical labels, and represented scale, and returns a tree
+  canonical at its root. A contraction-size guard raises instead of silently
+  approximating. Native Symmray/fermionic input is explicitly unsupported.
+
 - Added a geometry-aware rank scheduling policy to native `TreePeps` and
   `TreePEPO` compression. The default `order="rank"` removes the currently
   cheapest legal leaf branch using live physical/virtual dimensions, while

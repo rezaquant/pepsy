@@ -218,6 +218,7 @@ internal_inds
 iswap
 make_numpy_array_caster
 measure_obs
+mps_to_ttn
 normalize
 one_norm_bp
 optimize_packed_params

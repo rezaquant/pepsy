@@ -94,6 +94,7 @@ _register(
     "tn_norm",
 )
 _register(".observables", "measure_obs", "tn_fidelity")
+_register(".conversions", "mps_to_ttn")
 _register(".validation", "validate_tensor_network_tags")
 _register(
     "..backends.config",
@@ -128,6 +129,7 @@ _register(
 
 _SUBMODULES = (
     "constructors",
+    "conversions",
     "contractions",
     "maps",
     "observables",
