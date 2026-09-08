@@ -398,6 +398,7 @@ def test_compbdy_two_site_routes_cached_full_boundary_controls():
         "max_bond": 7,
         "cutoff": 2.0e-9,
         "cutoff_mode": "rel",
+        "adaptive_block_sweeps": None,
         "min_iter": 2,
         "rtol": 3.0e-8,
         "patience": 4,

@@ -453,9 +453,12 @@ which can synchronize an accelerator. Input validation, zero-divisor guards,
 and explicitly requested quality/overlap diagnostics retain their own policies.
 Backend linear algebra can still raise its own numerical errors.
 
-Dense DMRG SRC guesses and rollback snapshots copy tensor metadata across the
-chain but allocate independent array data only inside the active endpoint
-span. Exterior arrays are read-only shared inputs; Quimb canonicalization
+Dense DMRG SRC guesses copy tensor metadata across the chain but allocate
+independent array data only inside the active endpoint span. When the actual
+guess owns its active arrays, rollback retains the untouched original MPS
+instead of copying it again. Direct guesses that alias the live state still
+receive an isolated rollback copy before FIT. Exterior arrays are read-only
+shared inputs; Quimb canonicalization
 replaces arrays in the private copy. Active copies retain `left_inds`, backend,
 dtype/device, and Torch autograd connections. Native Symmray/fermionic and
 unrecognized array backends retain full deep copies. The public standalone
@@ -465,6 +468,20 @@ reuses that decision across backend-preserving updates. The cache is cleared
 on replay exit (including failure), invalidated by `set_p`, and never reused
 by standalone helper calls. SRC selection also skips rank-ceiling checks
 that only affect random initialization policies.
+
+Physical rank ceilings are also cached within a replay; actual changing bond
+dimensions remain independent of that cache. State replacement, cap events,
+layout changes, mode changes, and explicit canonical resynchronization clear
+cached metadata, and a changed `chi` or chain length forces new ceilings.
+Mixed replay prepares each FIT window once and reuses its validated final
+maximum bond for history and the next transaction. Quality checks invalidate
+that maximum because repair may change dimensions. DMRG1 skips rank checks
+used solely to validate a sweep budget when `n_iter >= 3` already suffices.
+
+Backend/symmetry classification uses weak references to actual networks,
+propagated only through owned backend-preserving copies. It does not retain
+discarded MPS states or assume that two different networks have the same
+array kind. Standalone helpers inspect their current inputs afresh.
 
 The expensive direct FIT-target overlap contraction is opt-in through
 `fit_overlap_diagnostics=True`. Its result is reported in

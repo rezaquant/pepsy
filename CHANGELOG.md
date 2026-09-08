@@ -14,6 +14,17 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Reduced MpsOptimizer metadata overhead with replay-scoped physical rank
+  ceilings and weak network classification caches, one mixed FIT-window
+  preparation per transaction, and reuse of validated maximum bonds.
+  Sufficient DMRG1 sweep budgets no longer inspect ranks just for validation.
+  Isolated dense SRC/random guesses retain the original state for rollback;
+  direct and native routes keep the required copies. FIT builds layered tag
+  selections lazily and classifies array kinds in one pass. Added cache
+  invalidation, weak ownership, rollback, and replay-equivalence regressions.
+- Made two-site boundary FIT explicitly preserve its own two-site schedule
+  instead of inheriting circuit FIT's block-to-one-site warm-up defaults.
+
 - Made runtime non-finite detection opt-in across all MpsOptimizer modes,
   including FIT convergence norms and mixed-mode commit checks. Enabling
   `finite_check=True` warns once per replay and validates final tensor data

@@ -1,7 +1,9 @@
 # `pepsy.boundary.sweeps`
 
 `CompBdy(..., fit_mode="two-site")` fits the complete boundary interval with
-`FIT.run_gate(block_size=2)`. Configure it with:
+`FIT.run_gate(block_size=2)` and explicitly retains two-site updates for every
+sweep until its stopping criterion is met. It does not inherit the circuit
+solver's block-to-one-site warm-up defaults. Configure it with:
 
 - `fit_max_bond`: required for rank growth beyond the current boundary bond;
   omission safely caps direct `CompBdy` use at the current bond.

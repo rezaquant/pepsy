@@ -35,6 +35,13 @@ high-level order in each path: own and validate the target/state, prepare
 effective environments, update the requested sites, then record optional
 fidelity or timing diagnostics.
 
+Layered targets build tag selections only for sites visited by the solver;
+`run_gate` therefore avoids duplicating unused exterior tag metadata. A later
+`run_eff` or `run` can populate the remaining selections normally. Setup
+classifies dense/native arrays in one pass and rejects layered targets from
+the one-tensor-per-site shortcut by tensor count before scanning site tags.
+Target index separation and native contraction ordering remain unchanged.
+
 Tree-shaped states use the companion `pepsy.fitting.TreeFIT` class. It keeps
 the same target/guess ownership model and `run`/`run_eff`/`run_gate` vocabulary,
 but caches a directed overlap environment for every tree edge and moves the

@@ -135,6 +135,9 @@ before rebuilding an open MPS.
   insertion site.
 - Temporary target copies (`p.copy()`) must use isolated metadata and must not
   overwrite the live `info_c` dictionary.
+- Dense SRC/random FIT guesses own their active data, so rollback may retain
+  the untouched original MPS. If the actual guess aliases the live state,
+  isolate rollback before FIT; native warm-starts still copy before mutation.
 - FIT may consume an optimizer-owned guess/target to remove redundant copies,
   but mixed mode must still isolate the complete trial before mutation.
 - Mixed in-place trial copies and commits must preserve each tensor's
@@ -232,6 +235,14 @@ for normal optimization. Enabling them warns once per replay about their
 cost; owned FIT calls share that warning. Convergence calculations and
 explicit quality/overlap diagnostics remain independent.
 
+Cache physical rank ceilings only within replay and invalidate after state,
+cap, layout, mode, or external canonical-resynchronization changes; chi/length
+changes also require new ceilings. Never cache changing active ranks as if
+they were physical ceilings. Mixed replay prepares a FIT window once and
+reuses its validated final maximum until a mutation or quality repair. Array
+classification uses weak network identity and explicit inheritance through
+backend-preserving copies, not first-array-type equivalence between networks.
+
 `run(timing=False)` performs no replay profiling clock reads, accelerator
 barriers, or timing-record allocation; mixed summaries leave elapsed time
 unset on that path. Enabled timing must remain observational: do not turn on
@@ -256,9 +267,10 @@ Before changing `optimizer.py`, verify the following ownership boundaries:
   remain available to select its schedule.
 - `_execute_mode` receives backend-prepared payloads and dispatches only gate
   or sub-MPO events. `_run_segmented` owns control-event boundaries.
-- DMRG builds an isolated exact target, an isolated initial guess, and a
-  transactional snapshot before FIT. A fallback must restore both tensor data
-  and `info_c` before direct MPO replay.
+- DMRG builds an isolated exact target and selects an owned guess or a direct
+  live-state guess. Rollback retains the original only for an isolated dense
+  guess; direct/native paths require a copy. A fallback must restore both
+  tensor data and `info_c` before direct MPO replay.
 - `_apply_measure_event` computes the Born probability before any frame
   localizer and records compression survival separately. A dense multi-site
   projector should remain a bond-two sub-MPO; native graded states retain

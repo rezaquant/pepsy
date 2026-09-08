@@ -97,6 +97,12 @@ mapping, direction, and block size together. It retains the mapping by
 reference and performs compatibility checks once per sweep; update kernels
 continue to use direct dictionary lookups with no wrapper in their hot loops.
 
+Layered target tag selections are cached lazily for visited sites; standalone
+global fits populate the same cache across the full chain. Setup rejects a
+layered target's extra tensor count before checking one-tensor-per-site tags,
+and a single array-kind pass supplies the native/dense routing decisions.
+Keep full target-index separation and the original target tensor order.
+
 An active interval containing one adjacent pair reaches its complete local
 optimum after that split. Named `dmrg2` enables the single-pair fast path even
 when tolerance stopping is disabled. Other modes require
@@ -120,6 +126,14 @@ exactly `fit_adaptive_sweeps` two- or three-site sweeps (two by default).
 `n_iter` budget on one-site refinement subject to
 `fit_rtol`. Generic `dmrg` remains available for rank-adaptive block
 scheduling.
+
+Physical ceilings are replay-scoped geometry metadata; changing bond ranks
+remain live. A sufficient `n_iter >= 3` needs no additional rank scan just to
+validate DMRG1's minimum budget. Mixed replay owns one window preparation and
+can reuse its checked final maximum while the state is unchanged. Dense owned
+SRC/random guesses retain the untouched source as rollback; a direct guess
+that aliases the source still requires an isolated snapshot before fitting.
+Native warm-start mutation retains the conservative early-copy path.
 
 Standalone `FIT.run_gate` defaults are eight sweeps, block size two, RL
 directions, two adaptive block sweeps, automatic dtype-aware tolerance,

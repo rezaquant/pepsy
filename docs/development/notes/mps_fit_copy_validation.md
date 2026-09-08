@@ -259,3 +259,105 @@ tests passed. Coverage includes multiple FIT calls per replay, timing enabled
 and disabled, standalone FIT warnings, and enabled rejection of invalid data.
 Ruff, skill/catalog checks, and `git diff --check` passed. The numerical suites
 recorded above were not repeated for this warning/comment clarification.
+
+## Replay metadata and FIT setup improvements (2026-09-08)
+
+Implemented the next four reviewed improvements without changing circuit
+initialization, sweep budgets, convergence tolerances, or diagnostic defaults:
+
+1. Cache physical rank ceilings within each replay and prepare mixed FIT
+   windows once. State replacement, caps, layout changes, mode changes, and
+   canonical resynchronization invalidate metadata; changed chi or length
+   also forces new ceilings. Actual active bond dimensions remain live.
+2. Skip DMRG1's rank-dependent minimum-budget validation when at least three
+   sweeps already suffice. Ordinary DMRG no longer computes an unused startup
+   maximum. Mixed replay reuses the maximum measured for its chi guard through
+   commit, history, and the next transaction; quality checks discard that
+   cached maximum because repair may alter dimensions. Segment boundaries
+   also start fresh. Required chi enforcement remains enabled.
+3. Build layered FIT tag selections only when visited, retain target tensor
+   ordering, and reject extra target tensors before checking site-by-site
+   shortcut eligibility. Dense SRC/random guesses with independent active
+   arrays retain the untouched source for rollback. A guess that aliases the
+   source still snapshots before FIT; native warm-starts retain their early
+   full copy. Full target-index separation remains intact.
+4. Reuse backend/symmetry classification by weak network identity during
+   replay and inherit it only through owned backend-preserving copies.
+   Standalone calls inspect their inputs afresh, discarded networks remain
+   collectable, and optimizer copies do not inherit replay caches. FIT setup
+   combines its repeated native/dense routing scans into one metadata pass.
+
+The cache scope restores prior state on all exits, including failures. These
+changes do not enable non-finite diagnostics, timing, profiling, or extra
+target-overlap contractions.
+
+### Upstream audit
+
+Repeated the audit of the Quimb changelog, Autoray repository, Cotengra
+documentation/changelog, and Symmray repository linked above. The Symmray
+Abelian-array URL again could not be retrieved. Installed versions remained
+Quimb `1.15.1.dev39+g369d09b9d`, Autoray `0.11.1.dev1+gc56f64427`, Cotengra
+`0.8.3.dev6+g08fe1a3a1`, and Symmray `0.3.2.dev6+ga17699db6`.
+
+Inspected installed public `TensorNetwork.copy`, `reindex`, `select`,
+`select_tensors`, `add_tensor_network`, `Tensor.modify`,
+`MatrixProductState.canonicalize`, `max_bond`, `bond_size`, `phys_dim`,
+`tensor_contract`, `autoray.infer_backend`, and `to_numpy` signatures.
+Checked copy/reindex/selection implementations, weak-key support on actual
+Quimb networks, and NumPy/Torch/JAX copy/conjugate/real/host-transfer dispatch.
+Classification: **adopt/retain** these public APIs and the existing
+differentiable Torch clone policy; **defer** new upstream compression,
+contraction-planning, random-generation, and native algorithm changes.
+No new compatibility shim or installed-package edit was needed.
+
+### Boundary compatibility found during validation
+
+The existing typed boundary convergence regression failed because the
+previous gate-FIT default change also gave boundary two-site fitting a
+block-to-one-site warm-up schedule. Loading the committed pre-change FIT
+implementation reproduced the same four-sweep result instead of the
+documented two-site convergence behavior. `CompBdy` now explicitly forwards
+`adaptive_block_sweeps=None`, retaining its two-site updates until stopping.
+The original numerical regression passes without weakening its expectation;
+the wrapper keyword-forwarding test now checks this explicit policy.
+
+### Measurement
+
+Compared the changed optimizer/FIT against their committed pre-change source
+in the same process, using NumPy complex128, 256 sites, initial bond and chi
+8, and twelve gates spanning five sites each. State seed was 714; gate seeds
+were 820 through 831. Timing and finite diagnostics stayed off. BLAS used one
+thread; optimizer construction and garbage collection were outside the timed
+region. Seven before/after pairs alternated order; the first pair was warm-up
+and the table reports medians of the remaining six samples.
+
+| Mode | Before | After | Time reduction |
+| --- | ---: | ---: | ---: |
+| DMRG2 | 123.62 ms | 114.41 ms | 7.4% |
+| DMRG3 | 129.62 ms | 119.49 ms | 7.8% |
+| Mixed | 137.84 ms | 128.05 ms | 7.1% |
+
+Tensor arrays agreed to `1e-12`; canonical-center metadata, full FIT
+diagnostics, and mixed history matched. Separate call profiles found mixed
+rank-ceiling builds reduced from 26 to 1, maximum-bond scans from 38 to 14,
+window preparation calls from 24 to 12, and full array-kind scans from 61 to
+1. Ordinary DMRG2/3 active-window copy calls fell from 24 to 12. These results
+describe this small CPU workload, not a general or GPU speedup guarantee.
+Temporary measurement scripts and output remain outside the repository.
+
+### Validation
+
+- New replay metadata regressions: 10 passed, covering invalidation,
+  reference equivalence, weak ownership, quality repair, lazy FIT selections,
+  and injected partial FIT writes for gates, batches, sub-MPOs, and measurement.
+- Final combined MPS/MPO, symmetric tensors, boundary preparation, sampler,
+  FIT hot-path/schedule, copy/non-finite policy, replay metadata, fermionic
+  boundary, public API, and package-layout suites: 1,254 passed, 7 skipped.
+- Quimb compatibility and contraction-dependency suites: 12 passed.
+- Default smoke suite: 128 passed.
+- Ruff, skill catalog, both affected skill validators, and `git diff --check`:
+  passed.
+
+Counts overlap. No full repository extended suite or GPU runtime benchmark
+was run. Native Symmray and dense NumPy/Torch/JAX paths were covered by the
+affected numerical and ownership suites.

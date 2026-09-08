@@ -464,35 +464,33 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # retagging. In particular, ``retag=True`` can turn an initially
         # untagged dense target into a valid one-tensor-per-site cache.
         self._target_site_tensors = self._build_target_site_cache()
-        self._target_tensor_ids = tuple(self.tn.tensor_map)
-        self._target_tensor_order = {
-            tensor_id: order
-            for order, tensor_id in enumerate(self._target_tensor_ids)
-        }
-        self._target_tag_tensor_ids = {
-            tag: tuple(
-                sorted(tensor_ids, key=self._target_tensor_order.__getitem__)
-            )
-            for tag, tensor_ids in self.tn.tag_map.items()
-        }
+        self._target_tensor_order = (
+            {tensor_id: order for order, tensor_id in enumerate(self.tn.tensor_map)}
+            if self._target_site_tensors is None else {}
+        )
+        # A gate fit visits only its active site tags. Build those selections
+        # lazily rather than duplicating the complete target's tag map.
+        # Global run/run_eff populate the same cache as they visit each site.
+        self._target_tag_tensor_ids = {}
         # Layered targets can carry several tensors per site, so their chain
         # bond is not available through ``TensorNetwork.bond``. The target
         # graph is immutable during FIT: resolve each boundary locally once
         # and retain only its index name, never tensor data.
         self._target_bond_cache = {}
+        # One metadata pass supplies all routing decisions, including mixed
+        # dense/native inputs. No tensor values or device scalars are read.
+        array_kinds = {
+            type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+            for network in (self.tn, self.p)
+            for tensor in network.tensor_map.values()
+        }
+        has_symmray = True in array_kinds
+        symmray_native_available = array_kinds == {True}
         direct_available = (
             self._target_site_tensors is not None
             and not self.tn.isfermionic()
             and not self.p.isfermionic()
-            and not any(
-                type(tensor.data).__module__.split(".", 1)[0] == "symmray"
-                for tensor in (*self.tn.tensors, *self.p.tensors)
-            )
-        )
-        symmray_tensors = (*self.tn.tensors, *self.p.tensors)
-        symmray_native_available = bool(symmray_tensors) and all(
-            type(tensor.data).__module__.split(".", 1)[0] == "symmray"
-            for tensor in symmray_tensors
+            and not has_symmray
         )
         if environment_strategy == "mps-direct" and not direct_available:
             raise ValueError(
@@ -533,10 +531,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self._allow_sweep_environment_reuse = (
             native_fermionic_pair
             or native_bosonic_symmray_pair
-            or not any(
-                type(tensor.data).__module__.split(".", 1)[0] == "symmray"
-                for tensor in (*self.tn.tensors, *self.p.tensors)
-            )
+            or not has_symmray
         )
         self._sweep_environment_reuse_count = 0
     # ------------------------------------------------------------------
@@ -550,6 +545,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         stores views of the already-copied target and never changes array
         backends, devices, symmetry sectors, or fermionic metadata.
         """
+        # Lazy gate layers add tensors. Reject that case before walking the
+        # untouched prefix of a long chain looking for the first layered site.
+        if len(self.tn.tensor_map) != self.L:
+            return None
         tensors = []
         for site in range(self.L):
             tag = self.site_tag_id.format(site)
@@ -563,8 +562,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # Likewise, extra untagged/layer tensors make the direct site-by-site
         # route incomplete. Require an exact one-to-one site/tensor mapping.
         if len({id(tensor) for tensor in tensors}) != self.L:
-            return None
-        if len(self.tn.tensor_map) != self.L:
             return None
         return tuple(tensors)
 
@@ -1455,11 +1452,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         else:
             tensor_ids = set()
             for site in sites:
-                tensor_ids.update(
-                    self._target_tag_tensor_ids.get(
-                        self.site_tag_id.format(site), ()
+                tag = self.site_tag_id.format(site)
+                if tag not in self._target_tag_tensor_ids:
+                    self._target_tag_tensor_ids[tag] = tuple(
+                        self.tn.tag_map.get(tag, ())
                     )
-                )
+                tensor_ids.update(self._target_tag_tensor_ids[tag])
             components = [
                 self.tn.tensor_map[tensor_id]
                 for tensor_id in sorted(

@@ -70,6 +70,7 @@ import threading
 import time
 import types
 import warnings
+import weakref
 import autoray as ar
 import numpy as np
 import quimb
@@ -2182,6 +2183,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.last_run_timing = None
         self._timing_state = None
         self._fit_copy_policy_cache = None
+        self._replay_rank_cache = None
+        self._replay_array_cache = None
         # Optional diagnostics, disabled for normal replay in every mode.
         # run(finite_check=True) enables them only for that replay and warns.
         self._finite_check_enabled = False
@@ -2287,6 +2290,39 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             cls._is_symmray_array(tensor.data)
             for tensor in getattr(tn, "tensors", ())
         )
+
+    def _replay_has_symmray_data(self, tn):
+        """Classify an owned network once during backend-preserving replay.
+
+        Use the actual network as a weak key, not its first tensor's type:
+        another network may contain mixed arrays. Outside replay, inspect
+        the supplied object every time. No tensor values are checked here.
+        """
+        cache = self._replay_array_cache
+        if cache is None:
+            return self._has_symmray_data(tn)
+        try:
+            return cache[tn]
+        except KeyError:
+            result = self._has_symmray_data(tn)
+            cache[tn] = result
+            return result
+
+    def _inherit_replay_array_kind(self, result, source):
+        """Carry classification through an owned, backend-preserving copy."""
+        if self._replay_array_cache is not None:
+            self._replay_array_cache[result] = self._replay_has_symmray_data(source)
+        return result
+
+    def _invalidate_replay_metadata(self):
+        """Forget cached facts after state replacement or structural changes."""
+        for cache in (
+            self._fit_copy_policy_cache,
+            self._replay_rank_cache,
+            self._replay_array_cache,
+        ):
+            if cache is not None:
+                cache.clear()
 
     @classmethod
     def _is_native_fermionic_product_state(cls, p):
@@ -2615,7 +2651,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         the current working MPS through the gate algebra; it never transfers
         tensors from the exact target network into ``fit.p``.
         """
-        if not (self._has_symmray_data(p) and p.isfermionic()):
+        if not (self._replay_has_symmray_data(p) and p.isfermionic()):
             return False
         sites = tuple(site for where in wheres for site in where)
         if max(sites) - min(sites) <= 1:
@@ -2722,7 +2758,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if len(where) != 2:
             raise ValueError("A layered FIT target gate must act on one or two sites.")
-        if self._has_symmray_data(target) or target.isfermionic():
+        if self._replay_has_symmray_data(target) or target.isfermionic():
             raise ValueError(
                 "fit_target_strategy='layered' is not available for Symmray/"
                 "fermionic data; use 'auto' or 'mps' for native graded routing."
@@ -2801,7 +2837,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Build an exact layered or materialized target for a sub-MPO event."""
         start, stop = min(where), max(where)
-        target = p.copy()
+        target = self._inherit_replay_array_kind(p.copy(), p)
         target.canonicalize_((start, stop), info={})
 
         # Target representation and FIT initial guess are independent knobs:
@@ -2811,7 +2847,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # its site tag; native graded data must stay on the materialized route
         # so charge sectors and dummy-mode metadata are not discarded.
         layered_supported = not (
-            self._has_symmray_data(target)
+            self._replay_has_symmray_data(target)
             or target.isfermionic()
             or submpo.isfermionic()
         )
@@ -2879,7 +2915,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "svd_guess_used": False,
             "random_initialization": info,
         }
-        if self._has_symmray_data(p) or p.isfermionic():
+        if self._replay_has_symmray_data(p) or p.isfermionic():
             info["reason"] = (
                 "native_sector_growth"
                 if int(block_size) in {2, 3}
@@ -2918,7 +2954,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # request to grow rank. Apply it even after the active bonds reach
             # their attainable size; otherwise the one-site phase would use a
             # different initial state from the growth phase.
-            fit_guess = p.copy()
+            fit_guess = self._copy_fit_window_state(p, where)
             opts = self._submpo_compress_opts(
                 guess_method,
                 cutoff=cutoff,
@@ -3077,7 +3113,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if int(self.p.bond_size(site, site + 1)) < target_sizes[site]
         ]
         if bonds_to_expand:
-            if self._has_symmray_data(self.p):
+            if self._replay_has_symmray_data(self.p):
                 raise ValueError(
                     "One-site FIT cannot pad native Symmray bonds safely; use "
                     "fit_block_size=2 or 3 so the native block SVD grows only "
@@ -3164,6 +3200,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Require two growth sweeps plus refinement for uncapped DMRG1."""
         if self._dmrg_mode_alias != "dmrg1" or int(block_size) != 2:
             return
+        # Three sweeps suffice at every rank. The default budget of eight
+        # needs no tensor metadata inspection just to validate this minimum.
+        if int(n_iter) >= 3:
+            return
         xmin, xmax = self._normalize_span(where)
         if xmax - xmin < 2:
             return
@@ -3200,8 +3240,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             state=new_p,
         )
         self.p = new_p
-        if self._fit_copy_policy_cache is not None:
-            self._fit_copy_policy_cache.clear()
+        self._invalidate_replay_metadata()
         self._initial_p = self.p.copy()
         self._initial_mps_length = int(getattr(self.p, "L", 0))
         self._mps_length_history = [self._initial_mps_length]
@@ -3266,6 +3305,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not hasattr(self.p, "calc_current_orthog_center"):
             raise TypeError("the live state does not expose MPS canonical metadata.")
 
+        self._invalidate_replay_metadata()
         current = self._normalize_span(self.p.calc_current_orthog_center())
         if site is None:
             site = current[1]
@@ -3430,6 +3470,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied.last_mix_summary = deepcopy(self.last_mix_summary)
         copied.last_run_timing = deepcopy(self.last_run_timing)
         copied._fit_copy_policy_cache = None
+        copied._replay_rank_cache = None
+        copied._replay_array_cache = None
         copied._finite_check_enabled = False
         copied._mix_dmrg_disabled_reason = self._mix_dmrg_disabled_reason
         copied._mix_dmrg_failed_sweep = self._mix_dmrg_failed_sweep
@@ -3483,6 +3525,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "read out the logical state or create a new optimizer."
             )
         self._validate_canonical_boundary(self.p, new_mode)
+        self._invalidate_replay_metadata()
         if old_mode == "su" and new_mode != "su":
             if self._su_gauges_ready:
                 self.p.gauge_simple_insert(self.gauges)
@@ -4383,6 +4426,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if hasattr(p, "exponent") and hasattr(new_p, "exponent"):
             new_p.exponent = p.exponent
         self.p = self._install_represented_norm(new_p)
+        self._invalidate_replay_metadata()
         self.info_c = {}
         self._init_canonicalization()
 
@@ -4518,11 +4562,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if set(target) != set(current) or len(target) != len(current):
             raise ValueError("target_order must be a permutation of current_order.")
 
+        self._invalidate_replay_metadata()
         for target_pos, logical_site in enumerate(target):
             current_pos = current.index(logical_site)
             if current_pos == target_pos:
                 continue
-            if self._has_symmray_data(self.p) and self._native_needs_safe_qr(self.p):
+            if self._replay_has_symmray_data(self.p) and self._native_needs_safe_qr(self.p):
                 self._native_swap_site_to(
                     self.p,
                     current_pos,
@@ -5481,7 +5526,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if fit_init_seed < 0:
                 raise ValueError("fit_init_seed must be non-negative.")
             if fit_target_strategy == "layered" and (
-                self._has_symmray_data(self.p) or self.p.isfermionic()
+                self._replay_has_symmray_data(self.p) or self.p.isfermionic()
             ):
                 raise ValueError(
                     "fit_target_strategy='layered' is not available for "
@@ -5505,7 +5550,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_rtol = None
             else:
                 fit_rtol = self._resolve_fit_rtol(fit_rtol)
-            current_max_bond = self.p.max_bond()
+            current_max_bond = self.p.max_bond() if self.mode == "mix" else None
             if (
                 self.mode == "mix"
                 and current_max_bond is not None
@@ -5619,8 +5664,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copy capabilities. Runtime non-finite validation is opt-in in all modes.
         """
         previous_cache = self._fit_copy_policy_cache
+        previous_ranks = self._replay_rank_cache
+        previous_arrays = self._replay_array_cache
         previous_finite_check = self._finite_check_enabled
         self._fit_copy_policy_cache = {}
+        self._replay_rank_cache = {}
+        self._replay_array_cache = weakref.WeakKeyDictionary()
         self._finite_check_enabled = bool(finite_check)
         try:
             if finite_check:
@@ -5645,6 +5694,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self._run_with_timing(executor, **timing_options)
         finally:
             self._fit_copy_policy_cache = previous_cache
+            self._replay_rank_cache = previous_ranks
+            self._replay_array_cache = previous_arrays
             self._finite_check_enabled = previous_finite_check
 
     def _run_with_timing(
@@ -6544,7 +6595,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         if len(where) < 2:
             return None
-        if self._has_symmray_data(self.p) or self.p.isfermionic():
+        if self._replay_has_symmray_data(self.p) or self.p.isfermionic():
             return None
 
         chars = [c for c in str(pauli).upper() if not c.isspace()]
@@ -7018,6 +7069,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if L <= 1:
             raise ValueError("cannot cap the only site of a length-1 MPS.")
 
+        self._invalidate_replay_metadata()
         # Cap vectors are state contractions rather than operator payloads.
         # The stream parser historically normalized them to complex dtype,
         # which made a real Torch MPS fail at the contraction boundary even
@@ -7614,11 +7666,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if target_strategy == "auto":
             target_strategy = (
                 "mps"
-                if self._has_symmray_data(p) or p.isfermionic()
+                if self._replay_has_symmray_data(p) or p.isfermionic()
                 else "layered"
             )
 
-        p_target = p.copy() if copy else p
+        p_target = self._inherit_replay_array_kind(p.copy(), p) if copy else p
         target_info = {} if info is None else info
         if len(where) == 1:
             self._apply_layered_target_gate(
@@ -7639,7 +7691,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff_mode=cutoff_mode,
             )
 
-        if self._has_symmray_data(p_target):
+        if self._replay_has_symmray_data(p_target):
             # Keep one native tensor per MPS site. A lazy ``split-gate`` target
             # is useful for one-site contractions but leaves extra gate tensors
             # carrying overlapping site tags, which does not define a unique
@@ -7681,22 +7733,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _fit_window_copy_supported(self, p):
         """Inspect array capabilities once before sharing exterior data."""
-        if self._has_symmray_data(p) or p.isfermionic():
+        if self._replay_has_symmray_data(p) or p.isfermionic():
             return False
         return all(
             ar.infer_backend(t.data) in {"numpy", "torch", "jax"}
             for t in p.tensors
         )
 
-    def _copy_fit_window_state(self, p, where):
-        """Copy active FIT data, retaining read-only exterior arrays.
-
-        Quimb copies tensor metadata independently and canonicalization
-        replaces arrays rather than writing through them. FIT and the local
-        compressor update only the endpoint span. Own every array in that
-        span so an in-place failure cannot corrupt the source or rollback.
-        Native/unknown array types retain the conservative full deep copy.
-        """
+    def _fit_window_copy_policy(self, p):
+        """Resolve the replay's existing active-window ownership policy."""
         cache = self._fit_copy_policy_cache
         if cache is None:
             supported = self._fit_window_copy_supported(p)
@@ -7705,8 +7750,29 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if key not in cache:
                 cache[key] = self._fit_window_copy_supported(p)
             supported = cache[key]
+        return supported
+
+    def _fit_rollback_snapshot(self, p, where):
+        """Retain an untouched dense state until the actual guess is known.
+
+        Dense target/guess preparation does not mutate p. If the selected
+        guess aliases p, the caller must copy this snapshot before FIT runs.
+        Native warm-starts may mutate p earlier and still require a full copy.
+        """
+        if self._fit_window_copy_policy(p):
+            return p
+        return self._copy_fit_window_state(p, where)
+
+    def _copy_fit_window_state(self, p, where):
+        """Copy active FIT data, retaining read-only exterior arrays.
+
+        Tensor metadata is independent, and every active array is owned.
+        Quimb canonicalization replaces exterior arrays in the private copy.
+        Native/unknown array types retain the conservative full deep copy.
+        """
+        supported = self._fit_window_copy_policy(p)
         if not supported:
-            return p.copy(deep=True)
+            return self._inherit_replay_array_kind(p.copy(deep=True), p)
         start, stop = min(where), max(where)
         copied = p.copy()
         for site in range(start, stop + 1):
@@ -7718,7 +7784,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             tensor.modify(
                 data=data, left_inds=tensor.left_inds
             )
-        return copied
+        return self._inherit_replay_array_kind(copied, p)
 
     def _build_compression_fit_guess(
         self,
@@ -7732,7 +7798,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         seed=None,
     ):
         """Build a disposable Quimb-compressed guess from one gate."""
-        return guess(
+        result = guess(
             self._copy_fit_window_state(p, where),
             gate,
             where,
@@ -7744,6 +7810,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             cutoff_mode=cutoff_mode,
             seed=seed,
         )
+        return self._inherit_replay_array_kind(result, p)
 
     def _build_compression_submpo_fit_guess(
         self,
@@ -7838,7 +7905,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         same randomized compressed warm-start role without constructing a dense
         gate, MPO, or random dense tensor.
         """
-        if not self._has_symmray_data(p):
+        if not self._replay_has_symmray_data(p):
             raise TypeError(
                 "native randomized FIT guesses require native Symmray data."
             )
@@ -7931,7 +7998,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if int(block_size) not in {2, 3}:
             info["reason"] = "one_site_fit"
             return p, info
-        if self._has_symmray_data(p) or p.isfermionic():
+        if self._replay_has_symmray_data(p) or p.isfermionic():
             info["reason"] = "native_sector_growth"
             return p, info
         if float(rand_strength) == 0.0:
@@ -7939,7 +8006,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return p, info
 
         xmin, xmax = self._normalize_span(where)
-        guess = p.copy(deep=True)
+        guess = self._inherit_replay_array_kind(p.copy(deep=True), p)
         rng = np.random.default_rng(int(seed))
         bonds = []
         if expand:
@@ -8065,7 +8132,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "native_randomized_guess_used": False,
             "random_initialization": info,
         }
-        if self._has_symmray_data(p) or p.isfermionic():
+        if self._replay_has_symmray_data(p) or p.isfermionic():
             if (
                 not submpo
                 and native_source is not None
@@ -8433,7 +8500,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_strategy="mps",
     ):
         """Apply a DMRG target block without output-compression truncation."""
-        p_g = p.copy()
+        p_g = self._inherit_replay_array_kind(p.copy(), p)
         for gate, where in zip(batch_G, batch_where):
             if len(where) == 1:
                 self._apply_layered_target_gate(
@@ -8713,10 +8780,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             max(site for where in where_seq for site in where),
         )
         self._validate_mix_norm(active_where, operation="DMRG batch")
-        if self._effective_max_bond(self.p) > int(self.chi):
+        final_bond = self._effective_max_bond(self.p)
+        if final_bond > int(self.chi):
             raise RuntimeError(
                 "DMRG batch exceeded the mixed-mode chi bond limit."
             )
+        return final_bond
 
     def _collect_mix_dmrg_batch(
         self,
@@ -8808,14 +8877,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         try:
             trial_p = committed_p.copy(deep=False)
         except (AttributeError, TypeError, ValueError):
-            return committed_p.copy(deep=True), tuple(range(int(committed_p.L)))
+            trial_p = self._inherit_replay_array_kind(
+                committed_p.copy(deep=True), committed_p
+            )
+            return trial_p, tuple(range(int(committed_p.L)))
         for site in sites:
             tensor = trial_p[site]
             tensor.modify(
                 data=self._copy_mix_tensor_data(tensor.data),
                 left_inds=tensor.left_inds,
             )
-        return trial_p, sites
+        return self._inherit_replay_array_kind(trial_p, committed_p), sites
 
     def _validate_mix_norm(self, where, *, operation):
         """Validate mixed-mode commit norms only when finite_check is enabled.
@@ -9134,6 +9206,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
 
     def _mix_target_bond_dimensions(self):
+        """Reuse physical rank ceilings while register geometry is unchanged.
+
+        The returned private list is read-only to callers. Actual bond sizes
+        are deliberately not cached: compression can change them each gate.
+        State, cap, and layout changes invalidate the replay cache; chi and
+        length are also part of the key. Standalone calls always recompute.
+        """
+        cache = self._replay_rank_cache
+        if cache is None:
+            return self._compute_mix_target_bond_dimensions()
+        key = (int(getattr(self.p, "L", 0)), int(self.chi))
+        if key not in cache:
+            cache.clear()
+            cache[key] = self._compute_mix_target_bond_dimensions()
+        return cache[key]
+
+    def _compute_mix_target_bond_dimensions(self):
         """Return each bond's ``chi``-capped physical rank ceiling."""
         L = int(getattr(self.p, "L", 0))
         if L <= 1:
@@ -9304,6 +9393,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             mpo_state_needs_check = False
             mpo_state_check_where = None
 
+        # A completed transaction's maximum is also the next one's initial
+        # maximum. Keep this local to the segment, and discard it after any
+        # quality check that could repair/change tensor shapes.
+        current_bond = None
         idx = 0
         try:
             while idx < len(G_seq):
@@ -9315,7 +9408,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Each gate location must have one or two sites.")
 
                 step = mix_step_offset + idx + 1
-                start_bond = self._effective_max_bond(self.p)
+                start_bond = (
+                    self._effective_max_bond(self.p)
+                    if current_bond is None else current_bond
+                )
                 active_bond_is_short = self._mix_active_bond_is_short(
                     where, target_sizes=target_sizes
                 )
@@ -9353,6 +9449,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         reason = "bond_below_target"
                     else:
                         reason = "active_bond_below_target"
+                    current_bond = self._effective_max_bond(self.p)
                     entry = {
                         "step": int(step),
                         "where": tuple(logical_where),
@@ -9361,7 +9458,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         "target_bond": int(target_bond),
                         "backend": "mpo",
                         "reason": reason,
-                        "end_bond": self._effective_max_bond(self.p),
+                        "end_bond": current_bond,
                     }
                     if self._mix_dmrg_disabled_reason is not None:
                         entry["dmrg_disabled_reason"] = (
@@ -9370,12 +9467,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         entry["failed_sweep"] = self._mix_dmrg_failed_sweep
                     append_entries([entry])
                     idx += 1
-                    self._maybe_run_quality_check(
+                    if self._maybe_run_quality_check(
                         step,
                         where,
                         quality_check_every,
                         repair=quality_check_repair,
-                    )
+                    ) is not None:
+                        current_bond = None
                     continue
 
                 check_pending_mpo_state()
@@ -9416,11 +9514,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     trial_p = self._install_represented_norm(trial_p)
                     self.p = trial_p
                     self.info_c = deepcopy(snapshot["info_c"])
-                    self._prepare_fit_window(
-                        active_where,
-                        block_size=fit_block_size,
-                    )
-                    self._run_mix_dmrg_batch(
+                    # The DMRG executor prepares the window before fitting.
+                    # Repeating that preparation here rescans identical ranks.
+                    trial_final_bond = self._run_mix_dmrg_batch(
                         batch_G,
                         batch_where,
                         steps=batch_steps,
@@ -9499,6 +9595,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     mpo_steps += len(batch_G)
                     fallback_steps += len(batch_G)
                     final_bond = self._effective_max_bond(self.p)
+                    current_bond = final_bond
                     entries = []
                     for offset, (step_i, where_i, logical_i) in enumerate(
                         zip(batch_steps, batch_where, batch_logical_where)
@@ -9535,19 +9632,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         )
                     append_entries(entries)
                     idx = next_idx
-                    self._maybe_run_quality_check(
+                    if self._maybe_run_quality_check(
                         batch_steps[-1],
                         active_where,
                         quality_check_every,
                         repair=quality_check_repair,
-                    )
+                    ) is not None:
+                        current_bond = None
                     continue
                 except BaseException:
                     self._restore_mix_state(snapshot)
                     raise
 
                 dmrg_steps += len(batch_G)
-                final_bond = self._effective_max_bond(self.p)
+                # Reuse the maximum already measured to enforce chi before
+                # commit; commit preserves the validated trial's dimensions.
+                final_bond = (
+                    self._effective_max_bond(self.p)
+                    if trial_final_bond is None else trial_final_bond
+                )
+                current_bond = final_bond
                 entries = []
                 for offset, (step_i, where_i, logical_i) in enumerate(
                     zip(batch_steps, batch_where, batch_logical_where)
@@ -9575,12 +9679,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                 append_entries(entries)
                 idx = next_idx
-                self._maybe_run_quality_check(
+                if self._maybe_run_quality_check(
                     batch_steps[-1],
                     active_where,
                     quality_check_every,
                     repair=quality_check_repair,
-                )
+                ) is not None:
+                    current_bond = None
             check_pending_mpo_state()
         finally:
             if pbar is not None:
@@ -9595,7 +9700,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "mpo_steps": int(mpo_steps),
             "dmrg_steps": int(dmrg_steps),
             "fallback_steps": int(fallback_steps),
-            "final_bond": self._effective_max_bond(self.p),
+            "final_bond": (
+                self._effective_max_bond(self.p)
+                if current_bond is None else current_bond
+            ),
             "chi": int(self.chi),
             "target_bond": int(target_bond),
             "dmrg_disabled": self._mix_dmrg_disabled_reason is not None,
@@ -9690,7 +9798,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         self._prepare_fit_window(span, block_size=fit_block_size)
         self.canonize_mps(p, span)
-        state_snapshot = self._copy_fit_window_state(p, span)
+        state_snapshot = self._fit_rollback_snapshot(p, span)
         info_snapshot = dict(self.info_c)
 
         fit = None
@@ -9739,6 +9847,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 submpo,
                 span,
             )
+            self._inherit_replay_array_kind(p_target, p)
             fit_initialization = self._timed_call(
                 "dmrg.fit_guess",
                 self._prepare_fit_initial_guess,
@@ -9759,6 +9868,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff_mode=cutoff_mode,
                 submpo=True,
             )
+            if state_snapshot is p and fit_initialization["fit_guess"] is p:
+                state_snapshot = self._copy_fit_window_state(p, span)
             fit = FIT(
                 p_target,
                 p=fit_initialization["fit_guess"],
@@ -9961,7 +10072,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # materialized route, where charge and dummy-mode metadata survive.
             fit_target_strategy = (
                 "mps"
-                if self._has_symmray_data(self.p) or self.p.isfermionic()
+                if self._replay_has_symmray_data(self.p) or self.p.isfermionic()
                 else "layered"
             )
 
@@ -10097,7 +10208,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     # guess; norm loss is never silently converted into an MPO
                     # result.
                     fit_state_snapshot = (
-                        self._copy_fit_window_state(p, (xmin, xmax))
+                        self._fit_rollback_snapshot(p, (xmin, xmax))
                         if xmax - xmin > 1 and self.mode != "mix"
                         else None
                     )
@@ -10109,7 +10220,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     native_fit_guess_source = None
                     if (
                         not is_submpo
-                        and self._has_symmray_data(p)
+                        and self._replay_has_symmray_data(p)
                         and self._native_src_fit_guess_enabled(
                             fit_init_strategy,
                             fit_mpo_guess,
@@ -10204,6 +10315,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             native_source=native_fit_guess_source,
                         )
                     fit_guess = fit_initialization["fit_guess"]
+                    if fit_state_snapshot is p and fit_guess is p:
+                        # Direct FIT mutates the live state; isolate rollback
+                        # before entering the solver. An owned SRC/random
+                        # guess leaves the retained original state untouched.
+                        fit_state_snapshot = self._copy_fit_window_state(p, (xmin, xmax))
                     svd_guess_used = fit_initialization["svd_guess_used"]
                     mpo_fit_guess_used = svd_guess_used
                     random_initialization = fit_initialization[
@@ -10439,7 +10555,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self.canonize_mps(p, (xmin, xmax))
                     unitary_target_norm = self._unitary_previous_norm
                     fit_state_snapshot = (
-                        self._copy_fit_window_state(p, (xmin, xmax))
+                        self._fit_rollback_snapshot(p, (xmin, xmax))
                         if xmax - xmin > 1 and self.mode != "mix"
                         else None
                     )
@@ -10450,7 +10566,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     native_fit_guess_source = None
                     if (
-                        self._has_symmray_data(p)
+                        self._replay_has_symmray_data(p)
                         and self._native_src_fit_guess_enabled(
                             fit_init_strategy,
                             fit_mpo_guess,
@@ -10511,6 +10627,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         native_source=native_fit_guess_source,
                     )
                     fit_guess = fit_initialization["fit_guess"]
+                    if fit_state_snapshot is p and fit_guess is p:
+                        fit_state_snapshot = self._copy_fit_window_state(p, (xmin, xmax))
                     random_initialization = fit_initialization[
                         "random_initialization"
                     ]
@@ -11159,7 +11277,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 self.canonize_mps(p, (xmin, xmax))
 
                 compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
-                if self._has_symmray_data(p) and self._native_needs_safe_qr(p):
+                if self._replay_has_symmray_data(p) and self._native_needs_safe_qr(p):
                     self._apply_symmray_auto_swap_gate(
                         p,
                         gate,

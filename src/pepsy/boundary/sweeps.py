@@ -450,6 +450,9 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 max_bond=max_bond,
                 cutoff=self.fit_cutoff,
                 cutoff_mode=self.fit_cutoff_mode,
+                # Boundary two-site FIT owns its fixed block schedule. Do
+                # not inherit the circuit solver's block-to-one-site warm-up.
+                adaptive_block_sweeps=None,
                 min_iter=self.fit_min_iter,
                 rtol=self.fit_rtol,
                 patience=self.fit_patience,
