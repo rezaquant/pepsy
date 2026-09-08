@@ -12,7 +12,12 @@ import numpy as np
 
 from ...tensors.maps import OneDMap
 from .operators import TreePepo, TreeSubPepo
-from .plan import TreePepsPlan, _normalize_topology
+from .plan import (
+    TreePepsPlan,
+    _normalize_tree_peps_coarse_grain,
+    _normalize_span_mode,
+    _normalize_topology,
+)
 
 __all__ = ["TreePepsLayoutFinder"]
 
@@ -65,7 +70,7 @@ class TreePepsLayoutFinder:
     def _normalize_seed_modes(seed_modes):
         """Normalize fixed traversal and stochastic seed spellings."""
         if seed_modes is None:
-            seed_modes = ("row-major", "col-major", "hilbert", "inside-out")
+            seed_modes = ("span-up", "span-down", "span-middle", "span-out")
         elif isinstance(seed_modes, (str, bytes)):
             seed_modes = (seed_modes,)
         else:
@@ -79,9 +84,23 @@ class TreePepsLayoutFinder:
         normalized = []
         for mode in seed_modes:
             mode = str(mode).strip().lower().replace("_", "-")
-            mode = OneDMap._normalize_mode(mode)
+            span_mode = _normalize_span_mode(mode)
+            if span_mode is not None and mode.startswith("span-"):
+                mode = span_mode
+            elif mode.startswith("coarse-"):
+                from ..tree.layout import _normalize_layout_order
+
+                mode = _normalize_layout_order(mode)
+            else:
+                # Keep legacy aliases in reports while TreePepsPlan itself
+                # canonicalizes them when constructing the candidate.
+                mode = OneDMap._normalize_mode(mode)
             if mode in {"source", "current", "weighted"}:
                 mode = {"current": "source"}.get(mode, mode)
+            elif mode in {"span-up", "span-down", "span-out", "span-middle"}:
+                pass
+            elif mode.startswith("coarse-"):
+                pass
             elif mode not in OneDMap._KNOWN_MODES or mode == "finder":
                 supported = ", ".join(OneDMap._KNOWN_MODES[:-1])
                 raise ValueError(
@@ -115,11 +134,13 @@ class TreePepsLayoutFinder:
         max_iter=64,
         refine_budget=None,
         order=None,
+        map_mode=None,
         tree_order=None,
         seed_modes=None,
         tree_orders=None,
         root=None,
         topology=None,
+        coarse_grain=None,
     ):
         if supports is not None:
             if interactions is not None:
@@ -134,19 +155,50 @@ class TreePepsLayoutFinder:
                 )
             interactions = alias_value
 
+        if map_mode is not None and any(
+            value is not None for value in (tree_order, seed_modes, tree_orders)
+        ):
+            raise TypeError(
+                "map_mode cannot be combined with tree_order, seed_modes, "
+                "or tree_orders"
+            )
         if sum(value is not None for value in (tree_order, seed_modes, tree_orders)) > 1:
             raise TypeError(
                 "pass only one of tree_order, seed_modes, or tree_orders"
             )
+        if map_mode is not None:
+            span_mode = _normalize_span_mode(map_mode)
+            if span_mode is not None:
+                map_mode = span_mode
+            else:
+                # Compatibility for the old PEPS map_mode contract.
+                map_mode = str(map_mode).strip().lower().replace("_", "-")
+            tree_order = map_mode
         if tree_order is not None:
             seed_modes = (tree_order,)
         elif tree_orders is not None:
             seed_modes = tree_orders
         explicit_seed_modes = seed_modes is not None
         self.seed_modes = self._normalize_seed_modes(seed_modes)
+        auto_span_middle_degree = (
+            max_virtual_degree is None
+            and "span-middle" in self.seed_modes
+        )
+        self.map_mode = (
+            None
+            if map_mode is None
+            else (_normalize_span_mode(map_mode) or map_mode)
+        )
 
         if isinstance(geometry, TreePepsPlan):
             source_geometry = geometry
+            if coarse_grain is None:
+                coarse_grain = geometry.coarse_grain
+            else:
+                coarse_grain = _normalize_tree_peps_coarse_grain(
+                    coarse_grain,
+                    geometry.ndim,
+                )
             if topology is None:
                 topology = geometry.topology
             elif _normalize_topology(topology) != geometry.topology:
@@ -154,7 +206,9 @@ class TreePepsLayoutFinder:
             if order is not None and str(order) != geometry.order:
                 raise ValueError("order cannot override the order of a TreePepsPlan")
             if max_virtual_degree is None:
-                max_virtual_degree = geometry.max_virtual_degree
+                max_virtual_degree = (
+                    4 if auto_span_middle_degree else geometry.max_virtual_degree
+                )
             if root is not None and self._resolve_root(geometry, root) != geometry.root:
                 source_geometry = TreePepsPlan(
                     geometry.shape,
@@ -166,31 +220,42 @@ class TreePepsLayoutFinder:
                     max_virtual_degree=geometry.max_virtual_degree,
                     order=geometry.order,
                     tree_order=geometry.tree_order,
+                    map_mode=geometry.map_mode,
                     topology=geometry.topology,
                     boundary=geometry.boundary,
+                    coarse_grain=coarse_grain,
                 )
         else:
             if max_virtual_degree is None:
-                max_virtual_degree = 3
+                # ``span-middle`` deliberately gives central-row/plane sites
+                # four virtual bonds: two along the backbone and one chain in
+                # each axial direction.
+                max_virtual_degree = (
+                    4 if "span-middle" in self.seed_modes else 3
+                )
             topology = "tree" if topology is None else _normalize_topology(topology)
             source_root = root
-            if source_root is None and explicit_seed_modes and "inside-out" in self.seed_modes:
+            if source_root is None and explicit_seed_modes and (
+                "inside-out" in self.seed_modes or "span-out" in self.seed_modes
+            ):
                 source_root = "center"
             source_geometry = TreePepsPlan.from_shape(
                 geometry,
                 order="snake" if order is None else order,
+                map_mode=map_mode,
                 max_virtual_degree=max_virtual_degree,
                 root=source_root,
                 topology=topology,
+                coarse_grain=coarse_grain,
             )
 
         if not isinstance(max_virtual_degree, Integral) or isinstance(
             max_virtual_degree, bool
         ):
-            raise TypeError("max_virtual_degree must be an integer from 1 to 3")
+            raise TypeError("max_virtual_degree must be an integer from 1 to 4")
         max_virtual_degree = int(max_virtual_degree)
-        if not 1 <= max_virtual_degree <= 3:
-            raise ValueError("TreePeps virtual degree must be between 1 and 3")
+        if not 1 <= max_virtual_degree <= 4:
+            raise ValueError("TreePeps virtual degree must be between 1 and 4")
 
         objective = str(objective).strip().lower().replace("-", "_")
         try:
@@ -209,7 +274,10 @@ class TreePepsLayoutFinder:
         except (TypeError, ValueError) as exc:
             raise TypeError("seed must be an integer") from exc
 
-        if source_geometry.max_virtual_degree < max_virtual_degree:
+        if (
+            source_geometry.max_virtual_degree < max_virtual_degree
+            and not auto_span_middle_degree
+        ):
             # A geometry with a stricter cap is still a valid source graph; its
             # cap is the physical plan contract unless the caller asks for a
             # smaller value.
@@ -217,6 +285,7 @@ class TreePepsLayoutFinder:
         if topology == "path":
             max_virtual_degree = min(max_virtual_degree, 2)
         self.geometry = source_geometry
+        self.coarse_grain = source_geometry.coarse_grain
         self.topology = topology
         self.max_virtual_degree = max_virtual_degree
         self.objective = objective
@@ -391,6 +460,15 @@ class TreePepsLayoutFinder:
         )
 
     def _build_plan(self, tree_edges, *, tree_order=None):
+        tree_order_use = (
+            self.geometry.tree_order if tree_order is None else tree_order
+        )
+        span_tree_mode = _normalize_span_mode(tree_order_use)
+        map_mode = (
+            span_tree_mode
+            if span_tree_mode is not None
+            else self.geometry.map_mode if tree_order is None else None
+        )
         return TreePepsPlan(
             self.geometry.shape,
             one_d_to_coord=self.geometry.one_d_to_coord,
@@ -400,11 +478,11 @@ class TreePepsLayoutFinder:
             root=self.geometry.root,
             max_virtual_degree=self.max_virtual_degree,
             order=self.geometry.order,
-            tree_order=(
-                self.geometry.tree_order if tree_order is None else tree_order
-            ),
+            tree_order=tree_order_use,
+            map_mode=map_mode,
             topology=self.topology,
             boundary=self.geometry.boundary,
+            coarse_grain=self.coarse_grain,
         )
 
     @staticmethod
@@ -563,6 +641,7 @@ class TreePepsLayoutFinder:
             max_virtual_degree=self.max_virtual_degree,
             boundary=self.geometry.boundary,
             topology=self.topology,
+            coarse_grain=self.coarse_grain,
         )
         # Constructing through TreePepsPlan keeps the shared OneDMap growth
         # ordering and all degree/fallback rules in one place.
@@ -582,6 +661,7 @@ class TreePepsLayoutFinder:
                 max_virtual_degree=self.max_virtual_degree,
                 boundary=self.geometry.boundary,
                 topology=self.topology,
+                coarse_grain=self.coarse_grain,
             )
         candidates = [base]
         candidate_modes = {base.tree_edges: "source"}
@@ -665,6 +745,8 @@ class TreePepsLayoutFinder:
             "max_edge_load": details["max_edge_load"],
             "interactions": details["interactions"],
             "seed_modes": self.seed_modes,
+            "coarse_grain": self.coarse_grain,
+            "map_mode": selected.map_mode,
             "topology": selected.topology,
             "selected_seed": self._candidate_modes.get(
                 selected.tree_edges, "refined"

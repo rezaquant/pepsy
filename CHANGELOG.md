@@ -14,6 +14,63 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Added a geometry-aware rank scheduling policy to native `TreePeps` and
+  `TreePEPO` compression. The default `order="rank"` removes the currently
+  cheapest legal leaf branch using live physical/virtual dimensions, while
+  `order="depth"` preserves the previous farthest-first schedule. TreePeps
+  full sweeps now re-score after each completed reduction and batch their
+  expensive whole-network validation to one final canonicality check;
+  localized `TreePepsOptimizer` sweeps re-score sibling branches in the same
+  way. Standalone edge operations retain validation by default.
+
+- Canonicalized tree layout names across the public handoff: TreeMPO,
+  TreeTensorNetwork, and TreeOptimizer accept `map_mode="coarse-*"` for
+  lattice coarsening/traversal, while TreePEPO, TreePeps, and
+  TreePepsOptimizer accept `map_mode="span-up"`, `"span-down"`,
+  `"span-out"`, or `"span-middle"` for bounded-degree physical spanning
+  trees. The selected mode is exposed on the shared plan, state, and operator;
+  historical generic and `inside-out` spellings remain compatibility aliases.
+  TreePEPS legacy `coarse-*` modes also accept the shared `coarse_grain`
+  control through the plan and layout finder.
+
+- Corrected `TreePeps` `span-middle` to use one central horizontal
+  line/plane with an axial chain above and below every backbone site. Central
+  interior sites therefore have four virtual bonds and off-backbone interior
+  sites have two; TreePeps now permits rank-five site tensors. `TreeMPO` also
+  retains optional `TreeLayoutFinder` metadata so `show(layout="both")` can
+  print the physical lattice and term supports above its native tree view.
+
+- Unified the Hamiltonian `to_*` conversion surface around the single
+  strategy-bearing `compress=` control. The public `to_mpo`, `to_pepo`,
+  `to_tree_mpo`, and `to_tree_pepo` builders now default to
+  `compress="term"`, adding and compressing one term at a time.
+  `compress=True`/`"auto"` explicitly select a workload-aware construction:
+  automaton assembly gets one final compression, while the term route
+  compresses after every term. `compress="automaton"` forces
+  shared/state-diagram assembly. `compress=False`, `max_bond=None`, and
+  `max_bond=False` disable numerical compression; `mode=` and
+  `compress_each=` remain compatibility spellings. Automatic native tree
+  conversions also choose a layout from the interaction supports when no plan
+  or mapping is supplied.
+
+- Batched internal `TreePEPO` validation across each full compression sweep.
+  Standalone edge compression still validates by default, while term-by-term
+  and one-shot builder paths avoid repeating the quadratic whole-network
+  topology check after every compressed edge.
+  `TreeMPO.show()` now keeps the clean native ASCII tree as its default, and
+  `TreePEPO` retains its `TreePepsLayoutFinder` metadata through later
+  operations.
+
+- Unified `cutoff="auto"` across MPS, tree, TreePEPS, and Hamiltonian
+  conversion paths: it resolves to `1e-12` for `float64`/`complex128`, `1e-6`
+  for `float32`/`complex64`, and `1e-3` for 16-bit floating-point data.
+
+- Added canonical `ham_tn.to_mpo`, `ham_tn.to_pepo`, `ham_tn.to_tree_mpo`, and
+  `ham_tn.to_tree_pepo` conversions. Native tree conversions preserve the
+  supplied tree geometry and avoid a chain-MPO round trip; `TreePEPO` and
+  `TreeSubPEPO` are now the canonical acronym spellings, with legacy names and
+  `build_*` methods retained as compatibility aliases.
+
 - Made `mode="direct"` the explicit GibbsMps default while retaining
   `mode="mpo"` as a compatibility alias for the same direct Quimb replay.
   Added coverage for inferred map ordering, triangular coordinate graphs, and

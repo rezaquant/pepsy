@@ -185,6 +185,8 @@ _SYMBOL_MODULES = {
     "TreePepsPlan": ".optimizers",
     "TreePepsGeometry": ".optimizers",
     "TreePepsLayoutFinder": ".optimizers",
+    "TreePEPO": ".optimizers",
+    "TreeSubPEPO": ".optimizers",
     "TreePepo": ".optimizers",
     "TreeSubPepo": ".optimizers",
     "TreePepsOptimizer": ".optimizers",

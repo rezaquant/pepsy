@@ -1,6 +1,7 @@
 """Regression tests for :mod:`pepsy.operators.hamiltonians` builders."""
 
 import builtins
+import inspect
 
 import numpy as np
 import pytest
@@ -8,7 +9,23 @@ import quimb
 import quimb.tensor as qtn
 
 import pepsy as py
+from pepsy._internal.cutoff import dtype_auto_cutoff
 from pepsy.tensors.core import OneDMap
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        (np.float64, 1.0e-12),
+        (np.complex128, 1.0e-12),
+        (np.float32, 1.0e-6),
+        (np.complex64, 1.0e-6),
+        (np.float16, 1.0e-3),
+    ],
+)
+def test_auto_cutoff_dtype_policy_is_shared(dtype, expected):
+    """All auto-cutoff users share the MPS precision policy."""
+    assert dtype_auto_cutoff(dtype) == expected
 
 
 def test_ham_tn_accepts_shape_alias_for_1d_2d_and_3d_layouts():
@@ -44,6 +61,476 @@ def test_build_mpo_single_site_term_works_for_ly1():
     )
 
     assert mpo.L == 2
+
+
+def test_to_mpo_is_canonical_and_build_mpo_is_compatibility_alias():
+    """The conversion spelling is canonical while the old spelling survives."""
+    builder = py.ham_tn(Lx=2, Ly=1, data_type="complex128")
+    terms = [((quimb.pauli("Z", dtype="complex128"),), (0,))]
+
+    canonical = builder.to_mpo(terms, compress_each=False)
+    with pytest.warns(DeprecationWarning, match="use ham_tn.to_mpo"):
+        compatibility = builder.build_mpo(terms, compress_each=False)
+
+    assert np.allclose(canonical.to_dense(), compatibility.to_dense())
+
+
+def test_to_tree_mpo_compiles_terms_without_chain_mpo():
+    """Tree conversion returns the native TreePlan operator directly."""
+    from pepsy.optimizers import TreeMPO, TreePlan
+
+    plan = TreePlan.from_order([0, 1, 2, 3])
+    builder = py.ham_tn(shape=4, data_type="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    operator = builder.to_tree_mpo(
+        plan,
+        [
+            ((z_op,), (0,), 0.5),
+            ((z_op, z_op), (1, 3), 1.2),
+        ],
+        cutoff=0.0,
+    )
+
+    assert isinstance(operator, TreeMPO)
+    assert len(operator.tree_networks) == 1
+    assert not hasattr(operator, "Lx")
+    assert np.allclose(
+        operator.to_dense(),
+        0.5 * np.kron(np.kron(np.kron(z_op, np.eye(2)), np.eye(2)), np.eye(2))
+        + 1.2 * np.kron(np.kron(np.kron(np.eye(2), z_op), np.eye(2)), z_op),
+    )
+
+
+def test_to_tree_mpo_resolves_coordinates_using_builder_map():
+    """Coordinate terms map through the builder when TreePlan has no lattice map."""
+    from pepsy.optimizers import TreePlan
+
+    mapper = OneDMap(2, 2, mode="row-major")
+    builder = py.ham_tn(shape=(2, 2), mapper=mapper, data_type="complex128")
+    plan = TreePlan.from_order([0, 1, 2, 3])
+    z_op = quimb.pauli("Z", dtype="complex128")
+    by_coordinate = builder.to_tree_mpo(
+        plan,
+        [((z_op,), ((1, 0),), 1.0)],
+        compress=False,
+        cutoff=0.0,
+    )
+    by_logical = builder.to_tree_mpo(
+        plan,
+        [((z_op,), (2,), 1.0)],
+        compress=False,
+        cutoff=0.0,
+    )
+
+    assert np.allclose(by_coordinate.to_dense(), by_logical.to_dense())
+
+
+def test_ham_tn_supports_direct_tree_map_mode_conversion():
+    """Tree conversions can derive their native plans from one map mode."""
+    from pepsy.optimizers import TreeMPO, TreePEPO
+
+    builder = py.ham_tn(
+        shape=(2, 3),
+        map_mode="row-major",
+        data_type="complex128",
+    )
+    z_op = quimb.pauli("Z", dtype="complex128")
+    terms = [
+        ((z_op,), ((0, 0),), 0.5),
+        ((z_op, z_op), ((0, 1), (1, 1)), 1.2),
+    ]
+
+    tree_mpo = builder.to_tree_mpo(
+        terms,
+        map_mode="coarse-alternate-x",
+        compress_opts={"order": "depth"},
+    )
+    tree_pepo = builder.to_tree_pepo(
+        terms,
+        map_mode="coarse-alternate-x",
+        form="left",
+        compress_opts={"order": "depth"},
+    )
+
+    assert builder.map_mode == "row-major"
+    assert isinstance(tree_mpo, TreeMPO)
+    assert isinstance(tree_pepo, TreePEPO)
+    assert tree_pepo.plan.order == "coarse-alternate-x"
+    assert tree_pepo.plan.tree_order == "coarse-alternate-x"
+
+
+def test_ham_tn_uses_distinct_canonical_tree_and_peps_map_modes():
+    from pepsy.optimizers import TreeMPO, TreePEPO
+
+    builder = py.ham_tn(shape=(4, 4), data_type="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    terms = [((z_op, z_op), ((0, 0), (3, 3)), 1.0)]
+
+    tree_mpo = builder.to_tree_mpo(
+        terms,
+        map_mode="coarse-alternate-x",
+        compress=False,
+    )
+    tree_pepo = builder.to_tree_pepo(
+        terms,
+        map_mode="span-middle",
+        compress=False,
+    )
+
+    assert isinstance(tree_mpo, TreeMPO)
+    assert isinstance(tree_pepo, TreePEPO)
+    assert tree_mpo.map_mode == "coarse-alternate-x"
+    assert tree_pepo.map_mode == "span-middle"
+    assert tree_pepo.plan.order == "snake"
+
+
+def test_ham_tn_conversion_modes_select_sequential_or_analytic_builds():
+    """All builder conversion families expose the same build-mode choice."""
+    from pepsy.optimizers import TreePEPO, TreeMPO
+
+    builder = py.ham_tn(shape=(2, 3), data_type="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    terms = [
+        ((z_op,), ((0, 0),), 0.5),
+        ((z_op, z_op), ((0, 1), (1, 1)), 1.2),
+    ]
+
+    mpo_term = builder.to_mpo(
+        terms,
+        compress="term",
+        cutoff=0.0,
+    )
+    mpo_analytic = builder.to_mpo(
+        terms,
+        compress="automaton",
+        cutoff=0.0,
+    )
+    pepo_term = builder.to_pepo(
+        terms,
+        compress="term",
+        cutoff=0.0,
+    )
+    pepo_analytic = builder.to_pepo(
+        terms,
+        compress="automaton",
+        cutoff=0.0,
+    )
+    tree_mpo_term = builder.to_tree_mpo(
+        terms,
+        map_mode="coarse-alternate-x",
+        compress="term",
+        cutoff=0.0,
+    )
+    tree_mpo_analytic = builder.to_tree_mpo(
+        terms,
+        map_mode="coarse-alternate-x",
+        compress="automaton",
+        cutoff=0.0,
+    )
+    tree_pepo_term = builder.to_tree_pepo(
+        terms,
+        map_mode="coarse-alternate-x",
+        compress="term",
+        cutoff=0.0,
+    )
+    tree_pepo_analytic = builder.to_tree_pepo(
+        terms,
+        map_mode="coarse-alternate-x",
+        compress="automaton",
+        cutoff=0.0,
+    )
+
+    assert np.allclose(mpo_term.to_dense(), mpo_analytic.to_dense())
+    assert np.allclose(pepo_term.to_dense(), pepo_analytic.to_dense())
+    assert np.allclose(tree_mpo_term.to_dense(), tree_mpo_analytic.to_dense())
+    assert np.allclose(tree_pepo_term.to_dense(), tree_pepo_analytic.to_dense())
+    assert isinstance(tree_mpo_term, TreeMPO)
+    assert isinstance(tree_pepo_term, TreePEPO)
+
+
+def test_ham_tn_term_mode_compresses_after_each_term(monkeypatch):
+    """Term accumulation applies the bond cap after every addition."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+
+    builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
+    terms = [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1)), ((2,), "Y", -0.3)]
+    builder.to_mpo(terms, compress="term", chi=2, cutoff=0.0)
+
+    assert len(calls) == len(terms)
+    assert all(call["max_bond"] == 2 for call in calls)
+
+
+@pytest.mark.parametrize("max_bond", [None, False])
+def test_ham_tn_automaton_skips_numerical_compression_without_bond_cap(
+    monkeypatch, max_bond
+):
+    """An exact automaton build does not run an unbounded compression sweep."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+
+    builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
+    builder.to_mpo(
+        [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1))],
+        compress="automaton",
+        max_bond=max_bond,
+        cutoff=0.0,
+    )
+
+    assert calls == []
+
+
+def test_ham_tn_compress_is_canonical_strategy_control():
+    """The old separate mode selector is compatibility-only by default."""
+    for name in ("to_mpo", "to_pepo", "to_tree_mpo", "to_tree_pepo"):
+        parameter = inspect.signature(getattr(py.ham_tn, name)).parameters["mode"]
+        assert parameter.default is None
+
+
+def test_ham_tn_to_builder_defaults_are_term_by_term():
+    """All public ``to_*`` builders default to sequential term construction."""
+    for name in ("to_mpo", "to_pepo", "to_tree_mpo", "to_tree_pepo"):
+        parameter = inspect.signature(getattr(py.ham_tn, name)).parameters["compress"]
+        assert parameter.default == "term"
+
+
+def test_ham_tn_default_compresses_after_each_term(monkeypatch):
+    """The omitted compression strategy is the incremental term policy."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+    builder = py.ham_tn(shape=4, data_type="complex128")
+    mpo = builder.to_mpo(
+        [((quimb.pauli("X", dtype="complex128"),), (0,), 0.5),
+         ((quimb.pauli("Z", dtype="complex128"),), (3,), 0.25)],
+        cutoff=0.0,
+    )
+
+    assert len(calls) == 2
+    assert not hasattr(mpo, "pepsy_automaton")
+
+
+def test_ham_tn_explicit_true_keeps_automatic_route(monkeypatch):
+    """Explicit ``compress=True`` retains the compatibility auto policy."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+    builder = py.ham_tn(shape=4, data_type="complex128")
+    mpo = builder.to_mpo(
+        [((quimb.pauli("X", dtype="complex128"),), (0,), 0.5),
+         ((quimb.pauli("Z", dtype="complex128"),), (3,), 0.25)],
+        compress=True,
+        cutoff=0.0,
+    )
+
+    assert len(calls) == 1
+    assert hasattr(mpo, "pepsy_automaton")
+
+
+def test_ham_tn_tree_automatic_layout_uses_term_supports():
+    """Automatic native tree conversion retains its workload-aware finder."""
+    builder = py.ham_tn(shape=(3, 3), data_type="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    terms = [((z_op, z_op), ((0, 0), (2, 2)), 1.0)]
+
+    tree_mpo = builder.to_tree_mpo(terms, compress="automaton", cutoff=0.0)
+    tree_pepo = builder.to_tree_pepo(terms, compress="automaton", cutoff=0.0)
+
+    assert tree_mpo.layout_finder is not None
+    assert tree_mpo.validate()
+    assert tree_pepo.layout_finder is not None
+    assert tree_pepo.validate()
+    assert tree_pepo.plan.tree_edges
+
+
+def test_ham_tn_map_mode_and_backend_overrides_are_per_conversion():
+    """Map and backend overrides do not mutate shared builder configuration."""
+    builder = py.ham_tn(
+        shape=(2, 3),
+        map_mode="snake",
+        data_type="complex128",
+    )
+    z_op = quimb.pauli("Z", dtype="complex128")
+    terms = [((z_op,), ((1, 0),), 0.5)]
+
+    row_major = builder.to_mpo(
+        terms,
+        map_mode="row-major",
+        compress_each=False,
+        to_backend=None,
+    )
+    expected = py.ham_tn(
+        shape=(2, 3),
+        map_mode="row-major",
+        data_type="complex128",
+    ).to_mpo(terms, compress_each=False)
+    assert np.allclose(row_major.to_dense(), expected.to_dense())
+
+    calls = []
+
+    def convert(array):
+        calls.append(array)
+        return np.asarray(array, dtype=np.complex64)
+
+    configured = py.ham_tn(
+        shape=(2, 3),
+        map_mode="snake",
+        data_type="complex128",
+        to_backend=convert,
+    )
+    configured.to_tree_mpo(terms, map_mode="row-major", compress=False)
+    assert calls
+    calls.clear()
+    native_tree = configured.to_tree_pepo(
+        terms,
+        map_mode="row-major",
+        tree_order="alternate-x",
+        compress=False,
+        to_backend=None,
+    )
+    assert native_tree.validate()
+    assert not calls
+    assert configured.map_mode == "snake"
+
+
+def test_tree_operator_show_has_native_tree_and_pepo_lattice_views(capsys):
+    """Native tree display is branch-aware while PEPO retains a lattice view."""
+    from pepsy.optimizers import TreeMPO, TreePEPO
+
+    builder = py.ham_tn(shape=(2, 3), data_type="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    terms = [((z_op, z_op), ((0, 0), (1, 1)), 1.0)]
+    tree_mpo = builder.to_tree_mpo(terms, map_mode="coarse-snake", compress=False)
+    tree_pepo = builder.to_tree_pepo(
+        terms,
+        map_mode="snake",
+        tree_order="alternate-x",
+        compress=False,
+    )
+
+    tree_mpo.show()
+    tree_mpo_output = capsys.readouterr().out
+    assert "physical lattice" not in tree_mpo_output
+    assert "◆ q" in tree_mpo_output
+    lattice = tree_pepo.ascii_lattice()
+    tree_pepo.show(layout="tree")
+    topology = tree_pepo.ascii_tree()
+    tree_pepo.show(layout="lattice", bond_dims=False, node_ids=True)
+    output = capsys.readouterr().out
+
+    assert isinstance(tree_mpo, TreeMPO)
+    assert tree_mpo.layout_finder is not None
+    assert tree_mpo.copy().layout_finder is tree_mpo.layout_finder
+    lattice_mpo = tree_mpo.ascii_lattice()
+    assert "physical lattice (2, 3)" in lattice_mpo
+    assert "t0: q0 - q4" in lattice_mpo
+    assert isinstance(tree_pepo, TreePEPO)
+    assert tree_pepo.layout_finder is not None
+    assert tree_pepo.copy().layout_finder is tree_pepo.layout_finder
+    assert "◆ q" in output
+    assert "N" in output
+    assert "●" in lattice
+    assert "◆ q" in topology
+
+
+def test_tree_operator_show_color_is_opt_in(capsys):
+    """Native tree show keeps plain text default and supports coloured output."""
+    from pepsy.optimizers import TreeMPO
+
+    builder = py.ham_tn(shape=4, data_type="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    operator = builder.to_tree_mpo(
+        [((z_op,), (0,))],
+        compress=False,
+    )
+    assert "\033[" not in operator.ascii_tree()
+    operator.show(color=True)
+    assert "\033[" in capsys.readouterr().out
+    assert isinstance(operator, TreeMPO)
+
+
+def test_to_tree_pepo_uses_tree_peps_plan_coordinates():
+    """TreePEPO conversion honors the logical-coordinate map owned by its plan."""
+    from pepsy.optimizers import TreePEPO, TreePepsPlan
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    builder = py.ham_tn(shape=(2, 3), data_type="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    operator = builder.to_tree_pepo(
+        plan,
+        [((z_op,), ((1, 2),), 0.75)],
+        cutoff=0.0,
+    )
+
+    assert isinstance(operator, TreePEPO)
+    logical_site = plan.logical_site((1, 2))
+    assert operator.operator_support == (logical_site,)
+    assert operator.operator_span == frozenset(plan.subtree_span((logical_site,)))
+    assert operator.validate()
+
+
+def test_tree_operator_arithmetic_matches_dense_products():
+    """TreeMPO and TreePEPO arithmetic preserves exact dense semantics."""
+    from pepsy.optimizers import TreeMPO, TreePEPO, TreePepsPlan, TreePlan
+
+    z_op = quimb.pauli("Z", dtype="complex128")
+    tree_plan = TreePlan.from_order([0, 1, 2, 3])
+    tree_builder = py.ham_tn(shape=4, data_type="complex128")
+    tree_left = tree_builder.to_tree_mpo(tree_plan, [((z_op,), (0,))], cutoff=0.0)
+    tree_right = tree_builder.to_tree_mpo(tree_plan, [((z_op,), (1,), 2.0)], cutoff=0.0)
+    assert isinstance(tree_left + tree_right, TreeMPO)
+    assert np.allclose(
+        (tree_left + tree_right).to_dense(),
+        tree_left.to_dense() + tree_right.to_dense(),
+    )
+    assert np.allclose(
+        (tree_left @ tree_right).to_dense(),
+        tree_left.to_dense() @ tree_right.to_dense(),
+    )
+    assert np.allclose(
+        (2.0 * tree_left).to_dense(),
+        2.0 * tree_left.to_dense(),
+    )
+
+    peps_plan = TreePepsPlan.from_shape((2, 3))
+    peps_builder = py.ham_tn(shape=(2, 3), data_type="complex128")
+    peps_left = peps_builder.to_tree_pepo(peps_plan, [((z_op,), ((0, 0),))], cutoff=0.0)
+    peps_right = peps_builder.to_tree_pepo(peps_plan, [((z_op,), ((1, 1),), 2.0)], cutoff=0.0)
+    assert isinstance(peps_left + peps_right, TreePEPO)
+    assert np.allclose(
+        (peps_left + peps_right).to_dense(),
+        peps_left.to_dense() + peps_right.to_dense(),
+    )
+    assert np.allclose(
+        (peps_left @ peps_right).to_dense(),
+        peps_left.to_dense() @ peps_right.to_dense(),
+    )
+    assert np.allclose(
+        (-peps_left).to_dense(),
+        -peps_left.to_dense(),
+    )
 
 
 def test_build_mpo_accepts_mapper_override():

@@ -21,6 +21,34 @@ from pepsy.optimizers.tree.ttn import _native_qr_block_scaled
 from pepsy.fitting import TreeFIT
 
 
+def test_tree_map_mode_is_shared_by_plan_state_and_native_operator():
+    plan = TreePlan.from_order(
+        range(8),
+        map_mode="coarse-alternate-x",
+    )
+    state = TreeTensorNetwork.from_plan(plan)
+    operator = TreeMPO.from_terms(
+        plan,
+        {(0,): np.diag([1.0, -1.0])},
+        compress=False,
+    )
+
+    assert plan.map_mode == "coarse-alternate-x"
+    assert state.map_mode == "coarse-alternate-x"
+    assert operator.map_mode == "coarse-alternate-x"
+
+
+def test_tree_coarse_map_mode_is_available_without_a_lattice_shape():
+    plan = TreeLayoutFinder(
+        [],
+        n=8,
+        map_mode="coarse-alternate-x",
+    ).run(refine=None, search=None)
+
+    assert plan.map_mode == "coarse-alternate-x"
+    assert plan.mpo_order() == tuple(range(8))
+
+
 def test_tree_mpo_higher_order_term_routes_and_replays_natively():
     """A dense higher-order TreeMPO applies without chain-MPO lowering."""
     plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)

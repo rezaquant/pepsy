@@ -11,6 +11,7 @@ from pepsy.optimizers import (
     TreePepo,
     TreePepsOptimizer,
 )
+from pepsy.optimizers.tree_peps._compression import iter_tree_compression_order
 
 pytestmark = pytest.mark.smoke
 
@@ -50,6 +51,81 @@ def test_tree_peps_plan_traversal_seeds_build_legal_trees():
         assert len(plan.tree_edges) == plan.size - 1
         assert set(plan.tree_edges).issubset(set(plan.lattice_edges))
         assert plan.is_connected(range(plan.size))
+
+
+@pytest.mark.parametrize("mode", ("span-up", "span-down", "span-out", "span-middle"))
+def test_tree_peps_span_map_modes_are_canonical_and_bounded(mode):
+    plan = TreePepsPlan.from_shape((4, 4), map_mode=mode)
+
+    assert plan.map_mode == mode
+    assert plan.tree_order == mode
+    assert len(plan.tree_edges) == plan.size - 1
+    assert plan.max_degree <= (4 if mode == "span-middle" else 3)
+    assert plan.is_connected(range(plan.size))
+
+
+def test_tree_peps_span_out_alias_and_state_operator_views():
+    alias = TreePepsPlan.from_shape((3, 3), map_mode="inside-out")
+    state = TreePeps.from_plan(alias)
+    operator = TreePepo.identity(alias)
+
+    assert alias.map_mode == "span-out"
+    assert state.map_mode == "span-out"
+    assert operator.map_mode == "span-out"
+
+
+def test_tree_peps_span_map_modes_generalize_to_3d():
+    for mode in ("span-up", "span-down", "span-out", "span-middle"):
+        plan = TreePepsPlan.from_shape((3, 3, 2), map_mode=mode)
+        assert plan.map_mode == mode
+        assert plan.max_degree <= (4 if mode == "span-middle" else 3)
+        assert plan.is_connected(range(plan.size))
+
+
+def test_tree_peps_span_middle_is_central_backbone_with_axial_chains():
+    """span-middle has a horizontal backbone and one vertical chain per site."""
+    plan = TreePepsPlan.from_shape((5, 5), map_mode="span-middle")
+    middle = (plan.shape[0] - 1) // 2
+
+    def edge(coord0, coord1):
+        return tuple(sorted((plan.logical_site(coord0), plan.logical_site(coord1))))
+
+    expected = {
+        edge((middle, y), (middle, y + 1))
+        for y in range(plan.shape[1] - 1)
+    }
+    expected.update(
+        edge((x, y), (x + 1, y))
+        for y in range(plan.shape[1])
+        for x in range(plan.shape[0] - 1)
+    )
+    assert set(plan.tree_edges) == expected
+    assert plan.max_degree == 4
+    for y in range(1, plan.shape[1] - 1):
+        assert len(plan.neighbors((middle, y))) == 4
+    for x in range(plan.shape[0]):
+        for y in range(plan.shape[1]):
+            if x != middle and 0 < x < plan.shape[0] - 1:
+                assert len(plan.neighbors((x, y))) == 2
+
+    state = TreePeps.from_plan(plan)
+    assert state.max_virtual_degree == 4
+    assert state.max_rank == 5
+    assert state.validate()
+
+
+def test_tree_peps_layout_finder_allows_span_middle_degree_four():
+    base = TreePepsPlan.from_shape((4, 4))
+    finder = TreePepsLayoutFinder(
+        base,
+        seed_modes=("span-middle",),
+        max_iter=0,
+    )
+
+    assert finder.max_virtual_degree == 4
+    middle_edges = finder._fixed_seed("span-middle")
+    middle_plan = finder._build_plan(middle_edges, tree_order="span-middle")
+    assert middle_plan.max_degree == 4
 
 
 def test_tree_peps_row_and_column_major_are_oriented_combs():
@@ -141,6 +217,24 @@ def test_tree_peps_normalize_preserves_canonical_tree_metadata():
     assert state.validate(check_canonical=True)
 
 
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        (np.float64, 1.0e-12),
+        (np.complex128, 1.0e-12),
+        (np.float32, 1.0e-6),
+        (np.complex64, 1.0e-6),
+    ],
+)
+def test_tree_peps_optimizer_auto_cutoff_matches_dtype_policy(dtype, expected):
+    """TreePepsOptimizer resolves its default from the live state dtype."""
+    plan = TreePepsPlan.from_shape((2, 2), topology="path")
+    state = TreePeps.from_plan(plan, dtype=dtype)
+    optimizer = TreePepsOptimizer(state, plan=plan, run=False)
+
+    assert optimizer.cutoff == pytest.approx(expected)
+
+
 def test_tree_peps_canonical_center_norm_matches_dense_norm():
     state = TreePeps.rand(
         TreePepsPlan.from_shape((2, 3)), bond_dim=2, seed=23, canonicalize=True
@@ -220,6 +314,113 @@ def test_tree_peps_moves_from_canonical_region_using_left_inds():
     assert state.validate(check_canonical=True)
 
 
+def test_tree_peps_rank_compression_batches_validation_and_keeps_layout():
+    """Full native compression chooses legal branches and validates once."""
+    plan = TreePepsPlan.from_shape((2, 3), tree_order="row-major")
+    state = TreePeps.rand(plan, bond_dim=2, seed=23, canonicalize=True)
+    validate_calls = []
+    original_validate = state.validate
+
+    def capture_validate(*args, **kwargs):
+        validate_calls.append(kwargs.get("check_canonical", False))
+        return original_validate(*args, **kwargs)
+
+    state.validate = capture_validate
+    state.compress(max_bond=1, cutoff=0.0, order="rank")
+
+    assert validate_calls == [True]
+    assert state.max_bond() <= 1
+    assert state.plan_signature == TreePeps.from_plan(plan).plan_signature
+    assert state.is_canonical_form()
+
+    depth = TreePeps.rand(plan, bond_dim=2, seed=23, canonicalize=True)
+    depth.compress(max_bond=1, cutoff=0.0, order="depth")
+    assert depth.max_bond() <= 1
+    assert depth.is_canonical_form()
+
+
+def test_tree_rank_schedule_recomputes_after_each_reduction():
+    """Rank ordering must read dimensions changed by the previous SVD."""
+    class FakeTensor:
+        def __init__(self, inds, dims):
+            self.inds = tuple(inds)
+            self.dims = dims
+
+        def ind_size(self, ind):
+            return self.dims[ind]
+
+    plan = TreePepsPlan.from_shape((2, 3), tree_order="row-major")
+    dims = {f"p{site}": 2 for site in range(plan.size)}
+    dims.update(
+        {
+            f"b{min(site0, site1)}_{max(site0, site1)}": 4
+            for site0, site1 in plan.tree_edges
+        }
+    )
+    tensors = {
+        site: FakeTensor(
+            [f"p{site}"]
+            + [
+                f"b{min(site, neighbor)}_{max(site, neighbor)}"
+                for neighbor in plan.neighbors(site)
+            ],
+            dims,
+        )
+        for site in range(plan.size)
+    }
+
+    def bond(site0, site1):
+        return f"b{min(site0, site1)}_{max(site0, site1)}"
+
+    schedule = iter_tree_compression_order(
+        plan,
+        center=plan.root,
+        nodes=range(plan.size),
+        order="rank",
+        tensor_getter=tensors.__getitem__,
+        bond_getter=bond,
+    )
+    assert next(schedule) == (3, 2)
+    # A completed compression can change a bond incident on a remaining
+    # branch. The next choice must see that live dimension.
+    dims["b0_5"] = 100
+    assert next(schedule) == (4, 1)
+
+
+def test_tree_pepo_rank_and_depth_compression_preserve_exact_operator():
+    """Both fixed-topology TreePEPO schedules preserve an uncapped operator."""
+    plan = TreePepsPlan.from_shape((2, 3), tree_order="row-major")
+    x = np.array([[0, 1], [1, 0]], dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    source = TreePepo.from_terms(
+        plan,
+        {
+            (0, 5): np.kron(x, z),
+            (1, 4): np.kron(z, x),
+        },
+    )
+    expected = np.asarray(source.to_dense().data)
+
+    for order in ("rank", "depth"):
+        compressed = source.copy()
+        compressed.compress(max_bond=None, cutoff=0.0, order=order)
+        np.testing.assert_allclose(
+            np.asarray(compressed.to_dense().data), expected, atol=1e-10, rtol=1e-10
+        )
+        assert compressed.is_canonical_form()
+
+        bounded = source.copy()
+        bounded.compress(max_bond=1, cutoff=0.0, order=order)
+        assert bounded.max_bond() <= 1
+        assert bounded.is_canonical_form()
+
+    with pytest.raises(ValueError, match="tree compression order"):
+        source.copy().compress(max_bond=1, order="invalid")
+    with pytest.raises(ValueError, match="tree compression order"):
+        TreePeps.rand(plan, bond_dim=2, seed=24).compress(
+            max_bond=1, cutoff=0.0, order="invalid"
+        )
+
 def test_tree_peps_supports_three_dimensional_coordinate_tags():
     plan = TreePepsPlan.from_shape((2, 1, 2), topology="path")
     state = TreePeps.from_plan(plan)
@@ -239,9 +440,10 @@ def test_tree_peps_plan_rejects_non_lattice_or_cyclic_edges():
         TreePepsPlan.from_shape((2, 2), tree_edges=[(0, 1), (1, 2), (2, 3), (3, 0)])
 
 
-def test_tree_peps_hard_limits_virtual_degree_to_three():
-    with pytest.raises(ValueError, match="at most 3"):
-        TreePepsPlan.from_shape((2, 2), max_virtual_degree=4)
+def test_tree_peps_hard_limits_virtual_degree_to_four():
+    assert TreePepsPlan.from_shape((2, 3), max_virtual_degree=4)
+    with pytest.raises(ValueError, match="at most 4"):
+        TreePepsPlan.from_shape((2, 3), max_virtual_degree=5)
 
 
 def test_tree_peps_requires_explicit_path_topology_for_non_branching_geometry():
@@ -266,7 +468,7 @@ def test_tree_peps_layout_finder_returns_a_plan_for_all_consumers():
     plan = finder.run()
 
     assert isinstance(plan, TreePepsPlan)
-    assert plan.max_degree <= 3
+    assert plan.max_degree <= 4
     assert finder.plan is plan
     assert finder.report["tree_edges"] == plan.tree_edges
     state = TreePeps.from_plan(plan)
@@ -290,3 +492,37 @@ def test_tree_peps_layout_finder_compares_fixed_traversal_seeds():
     assert finder.report["seed_modes"] == ("inside-out",)
     assert finder.report["n_candidates"] >= 1
     assert finder.report["selected_seed"] in {"source", "inside-out", "refined"}
+
+
+def test_tree_peps_layout_finder_accepts_canonical_span_map_mode():
+    finder = TreePepsLayoutFinder(
+        (4, 4),
+        interactions=[],
+        map_mode="span-out",
+        max_iter=0,
+    )
+
+    plan = finder.run(refine=False)
+
+    assert finder.map_mode == "span-out"
+    assert plan.map_mode == "span-out"
+    assert finder.report["map_mode"] == "span-out"
+
+
+@pytest.mark.parametrize("coarse_grain", ((1, 2), (2, 2)))
+def test_tree_peps_layout_finder_accepts_legacy_coarse_map_modes(coarse_grain):
+    finder = TreePepsLayoutFinder(
+        (4, 4),
+        interactions=[],
+        map_mode="coarse-alternate-x",
+        coarse_grain=coarse_grain,
+        max_iter=0,
+    )
+
+    plan = finder.run(refine=False)
+
+    assert finder.seed_modes == ("coarse-alternate-x",)
+    assert finder.coarse_grain == coarse_grain
+    assert plan.map_mode == "coarse-alternate-x"
+    assert plan.coarse_grain == coarse_grain
+    assert finder.report["coarse_grain"] == coarse_grain

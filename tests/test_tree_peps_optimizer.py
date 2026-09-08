@@ -733,6 +733,44 @@ def test_optimizer_compresses_only_the_requested_span_and_reports_scope():
     assert optimizer.last_report["touched_edges"]
 
 
+def test_tree_peps_optimizer_batches_validation_across_span_edges(monkeypatch):
+    """Localized optimizer compression validates after, not during, its sweep."""
+    plan = TreePepsPlan.from_shape((2, 3), tree_order="row-major")
+    events = []
+    original_validate = TreePeps.validate
+    original_edge = TreePeps._compress_edge_inplace
+
+    def capture_validate(self, *args, **kwargs):
+        events.append(("validate", kwargs.get("check_canonical", False)))
+        return original_validate(self, *args, **kwargs)
+
+    def capture_edge(self, *args, **kwargs):
+        events.append(("edge", kwargs.get("_validate", True)))
+        return original_edge(self, *args, **kwargs)
+
+    monkeypatch.setattr(TreePeps, "validate", capture_validate)
+    monkeypatch.setattr(TreePeps, "_compress_edge_inplace", capture_edge)
+    optimizer = TreePepsOptimizer(
+        TreePeps.rand(plan, bond_dim=2, seed=47),
+        chi=1,
+        cutoff=0.0,
+        track_infidelity=False,
+        run=False,
+    )
+    events.clear()
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    edge_positions = [i for i, event in enumerate(events) if event[0] == "edge"]
+    assert edge_positions
+    assert all(events[i][1] is False for i in edge_positions)
+    for first, second in zip(edge_positions, edge_positions[1:]):
+        assert not any(
+            event[0] == "validate" for event in events[first + 1 : second]
+        )
+    assert any(event == ("validate", True) for event in events)
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
 def test_optimizer_run_supports_norm_controls_and_profile_report():
     plan = _path_plan((1, 2))
     scale = np.diag([2.0, 1.0])

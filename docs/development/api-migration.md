@@ -35,6 +35,8 @@ New code and documentation should use the canonical import on the right.
 | `pepsy.optimizers.stabilizer_tn.StabilizerMps` | `pepsy.optimizers.stabilizer_tn.MpsStabOptimizer` |
 | `pepsy.experimental.mera` | `pepsy.experimental.qmera` |
 | `pepsy.optimizers.mera` | `pepsy.optimizers.qmera` |
+| `ham_tn.build_mpo(...)` | `ham_tn.to_mpo(...)` |
+| `ham_tn.build_pepo(...)` | `ham_tn.to_pepo(...)` |
 
 These aliases emit `DeprecationWarning` when resolved. Applications can make
 the transition visible in CI with:
@@ -52,11 +54,17 @@ deprecation window. The root-level compatibility facade is governed by
 [`api-manifest.txt`](api-manifest.txt) and remains unchanged until that
 review.
 
-## Tree operator chain conversion
+## Tree operator conversion
 
-The Tree-specific `tree_mpo(...)` builder and `TreePlan.to_mpo(...)` alias are
-not part of the native Tree API. Build a native operator with
-`TreePlan.build_tree_operator(...)` or `Fermion.build_tree_operator(...)`.
-When a one-dimensional Quimb `MatrixProductOperator` is explicitly needed,
-convert at the model level with `Fermion.to_mpo(...)` or
-`SymHamiltonian.to_mpo(...)`.
+The canonical model-facing conversion methods are `ham_tn.to_mpo(...)`,
+`ham_tn.to_pepo(...)`, `ham_tn.to_tree_mpo(...)`, and
+`ham_tn.to_tree_pepo(...)`. The first two return Quimb chain/lattice operator
+networks; the latter two factor directly over a supplied `TreePlan` or
+`TreePepsPlan` without creating a chain MPO. `to_treempo` and
+`to_treepepsmpo` are short compatibility aliases for the native tree methods.
+
+`ham_tn.build_mpo(...)` and `ham_tn.build_pepo(...)` remain available as
+deprecated wrappers and emit `DeprecationWarning`. The lower-level native
+routes `TreePlan.build_tree_operator(...)` and
+`Fermion.build_tree_operator(...)` remain available when a model object is
+already in hand.

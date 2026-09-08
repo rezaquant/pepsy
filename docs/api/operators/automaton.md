@@ -61,6 +61,15 @@ removes channels that are unreachable from either boundary without changing
 any accepted operator path. Numerical bond compression remains an explicit
 follow-up on the returned Quimb MPO.
 
+The model-facing `ham_tn.to_mpo(...)` builder adds one dense-only structural
+pass after its automaton or term assembly. It removes exact proportional and
+roundoff-safe linearly dependent boundary channels before the optional Quimb
+SVD, then keeps the existing public `compress`, `max_bond`, and backend
+behavior. This is the deparallelization/delinearization stage; the explicit
+`MPOAutomaton.to_mpo()` method above remains a raw, inspection-friendly
+materialization. Non-NumPy tensors, including Torch and native Symmray data,
+continue through their existing backend-aware paths.
+
 The existing channel/transition tuple representation can be wrapped with
 `MPOAutomaton.from_legacy(...)` and emitted with `to_legacy()`. This allows the
 current Symmray MPO assembly code to adopt the common structural model without

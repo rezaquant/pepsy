@@ -45,6 +45,28 @@ turn MPO evolution into an MPS-only `mix`, `su`, `perm`, or `swap` algorithm.
 On a native Symmray MPO, all of these aliases intentionally select the
 existing block-aware SVD path so no dense auxiliary MPO is constructed.
 
+For dense local-term construction, `ham_tn.to_mpo(...)` performs a small
+structural deparallelization/delinearization sweep before the requested Quimb
+compression. In the shared automaton route this follows exact
+prefix/future-channel sharing; in `compress="term"` mode it runs before every
+per-term SVD, preventing each direct-sum addition from carrying redundant
+channels into the next compression. The pass is exact to floating-point
+roundoff, runs only for NumPy-backed operator tensors, and is skipped for
+Torch/autodiff and native Symmray data so their backend metadata and gradients
+remain intact. The same builder policy also applies when the result is
+converted with `to_pepo(...)`.
+
+The public `ham_tn.to_*` builders default to `compress="term"`: terms are
+accumulated and compressed one at a time. Pass `compress=True` or
+`compress="auto"` to request the workload-aware route, or
+`compress="automaton"` to force finite-state assembly.
+
+Pass `progbar=True` to `ham_tn.to_mpo(...)` (or `to_pepo(...)`) for an
+MPS-style construction bar. In a term-by-term build, it advances once per
+term and displays `chi=current/cap`; `peak` reports a temporarily larger
+direct-sum bond before that term's compression. The default is `False`, so
+existing output remains quiet.
+
 For an explicit neutral term collection, arbitrary one- or multi-site support
 is accepted:
 

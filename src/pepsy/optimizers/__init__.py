@@ -56,6 +56,8 @@ _SYMBOL_MODULES = {
     "TreePepsPlan": ".tree_peps",
     "TreePepsGeometry": ".tree_peps",
     "TreePepsLayoutFinder": ".tree_peps",
+    "TreePEPO": ".tree_peps",
+    "TreeSubPEPO": ".tree_peps",
     "TreePepo": ".tree_peps",
     "TreeSubPepo": ".tree_peps",
     "TreePepsOptimizer": ".tree_peps",

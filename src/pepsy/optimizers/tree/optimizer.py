@@ -49,6 +49,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ..._internal.cutoff import dtype_auto_cutoff
 from ...fitting import TreeFIT
 from ...fitting.tree import (
     _build_layered_operator_state_target,
@@ -673,12 +674,7 @@ class TreeOptimizer:
     def _resolve_cutoff(self, value):
         """Return a validated truncation cutoff, including ``"auto"``."""
         if value == "auto":
-            dtype = str(self.backend_dtype).lower()
-            if "16" in dtype:
-                return 1.0e-3
-            if "32" in dtype or "complex64" in dtype:
-                return 1.0e-6
-            return 1.0e-12
+            return dtype_auto_cutoff(self.backend_dtype)
         try:
             value = float(value)
         except (TypeError, ValueError) as exc:
@@ -715,6 +711,7 @@ class TreeOptimizer:
                  star_frac=0.75, layout_objective="congestion",
                  layout_weight_mode="count", layout_time_decay=None,
                  layout_time_window=None, layout=None, tree=None,
+                 map_mode=None,
                  root_qubit=None,
                  dtype=complex, threads=1, subtree_workers=1, seed=None,
                  run=True, tn=None,
@@ -730,6 +727,10 @@ class TreeOptimizer:
         # iterator and silently degrade to an interaction-free layout.
         if hasattr(gates, "__next__"):
             gates = list(gates)
+        if map_mode is not None and (layout is not None or tree is not None):
+            raise TypeError(
+                "map_mode cannot be combined with an explicit tree or layout"
+            )
         layout_top_arity = (
             layout.top_arity if isinstance(layout, TreeLayoutFinder) else None
         )
@@ -2092,6 +2093,7 @@ class TreeOptimizer:
                 "n_qubits": self.n,
                 "root": self.plan.root,
                 "root_qubit": self.plan.root_qubit,
+                "map_mode": self.plan.map_mode,
                 "top_arity": self.plan.top_arity,
                 "is_binary": self.plan.is_binary(),
                 "is_strictly_binary": self.plan.is_strictly_binary(),
@@ -7910,7 +7912,7 @@ class TreeOptimizer:
                          max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
                          lattice_shape=None, lattice_site=None,
                          coarse_grain=(2, 1),
-                         order=None):
+                         order=None, map_mode=None):
         """Return the :class:`TreePlan` a :class:`TreeLayoutFinder` would use."""
         return TreeLayoutFinder(
             gates=gates, n=n, structure=structure,
@@ -7926,6 +7928,7 @@ class TreeOptimizer:
             lattice_site=lattice_site,
             coarse_grain=coarse_grain,
             order=order,
+            map_mode=map_mode,
         ).run()
 
     @classmethod

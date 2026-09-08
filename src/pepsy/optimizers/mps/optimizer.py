@@ -82,6 +82,7 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting.local import FIT
+from ..._internal.cutoff import dtype_auto_cutoff
 from ..._internal.random import backend_random_array
 from ..._internal.quimb import (
     quimb_1d_compression_method_available as _quimb_compression_method_available,  # noqa: F401
@@ -8859,12 +8860,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _resolve_cutoff(self, value):
         """Return a validated truncation cutoff, including ``"auto"``."""
         if value == "auto":
-            dtype = str(self.backend_dtype).lower()
-            if "16" in dtype:
-                return 1.0e-3
-            if "32" in dtype or "complex64" in dtype:
-                return 1.0e-6
-            return 1.0e-12
+            return dtype_auto_cutoff(self.backend_dtype)
         try:
             value = float(value)
         except (TypeError, ValueError) as exc:

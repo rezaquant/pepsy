@@ -11,6 +11,7 @@ from time import perf_counter
 import autoray as ar
 import numpy as np
 
+from ..._internal.cutoff import dtype_auto_cutoff
 from ...backends import (
     backend_infer,
     backend_signatures_compatible,
@@ -135,7 +136,7 @@ class TreePepsOptimizer:
         fit_overlap_diagnostics=False,
         chi=64,
         max_bond=None,
-        cutoff=1e-10,
+        cutoff="auto",
         cutoff_mode="rsum2",
         reduced=True,
         inplace=False,
@@ -234,7 +235,7 @@ class TreePepsOptimizer:
         if max_bond is not None:
             chi = max_bond
         self.chi = self._normalize_max_bond(chi)
-        self.cutoff = self._normalize_cutoff(cutoff)
+        self.cutoff = cutoff
         self.cutoff_mode = cutoff_mode
         self.reduced = bool(reduced)
         self.info_c = info_c
@@ -273,6 +274,7 @@ class TreePepsOptimizer:
         self.state = state if self.inplace else state.copy()
         self.state.validate()
         self.backend_info()
+        self.cutoff = self._normalize_cutoff(self.cutoff)
         self._sync_info()
         self._gate_stream = ()
 
@@ -369,13 +371,12 @@ class TreePepsOptimizer:
             raise ValueError(f"{name} must be a positive integer or None")
         return value
 
-    @staticmethod
-    def _normalize_cutoff(cutoff):
+    def _normalize_cutoff(self, cutoff):
         if cutoff is None:
             return 1e-10
         if isinstance(cutoff, str):
             if cutoff.strip().lower() == "auto":
-                return 1e-10
+                return dtype_auto_cutoff(self.backend_dtype)
             raise ValueError("cutoff must be a non-negative number or 'auto'")
         cutoff = float(cutoff)
         if not np.isfinite(cutoff) or cutoff < 0.0:
@@ -663,6 +664,8 @@ class TreePepsOptimizer:
             "root_coordinate": self.plan.coordinate(self.plan.root),
             "order": self.plan.order,
             "tree_order": self.plan.tree_order,
+            "map_mode": self.plan.map_mode,
+            "coarse_grain": self.plan.coarse_grain,
             "topology": self.plan.topology,
             "tree_edges": self.plan.tree_edges,
             "max_virtual_degree": self.plan.max_virtual_degree,
@@ -681,17 +684,19 @@ class TreePepsOptimizer:
         supports=None,
         gates=None,
         terms=None,
-        max_virtual_degree=3,
+        max_virtual_degree=None,
         objective="hybrid",
         seed=0,
         max_iter=64,
         refine=True,
         order=None,
+        map_mode=None,
         tree_order=None,
         seed_modes=None,
         tree_orders=None,
         root=None,
         topology=None,
+        coarse_grain=None,
     ):
         """Return a workload-aware :class:`TreePepsPlan`.
 
@@ -718,11 +723,13 @@ class TreePepsOptimizer:
             seed=seed,
             max_iter=max_iter,
             order=order,
+            map_mode=map_mode,
             tree_order=tree_order,
             seed_modes=seed_modes,
             tree_orders=tree_orders,
             root=root,
             topology=topology,
+            coarse_grain=coarse_grain,
         )
         return finder.run(refine=refine)
 
@@ -2277,6 +2284,7 @@ class TreePepsOptimizer:
         cutoff_mode=None,
         compression_mode=None,
         compression_seed=None,
+        order="rank",
     ):
         """Compress the whole tree or only a selected gate-like span.
 
@@ -2284,6 +2292,8 @@ class TreePepsOptimizer:
         used after a gate update. It canonicalizes only the minimal requested
         span when ``span=True`` and leaves exterior virtual bonds untouched.
         With no sites, the complete tree is compressed toward ``center``.
+        ``order="rank"`` uses live tree dimensions to choose the next branch;
+        ``order="depth"`` retains the deterministic farthest-first schedule.
         """
 
         max_bond = self.chi if max_bond is _UNSET else self._normalize_max_bond(max_bond)
@@ -2309,6 +2319,7 @@ class TreePepsOptimizer:
                     self.compression_seed
                     if compression_seed is None else compression_seed
                 ),
+                order=order,
                 info_c=self.info_c,
             )
         else:
@@ -2327,6 +2338,7 @@ class TreePepsOptimizer:
                     self.compression_seed
                     if compression_seed is None else compression_seed
                 ),
+                order=order,
                 inplace=True,
                 info_c=self.info_c,
             )

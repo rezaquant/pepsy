@@ -796,6 +796,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return self._plan
 
     @property
+    def map_mode(self):
+        """Canonical geometric label for the tree's leaf layout."""
+
+        return self.plan.map_mode
+
+    @property
     def top_arity(self):
         """Number of virtual child bonds entering the structural root."""
         return self._plan.top_arity
@@ -3077,7 +3083,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                    max_arity=2, community_frac=0.35, star_frac=0.75,
                    dtype=complex, site_tag_id="I{}", site_ind_id="k{}",
                    node_tag_id="N{}", root_qubit=None,
-                   top_arity=_DEFAULT_TOP_ARITY):
+                   top_arity=_DEFAULT_TOP_ARITY, map_mode=None):
         """Build a product state on a tree partitioned from ``order``.
 
         Convenience wrapper that first builds a :class:`TreePlan` with
@@ -3092,6 +3098,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             max_arity=max_arity, community_frac=community_frac,
             star_frac=star_frac, root_qubit=root_qubit,
             top_arity=top_arity,
+            map_mode=map_mode,
         )
         return cls.from_plan(
             plan,

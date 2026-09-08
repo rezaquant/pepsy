@@ -11,6 +11,7 @@ import autoray as ar
 import numpy as np
 import quimb
 import quimb.tensor as qtn
+from .._internal.cutoff import dtype_auto_cutoff
 from .._internal.formatting import (
     ansi_wrap,
     coerce_integral_tuple,
@@ -21,6 +22,10 @@ from .._internal.formatting import (
 )
 from ..tensors.core import OneDMap
 from ..tensors.bonds import new_native_bond
+from ._structural_compression import (
+    _structural_compress_mpo,
+    _structural_compress_tree,
+)
 from .mpo_automaton import MPOAutomaton
 
 __all__ = [
@@ -43,6 +48,202 @@ _DENSE_MPO_COMPRESS_KEYS = frozenset({
 })
 
 
+class _InheritBackend:
+    """Signature-friendly sentinel for inheriting the builder backend."""
+
+    def __repr__(self):
+        return "inherit"
+
+
+_DEFAULT_BACKEND = _InheritBackend()
+
+
+class _InheritMaxBond:
+    """Signature-friendly sentinel for inheriting the builder bond cap."""
+
+    def __repr__(self):
+        return "inherit"
+
+
+_DEFAULT_MAX_BOND = _InheritMaxBond()
+
+
+class _DefaultTermCompression(str):
+    """Signature-friendly sentinel for the term-by-term builder default."""
+
+    def __new__(cls):
+        return super().__new__(cls, "term")
+
+
+_DEFAULT_COMPRESSION = _DefaultTermCompression()
+
+
+def _normalize_map_mode_name(mode):
+    """Normalize a public geometric mapping spelling for tree dispatch."""
+    if not isinstance(mode, str):
+        raise TypeError("map_mode must be a string or None.")
+    return mode.strip().lower().replace("_", "-")
+
+
+def _tree_base_map_mode(mode):
+    """Return the regular ``OneDMap`` mode behind a tree coarse preset."""
+    mode = _normalize_map_mode_name(mode)
+    if mode.startswith("coarse-"):
+        mode = mode[len("coarse-"):]
+    return mode
+
+
+def _normalize_build_mode(mode, *, tree=False):
+    """Normalize the public term-building/compression strategy."""
+    if not isinstance(mode, str):
+        raise TypeError("mode must be a string.")
+    mode = mode.strip().lower().replace("-", "_")
+    if tree:
+        aliases = {
+            "term": "term",
+            "terms": "term",
+            "sequential": "term",
+            "analytic": "analytic",
+            "automaton": "analytic",
+            "automata": "analytic",
+            "auto": "auto",
+            "direct": "analytic",
+            "direct_sum": "analytic",
+        }
+        try:
+            return aliases[mode]
+        except KeyError as exc:
+            raise ValueError(
+                "mode must be 'term' or 'analytic' (aliases: 'auto' and "
+                "'automaton')."
+            ) from exc
+    aliases = {
+        "term": "term",
+        "terms": "term",
+        "sequential": "term",
+        "automaton": "automaton",
+        "automata": "automaton",
+        "analytic": "automaton",
+        "auto": "auto",
+    }
+    return aliases.get(mode, mode)
+
+
+def _resolve_compression_request(compress, mode=None, *, tree=False):
+    """Resolve the canonical ``compress=`` conversion API.
+
+    ``compress`` is normally a boolean.  The string forms are a compact
+    strategy spelling: ``compress="term"`` selects sequential terms and
+    ``compress="automaton"`` selects the finite-state/analytic route.
+    ``mode=`` remains a compatibility alias for callers using the older
+    separate strategy keyword.
+    """
+    if compress is _DEFAULT_COMPRESSION:
+        # Keep ``mode=`` usable when the public ``compress`` argument is
+        # omitted, while making the new public default explicitly term-wise.
+        compress = True
+        if mode is None:
+            mode = "term"
+    elif isinstance(compress, str):
+        mode = compress
+        compress = True
+    elif compress is None:
+        compress = True
+    elif not isinstance(compress, (bool, np.bool_)):
+        raise TypeError(
+            "compress must be a bool, None, or the strategy string "
+            "'term'/'automaton'/'auto'."
+        )
+    if mode is None:
+        # A boolean is deliberately only the compression switch.  The
+        # explicit boolean route remains workload-aware for compatibility.
+        mode = "auto"
+    return _normalize_build_mode(mode, tree=tree), bool(compress)
+
+
+def _normalize_optional_max_bond(value, *, name="max_bond"):
+    """Normalize an optional operator bond cap.
+
+    ``None`` and ``False`` explicitly disable numerical bond compression.
+    The caller uses ``_DEFAULT_MAX_BOND`` when it wants to inherit the
+    builder-level cap instead.
+    """
+    if value is None or value is False:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a positive integer, None, or False.")
+    if not isinstance(value, Integral):
+        raise TypeError(f"{name} must be a positive integer, None, or False.")
+    value = int(value)
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1.")
+    return value
+
+
+def _resolve_max_bond(value, default):
+    """Resolve a conversion bond cap, preserving explicit no-cap values."""
+    if value is _DEFAULT_MAX_BOND:
+        value = default
+    return _normalize_optional_max_bond(value)
+
+
+_OPERATOR_PROGBAR_COLOR = "#2ca02c"
+
+
+def _make_operator_progress(progbar, total, *, desc):
+    """Create an MPS-style operator-construction progress bar."""
+    if not progbar:
+        return None
+    from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+    return tqdm(
+        total=total,
+        desc=desc,
+        leave=True,
+        position=0,
+        ascii=True,
+        colour=_OPERATOR_PROGBAR_COLOR,
+    )
+
+
+def _operator_max_bond(operator):
+    """Read an operator's current maximum virtual bond safely."""
+    try:
+        return int(operator.max_bond())
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _set_operator_progress_postfix(progress_bar, operator, *, cap, peak=None):
+    """Show current/capped ``chi`` and any pre-compression peak."""
+    if progress_bar is None:
+        return
+    current = _operator_max_bond(operator)
+    postfix = {
+        "chi": (
+            f"{current}/{cap}"
+            if current is not None and cap is not None
+            else current if current is not None else "?"
+        ),
+    }
+    if peak is not None and current is not None and peak > current:
+        postfix["peak"] = peak
+    progress_bar.set_postfix(postfix)
+
+
+def _advance_operator_progress(progress_bar, operator, *, cap, peak=None):
+    """Update an operator-construction progress bar after one work unit."""
+    if progress_bar is None:
+        return
+    _set_operator_progress_postfix(
+        progress_bar,
+        operator,
+        cap=cap,
+        peak=peak,
+    )
+    progress_bar.update(1)
+
+
 class ham_tn:
     """Build MPO Hamiltonians from local terms on a mapped lattice.
 
@@ -62,11 +263,13 @@ class ham_tn:
     Lz : int | None, default=None
         Optional number of lattice sites along z. When provided, terms can
         use 3D coordinates ``(x, y, z)`` and the 1D mapping is built in 3D.
-    max_bond : int, default=256
-        Compression cap used after each term addition.
-    cutoff : float | {"auto"}, default=1e-12
-        Compression cutoff used after each term addition. ``"auto"`` selects
-        the same dtype-aware cutoff policy as :class:`MpsOptimizer`.
+    max_bond : int | None | False, default=256
+        Compression cap used after term additions or final assembly. ``None``
+        and ``False`` disable numerical compression for conversions.
+    cutoff : float | {"auto"}, default="auto"
+        Compression cutoff used by the selected numerical compression sweep.
+        ``"auto"`` selects the same dtype-aware cutoff policy as
+        :class:`MpsOptimizer`.
     cutoff_mode : str | {"auto"} | None, default=None
         Singular-value cutoff mode used after each term addition. ``"auto"``
         resolves to Pepsy's ordinary ``"rsum2"`` policy. ``None`` preserves
@@ -85,6 +288,9 @@ class ham_tn:
     mapper : pepsy.tensors.core.OneDMap | None, default=None
         Optional preconfigured lattice mapper. When omitted, a default
         ``OneDMap(Lx, Ly, Lz=Lz, mode="snake")`` is constructed.
+    map_mode : str | None, default=None
+        Shorthand for constructing the stored ``OneDMap`` with a named
+        traversal. This cannot be combined with ``mapper``.
 
     Attributes
     ----------
@@ -94,6 +300,8 @@ class ham_tn:
         Inverse mapping from lattice coordinate to 1D index.
     mapper : pepsy.tensors.core.OneDMap
         Stored mapping helper instance used to build ``map`` and ``map_inv``.
+    map_mode : str
+        Canonical name of the stored ``OneDMap`` traversal.
     """
 
     @staticmethod
@@ -167,11 +375,12 @@ class ham_tn:
         L_z=None,
         max_bond=256,
         chi=None,
-        cutoff=1e-12,
+        cutoff="auto",
         cutoff_mode=None,
         data_type=None,
         to_backend=None,
         mapper=None,
+        map_mode=None,
     ):
         Lx, Ly, Lz = self._coalesce_dim_names(Lx=Lx, Ly=Ly, Lz=Lz, L_x=L_x, L_y=L_y, L_z=L_z)
         if shape is not None:
@@ -204,16 +413,15 @@ class ham_tn:
             dims_str = "Lx * Ly" if self.L_z is None else "Lx * Ly * Lz"
             raise ValueError(f"MPO construction requires {dims_str} >= 2.")
 
-        if not isinstance(max_bond, Integral):
-            raise TypeError("max_bond must be an integer.")
         if chi is not None:
-            if not isinstance(chi, Integral):
-                raise TypeError("chi must be an integer or None.")
-            if int(max_bond) != 256 and int(max_bond) != int(chi):
+            chi_limit = _normalize_optional_max_bond(chi, name="chi")
+            if (
+                max_bond not in (None, False, 256)
+                and _normalize_optional_max_bond(max_bond) != chi_limit
+            ):
                 raise TypeError("Pass only one of max_bond and chi, or use equal values.")
             max_bond = chi
-        if int(max_bond) < 1:
-            raise ValueError("max_bond must be >= 1.")
+        max_bond = _normalize_optional_max_bond(max_bond)
         if isinstance(cutoff, str):
             if cutoff.strip().lower() != "auto":
                 raise ValueError("cutoff must be 'auto' or a non-negative number.")
@@ -227,7 +435,7 @@ class ham_tn:
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None.")
 
-        self.max_bond = int(max_bond)
+        self.max_bond = max_bond
         self.cutoff = cutoff
         self.cutoff_mode = cutoff_mode
         self._data_type_explicit = data_type is not None
@@ -237,12 +445,14 @@ class ham_tn:
             else np.dtype("float64") if data_type is None else np.dtype(data_type)
         )
         self.to_backend = to_backend
+        if mapper is not None and map_mode is not None:
+            raise TypeError("Pass only one of mapper and map_mode.")
         if mapper is None:
             mapper = OneDMap(
                 self.Lx,
                 self.Ly,
                 Lz=self.Lz,
-                mode="snake",
+                mode="snake" if map_mode is None else map_mode,
             )
         elif not isinstance(mapper, OneDMap):
             raise TypeError("mapper must be a pepsy.tensors.core.OneDMap instance or None.")
@@ -274,7 +484,7 @@ class ham_tn:
         field=1.0,
         max_bond=256,
         chi=None,
-        cutoff=1e-12,
+        cutoff="auto",
         data_type=None,
         to_backend=None,
         mapper=None,
@@ -431,16 +641,26 @@ class ham_tn:
             )
         return self.map_inv[coord]
 
+    def _mapper_for_mode(self, map_mode):
+        """Build a per-conversion regular mapper without mutating the builder."""
+        if map_mode is None:
+            return self.mapper
+        return OneDMap(
+            self.Lx,
+            self.Ly,
+            Lz=self.Lz,
+            mode=map_mode,
+        )
+
+    def _tree_mapper_for_mode(self, map_mode):
+        """Build the coordinate mapper paired with a tree layout mode."""
+        return self._mapper_for_mode(_tree_base_map_mode(map_mode))
+
     @staticmethod
     def _resolve_cutoff(value, dtype):
         """Resolve a numeric or dtype-aware truncation cutoff."""
         if isinstance(value, str) and value.strip().lower() == "auto":
-            dtype_name = np.dtype(dtype).name.lower()
-            if "16" in dtype_name:
-                return 1.0e-3
-            if "32" in dtype_name or "complex64" in dtype_name:
-                return 1.0e-6
-            return 1.0e-12
+            return dtype_auto_cutoff(dtype)
         try:
             value = float(value)
         except (TypeError, ValueError) as exc:
@@ -824,30 +1044,33 @@ class ham_tn:
         self._swap_mpo_phys_inds_(mpo)
         return mpo, automaton
 
-    def build_mpo(
+    def to_mpo(
         self,
         ints=None,
         *,
         phys_dim=2,
-        max_bond=None,
+        max_bond=_DEFAULT_MAX_BOND,
         chi=None,
         cutoff=None,
         data_type=None,
-        compress_each=True,
+        compress=_DEFAULT_COMPRESSION,
+        compress_each=None,
         cutoff_mode=None,
         form=None,
         create_bond=False,
         compress_opts=None,
-        mode="term",
-        to_backend=None,
+        mode=None,
+        to_backend=_DEFAULT_BACKEND,
         mapper=None,
+        map_mode=None,
         fermion=None,
         edges=None,
         fermionic=None,
         charge_sectors=False,
+        progbar=False,
         **model_params,
     ):
-        """Build MPO from user interactions.
+        """Convert user interactions to a one-dimensional MPO.
 
         Parameters
         ----------
@@ -866,9 +1089,10 @@ class ham_tn:
             support unambiguous.
         phys_dim : int, default=2
             On-site physical dimension.
-        max_bond : int | None, default=None
-            MPO compression max bond. Uses instance default when None.
-        chi : int | None, default=None
+        max_bond : int | None | False, default=inherit
+            MPO compression max bond. An omitted value inherits the builder
+            default; ``None`` or ``False`` disables numerical compression.
+        chi : int | None | False, default=None
             Alias for ``max_bond``. Supplying both is allowed only when they
             have the same value.
         cutoff : float | {"auto"} | None, default=None
@@ -877,8 +1101,19 @@ class ham_tn:
             ``1e-6`` for 32-bit/complex64 data, and ``1e-12`` otherwise.
         data_type : str | numpy.dtype | None, default=None
             Operator/MPO dtype. Uses instance default when None.
-        compress_each : bool, default=True
-            Compress after each term addition. If False, only compress once at end.
+        compress : bool | {"term", "automaton", "auto"}, default="term"
+            Whether to compress the result. The default ``"term"`` performs
+            sequential accumulation and compresses after every added term.
+            These numerical compressions run only when an effective bond cap
+            is set. ``True`` and ``"auto"`` select the workload-aware
+            automatic route for compatibility; ``"automaton"`` forces the
+            shared finite-state route. Automaton assembly is compressed once
+            after the complete sum.
+        compress_each : bool | None, default=None
+            Deprecated compatibility spelling for the old API. ``True``
+            compresses after each sequential term; ``False`` compresses once
+            after the complete sum. Prefer the strategy-bearing
+            ``compress=`` spelling.
         cutoff_mode : str | {"auto"} | None, default=None
             Cutoff mode forwarded to Quimb. ``"auto"`` resolves to ``"rsum2"``;
             None preserves Quimb's default.
@@ -892,27 +1127,34 @@ class ham_tn:
             ``method``, ``absorb``, ``renorm``, or ``info``. The explicit
             ``chi``, ``max_bond``, ``cutoff``, ``cutoff_mode``, ``form``, and
             ``create_bond`` arguments take precedence.
-        mode : {"term", "automaton", "auto"}, default="term"
-            ``"term"`` adds and compresses each term sequentially. The
-            ``"automaton"`` mode first compiles all terms through Pepsy's
-            finite-state MPO automaton and then compresses the resulting MPO.
-            ``"auto"`` selects the automaton when its estimated structural
-            width is reasonable, otherwise it falls back to sequential terms.
+        mode : str | None, default=None
+            Deprecated compatibility alias for selecting the build strategy.
+            Prefer ``compress="term"``, ``compress="automaton"``, or
+            ``compress="auto"``.
         to_backend : callable | None, default=None
             Optional per-build array converter. When omitted, the converter
-            configured on the builder is used. Generic MPO tensors are placed
-            on this backend before addition and compression. Native fermion
-            construction forwards it directly to the native builder.
+            configured on the builder is used; passing ``None`` explicitly
+            disables that converter for this build. Generic MPO tensors are
+            placed on this backend before addition and compression. Native
+            fermion construction forwards it directly to the native builder.
+        progbar : bool, default=False
+            Show an MPS-style ``tqdm`` progress bar. Term-by-term builds
+            advance once per term and report the current ``chi`` together
+            with any temporary pre-compression peak bond.
         mapper : pepsy.tensors.core.OneDMap | None, default=None
             Optional mapper override used only for this MPO build. When
             omitted, the builder's configured mapper is used.
+        map_mode : str | None, default=None
+            One-off ``OneDMap`` traversal override. This is shorthand for
+            ``mapper=OneDMap(..., mode=map_mode)`` and cannot be combined
+            with ``mapper``.
         fermion : pepsy.Fermion | None, default=None
             Optional native fermion model. When supplied, ``ints`` (or the
             explicit ``edges`` alias) is passed to ``fermion.build_mpo`` and
             the returned Symmray MPO keeps the model's U1/U1U1 symmetry.
         edges : sequence | None, default=None
             Explicit edge alias for the ``fermion=...`` form. For example,
-            ``builder.build_mpo(fermion=f, edges=edges, t=..., U=...)``.
+            ``builder.to_mpo(fermion=f, edges=edges, t=..., U=...)``.
         fermionic : bool | None, default=None
             Native graded encoding flag for the fermion-model form. ``None``
             and ``False`` select the Jordan-Wigner-compatible MPO builder;
@@ -937,14 +1179,21 @@ class ham_tn:
             fermion = ints
             ints = None
 
-        to_backend = self.to_backend if to_backend is None else to_backend
+        to_backend = self.to_backend if to_backend is _DEFAULT_BACKEND else to_backend
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None.")
+        if mapper is not None and map_mode is not None:
+            raise TypeError("Pass only one of mapper and map_mode.")
+        if map_mode is not None:
+            mapper = self._mapper_for_mode(map_mode)
 
         if chi is not None:
-            if not isinstance(chi, Integral):
-                raise TypeError("chi must be an integer or None.")
-            if max_bond is not None and int(max_bond) != int(chi):
+            chi_limit = _normalize_optional_max_bond(chi, name="chi")
+            if (
+                max_bond is not _DEFAULT_MAX_BOND
+                and max_bond not in (None, False)
+                and _normalize_optional_max_bond(max_bond) != chi_limit
+            ):
                 raise TypeError("Pass only one of max_bond and chi, or use equal values.")
             max_bond = chi
 
@@ -965,9 +1214,17 @@ class ham_tn:
 
         if "chi" in compress_extra:
             chi_extra = compress_extra.pop("chi")
-            if chi is not None and int(chi) != int(chi_extra):
+            chi_extra_limit = _normalize_optional_max_bond(chi_extra, name="chi")
+            if (
+                chi is not None
+                and _normalize_optional_max_bond(chi, name="chi") != chi_extra_limit
+            ):
                 raise TypeError("conflicting chi values supplied.")
-            if max_bond is not None and int(max_bond) != int(chi_extra):
+            if (
+                max_bond is not _DEFAULT_MAX_BOND
+                and max_bond not in (None, False)
+                and _normalize_optional_max_bond(max_bond) != chi_extra_limit
+            ):
                 raise TypeError("conflicting max_bond and chi values supplied.")
             max_bond = chi_extra
 
@@ -982,7 +1239,15 @@ class ham_tn:
                 "form": form,
                 "create_bond": create_bond,
             }[name]
-            if current is not None and current is not False and current != value:
+            if name == "max_bond":
+                if (
+                    current is not _DEFAULT_MAX_BOND
+                    and current not in (None, False)
+                    and _normalize_optional_max_bond(current)
+                    != _normalize_optional_max_bond(value)
+                ):
+                    raise TypeError(f"conflicting {name} values supplied.")
+            elif current is not None and current is not False and current != value:
                 raise TypeError(f"conflicting {name} values supplied.")
             if name == "max_bond":
                 max_bond = value
@@ -995,9 +1260,29 @@ class ham_tn:
             else:
                 create_bond = value
 
-        mode = str(mode).strip().lower().replace("-", "_")
+        legacy_compress_each = compress_each is not None
+        if (
+            legacy_compress_each
+            and compress is not _DEFAULT_COMPRESSION
+            and compress not in (None, True)
+        ):
+            raise TypeError("Pass only one of compress and compress_each.")
+        if legacy_compress_each:
+            compress_each = bool(compress_each)
+            compression_enabled = True
+            mode = _normalize_build_mode("term" if mode is None else mode)
+        else:
+            mode, compression_enabled = _resolve_compression_request(
+                compress,
+                mode,
+            )
+            # Automatic and automaton assembly are compressed once, after the
+            # complete sum. Only the explicit term strategy is incremental.
+            compress_each = compression_enabled and mode == "term"
         if mode not in {"term", "automaton", "auto"}:
-            raise ValueError("mode must be 'term', 'automaton', or 'auto'.")
+            raise ValueError(
+                "mode must be 'term', 'automaton', 'analytic', or 'auto'."
+            )
         mode_auto = mode == "auto"
 
         if fermion is not None:
@@ -1023,7 +1308,8 @@ class ham_tn:
                     "fermion must provide the Fermion.build_mpo interface."
                 )
             dtype = self.data_type if data_type is None else np.dtype(data_type)
-            max_bond_use = self.max_bond if max_bond is None else int(max_bond)
+            max_bond_use = _resolve_max_bond(max_bond, self.max_bond)
+            compression_active = compression_enabled and max_bond_use is not None
             cutoff_use = self._resolve_cutoff(
                 self.cutoff if cutoff is None else cutoff,
                 dtype,
@@ -1038,7 +1324,11 @@ class ham_tn:
                 mapper=mapper_use,
                 max_bond=max_bond_use,
                 cutoff=cutoff_use,
-                compress=bool(compress_each),
+                compress=(
+                    compression_active
+                    if not legacy_compress_each
+                    else compression_active and compress_each
+                ),
                 dtype=dtype,
                 fermionic=fermionic_use,
                 charge_sectors=charge_sectors,
@@ -1061,7 +1351,14 @@ class ham_tn:
             if data_type is None and to_backend is not None and not self._data_type_explicit
             else self.data_type if data_type is None else np.dtype(data_type)
         )
-        max_bond = self.max_bond if max_bond is None else int(max_bond)
+        max_bond = _resolve_max_bond(max_bond, self.max_bond)
+        compression_enabled = compression_enabled and max_bond is not None
+        if not legacy_compress_each:
+            # ``auto`` can become the term route after the structural width
+            # estimate, so derive the schedule from the selected route.
+            compress_each = compression_enabled and mode == "term"
+        else:
+            compress_each = compression_enabled and compress_each
         cutoff = self._resolve_cutoff(
             self.cutoff if cutoff is None else cutoff,
             dtype,
@@ -1069,8 +1366,6 @@ class ham_tn:
         cutoff_mode = self._resolve_cutoff_mode(
             self.cutoff_mode if cutoff_mode is None else cutoff_mode,
         )
-        if max_bond < 1:
-            raise ValueError("max_bond must be >= 1.")
         if cutoff < 0.0:
             raise ValueError("cutoff must be >= 0.")
 
@@ -1102,6 +1397,8 @@ class ham_tn:
 
         automaton_records = None
         automaton = None
+        structural_applied = False
+        progress_bar = None
         if mode in {"automaton", "auto"}:
             automaton_records = builder._normalize_automaton_terms(
                 tuple(ints),
@@ -1113,7 +1410,7 @@ class ham_tn:
                 # term-by-term route will be substantially smaller.  The
                 # estimate is conservative for repeated prefixes, so common
                 # nearest-neighbour structures still select the automaton.
-                auto_bond_limit = max(64, 4 * max_bond)
+                auto_bond_limit = max(64, 4 * (max_bond or 256))
                 estimated_bonds = builder._estimate_automaton_bond_dimensions(
                     automaton_records,
                     phys_dim=phys_dim,
@@ -1125,16 +1422,38 @@ class ham_tn:
                     mode = "automaton"
 
             if mode == "automaton":
+                progress_bar = _make_operator_progress(
+                    progbar,
+                    1,
+                    desc="mpo",
+                )
                 mpo_total, automaton = builder._build_mpo_from_automaton(
                     automaton_records,
                     phys_dim=phys_dim,
                 )
-                if mode_auto and max(automaton.bond_dimensions, default=1) > auto_bond_limit:
-                    mode = "term"
-                else:
-                    if to_backend is not None:
-                        builder._apply_to_backend(mpo_total, to_backend)
+                if to_backend is not None:
+                    builder._apply_to_backend(mpo_total, to_backend)
+                elif automaton is not None:
+                    # Remove exact boundary dependencies before the optional
+                    # numerical sweep. This is the dense analogue of
+                    # deparallelization/delinearization and leaves the
+                    # public builder API and automaton route unchanged.
+                    _structural_compress_mpo(
+                        mpo_total,
+                        method="auto",
+                    )
+                    structural_applied = True
+                peak_bond = _operator_max_bond(mpo_total)
+                if compression_enabled:
                     mpo_total.compress(**compress_options)
+                _advance_operator_progress(
+                    progress_bar,
+                    mpo_total,
+                    cap=max_bond,
+                    peak=peak_bond,
+                )
+                if progress_bar is not None:
+                    progress_bar.close()
 
         if mode == "term":
             term_iter = (
@@ -1142,24 +1461,78 @@ class ham_tn:
                 if automaton_records is not None
                 else ints
             )
+            progress_bar = _make_operator_progress(
+                progbar,
+                len(term_iter) if hasattr(term_iter, "__len__") else None,
+                desc="mpo-term",
+            )
             mpo_total = builder._zero_mpo(phys_dim=phys_dim, dtype=dtype)
             if to_backend is not None:
                 builder._apply_to_backend(mpo_total, to_backend)
+            peak_bond = None
             for term in term_iter:
                 mpo_term = builder._term_to_mpo(term, phys_dim=phys_dim, dtype=dtype)
                 if to_backend is not None:
                     builder._apply_to_backend(mpo_term, to_backend)
                 mpo_total = mpo_total + mpo_term
-                if compress_each:
+                peak_bond = _operator_max_bond(mpo_total)
+                if compression_enabled and compress_each:
+                    if to_backend is None:
+                        # Sequential direct sums can recreate parallel
+                        # boundary channels at every addition. Reduce them
+                        # before paying for this term's numerical SVD.
+                        _structural_compress_mpo(
+                            mpo_total,
+                            method="auto",
+                        )
+                        structural_applied = True
                     mpo_total.compress(**compress_options)
+                _advance_operator_progress(
+                    progress_bar,
+                    mpo_total,
+                    cap=max_bond,
+                    peak=peak_bond,
+                )
 
-            if not compress_each:
+            if compression_enabled and not compress_each:
+                if to_backend is None:
+                    _structural_compress_mpo(
+                        mpo_total,
+                        method="auto",
+                    )
+                    structural_applied = True
                 mpo_total.compress(**compress_options)
+            _set_operator_progress_postfix(
+                progress_bar,
+                mpo_total,
+                cap=max_bond,
+                peak=peak_bond,
+            )
+            if progress_bar is not None:
+                progress_bar.close()
         if to_backend is not None:
             # Keep the return boundary explicit in case a backend operation
             # materialized an intermediate NumPy array.
             builder._apply_to_backend(mpo_total, to_backend)
+        elif not structural_applied:
+            # The explicit term route can also leave exact dependencies after
+            # its additions. This is a no-op for an already reduced network.
+            _structural_compress_mpo(mpo_total, method="auto")
         return mpo_total
+
+    def build_mpo(self, ints=None, **kwargs):
+        """Compatibility alias for :meth:`to_mpo`.
+
+        ``to_mpo`` describes the conversion boundary more accurately and is
+        the canonical spelling for new code.  Keep this wrapper rather than a
+        direct assignment so callers receive a useful migration warning.
+        """
+        warnings.warn(
+            "ham_tn.build_mpo is deprecated; use ham_tn.to_mpo instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.to_mpo(ints, **kwargs)
 
     def _add_missing_lattice_bonds_(self, pepo):
         """Add rank-1 bonds for lattice neighbours not already used by the 1D path."""
@@ -1275,45 +1648,65 @@ class ham_tn:
 
         return pepo
 
-    def build_pepo(
+    def to_pepo(
         self,
         ints=None,
         *,
         phys_dim=2,
-        max_bond=None,
+        max_bond=_DEFAULT_MAX_BOND,
         cutoff=None,
         data_type=None,
-        compress_each=True,
+        compress=_DEFAULT_COMPRESSION,
+        compress_each=None,
+        mode=None,
         cycle_peps=False,
         cycle_bond_dim=1,
         mapper=None,
+        map_mode=None,
         fermion=None,
         edges=None,
         fermionic=None,
         charge_sectors=False,
+        to_backend=_DEFAULT_BACKEND,
+        progbar=False,
         **model_params,
     ):
-        """Build a PEPO from interactions or a native fermion model.
+        """Convert interactions or a native fermion model to a PEPO.
 
-        The ``fermion=...``/``edges=...`` form mirrors :meth:`build_mpo` and
+        The ``fermion=...``/``edges=...`` form mirrors :meth:`to_mpo` and
         forwards ``mapper=OneDMap(...)`` and ``fermionic=True`` to the native
         fermion MPO builder before converting the result to a PEPO.
         With ``charge_sectors=True``, return ``{charge: pepo}`` for a mixed
-        native operator.
+        native operator. ``map_mode`` is a shorthand for a one-off regular
+        ``OneDMap`` override and cannot be combined with ``mapper``. The
+        per-call ``to_backend`` override follows :meth:`to_mpo`, including
+        explicit ``None`` to keep the result on NumPy/Symmray arrays.
+        ``compress`` and ``mode`` follow :meth:`to_mpo`; omitted ``compress``
+        defaults to ``"term"``. An omitted ``max_bond`` inherits the builder
+        cap; ``max_bond=None`` or ``False`` disables numerical compression.
+        The compatibility spelling
+        ``compress_each=`` remains accepted but is not used by new code.
+        ``progbar=True`` forwards the MPS-style construction progress bar to
+        :meth:`to_mpo`.
         """
-        self._require_2d("build_pepo")
-        mpo = self.build_mpo(
+        self._require_2d("to_pepo")
+        mpo = self.to_mpo(
             ints,
             phys_dim=phys_dim,
             max_bond=max_bond,
             cutoff=cutoff,
             data_type=data_type,
+            compress=compress,
             compress_each=compress_each,
+            mode=mode,
+            progbar=progbar,
             mapper=mapper,
+            map_mode=map_mode,
             fermion=fermion,
             edges=edges,
             fermionic=fermionic,
             charge_sectors=charge_sectors,
+            to_backend=to_backend,
             **model_params,
         )
         if isinstance(mpo, Mapping):
@@ -1332,6 +1725,924 @@ class ham_tn:
             cycle_bond_dim=cycle_bond_dim,
             inplace=False,
         )
+
+    def build_pepo(self, ints=None, **kwargs):
+        """Compatibility alias for :meth:`to_pepo`."""
+        warnings.warn(
+            "ham_tn.build_pepo is deprecated; use ham_tn.to_pepo instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.to_pepo(ints, **kwargs)
+
+    def _tree_site(self, plan, site, *, mapper=None):
+        """Resolve a Hamiltonian site against a native tree plan."""
+        if hasattr(plan, "coord_to_one_d"):
+            # TreePepsPlan owns the coordinate-to-logical-site mapping.  Do
+            # not silently replace it with this builder's OneDMap ordering.
+            resolved = plan.resolve_site(site)
+        else:
+            # TreePlan sites are logical qubit ids.  Coordinate terms use the
+            # conversion mapper because a plain TreePlan has no lattice map.
+            mapper = self.mapper if mapper is None else mapper
+            if isinstance(site, Integral):
+                resolved = int(site)
+            else:
+                coord = self._coerce_coord(site)
+                map_inv = self.map_inv if mapper is self.mapper else mapper.build()[1]
+                if coord not in map_inv:
+                    raise ValueError(
+                        f"Coordinate {coord} is outside lattice bounds "
+                        f"{self._coord_bounds_label()}."
+                    )
+                resolved = map_inv[coord]
+        if resolved < 0 or resolved >= self.L:
+            raise ValueError(
+                f"tree site {resolved} is outside the builder range [0, {self.L - 1}]."
+            )
+        return int(resolved)
+
+    def _normalize_tree_terms(self, plan, ints, *, phys_dim, dtype, mapper=None):
+        """Convert the public Hamiltonian term spellings to dense tree terms."""
+        if isinstance(ints, Mapping):
+            normalized = {}
+            for support, operator in ints.items():
+                raw_support = (support,) if isinstance(support, Integral) else tuple(support)
+                mapped_support = tuple(
+                    self._tree_site(plan, site, mapper=mapper) for site in raw_support
+                )
+                if len(set(mapped_support)) != len(mapped_support):
+                    raise ValueError("Duplicate sites in one tree term are not supported.")
+                array = self._as_matrix(operator)
+                matrix_shape = (phys_dim ** len(mapped_support),) * 2
+                tensor_shape = (phys_dim,) * (2 * len(mapped_support))
+                if array.shape == matrix_shape and len(mapped_support) > 1:
+                    array = array.reshape(tensor_shape)
+                elif array.shape not in {
+                    matrix_shape,
+                    tensor_shape,
+                }:
+                    raise ValueError(
+                        f"tree term on support {mapped_support!r} has shape {array.shape}, "
+                        f"expected {matrix_shape} or {tensor_shape}."
+                    )
+                key = mapped_support[0] if len(mapped_support) == 1 else mapped_support
+                normalized[key] = (
+                    np.asarray(array, dtype=dtype)
+                    if key not in normalized
+                    else normalized[key] + np.asarray(array, dtype=dtype)
+                )
+            if not normalized:
+                raise ValueError("tree term mapping must not be empty.")
+            return normalized
+
+        try:
+            terms = tuple(ints)
+        except TypeError as exc:
+            raise TypeError("tree terms must be a sequence or mapping.") from exc
+        if not terms:
+            raise ValueError("tree terms must not be empty.")
+
+        normalized = {}
+        for term in terms:
+            sites, operators, coeff = self._parse_term(term)
+            mapped_support = tuple(
+                self._tree_site(plan, site, mapper=mapper) for site in sites
+            )
+            if len(set(mapped_support)) != len(mapped_support):
+                raise ValueError("Duplicate sites in one tree term are not supported.")
+            local_ops = tuple(
+                self._coerce_op(operator, phys_dim=phys_dim, dtype=dtype)
+                for operator in operators
+            )
+            dense = local_ops[0]
+            for operator in local_ops[1:]:
+                dense = np.kron(dense, operator)
+            dense = coeff * dense
+            if np.iscomplexobj(dense) and not np.issubdtype(
+                np.dtype(dtype), np.complexfloating
+            ) and not np.allclose(np.imag(dense), 0.0):
+                raise ValueError(
+                    "Complex-valued tree term requires complex data_type "
+                    f"(got {np.dtype(dtype)})."
+                )
+            if len(mapped_support) > 1:
+                dense = dense.reshape((phys_dim,) * (2 * len(mapped_support)))
+            dense = np.asarray(dense, dtype=dtype)
+            key = mapped_support[0] if len(mapped_support) == 1 else mapped_support
+            normalized[key] = (
+                dense if key not in normalized else normalized[key] + dense
+            )
+        return normalized
+
+    @staticmethod
+    def _apply_tree_backend(operator, to_backend):
+        """Convert all native tree-operator arrays to the requested backend."""
+        if to_backend is None:
+            return operator
+        networks = getattr(operator, "tree_networks", (operator,))
+        for network in networks:
+            network.apply_to_arrays(to_backend)
+        return operator
+
+    def _validate_tree_plan(self, plan, *, tree_peps=False):
+        """Validate a tree plan against this builder's site count and shape."""
+        expected_size = self.L
+        actual_size = getattr(plan, "size", None) if tree_peps else getattr(plan, "n", None)
+        if actual_size != expected_size:
+            name = "TreePepsPlan" if tree_peps else "TreePlan"
+            raise ValueError(
+                f"{name} has {actual_size} physical sites, expected {expected_size}."
+            )
+        if tree_peps:
+            expected_shape = (self.Lx, self.Ly) if self.Lz is None else (
+                self.Lx, self.Ly, self.Lz
+            )
+            if tuple(plan.shape) != expected_shape:
+                raise ValueError(
+                    f"TreePepsPlan shape {tuple(plan.shape)!r} does not match "
+                    f"builder shape {expected_shape!r}."
+                )
+        return plan
+
+    def _tree_plan_from_map_mode(self, map_mode):
+        """Build a default binary TreePlan for a geometric map mode."""
+        from ..optimizers.tree.layout import TreeLayoutFinder, TreePlan
+
+        mode = self.map_mode if map_mode is None else map_mode
+        mapper = self._tree_mapper_for_mode(mode)
+        _, map_inv = mapper.build()
+
+        def site(*coordinate):
+            return map_inv[tuple(coordinate)]
+
+        if self.Lz is None:
+            order = TreeLayoutFinder.lattice_order(
+                self.Lx,
+                self.Ly,
+                mode=mode,
+                site=site,
+            )
+        else:
+            order = TreeLayoutFinder.lattice_order(
+                self.Lx,
+                self.Ly,
+                Lz=self.Lz,
+                mode=mode,
+                site=site,
+            )
+        # TreePlan's defaults are the intended simple path: quality layout,
+        # binary internal nodes, and the standard top arity.
+        mode_name = _normalize_map_mode_name(mode)
+        tree_map_mode = mode_name if mode_name.startswith("coarse-") else None
+        return TreePlan.from_order(order, map_mode=tree_map_mode), mapper
+
+    def _raw_tree_term_supports(self, ints):
+        """Return public term supports without touching their operator data."""
+        if isinstance(ints, Mapping):
+            entries = ints.keys()
+            supports = []
+            for support in entries:
+                support = (support,) if isinstance(support, Integral) else tuple(support)
+                if not support:
+                    raise ValueError("tree term supports must not be empty.")
+                supports.append(support)
+            return tuple(supports)
+        try:
+            return tuple(
+                tuple(sites)
+                for sites, _ops, _coeff in (
+                    self._parse_term(term) for term in tuple(ints)
+                )
+            )
+        except TypeError as exc:
+            raise TypeError("tree terms must be a sequence or mapping.") from exc
+
+    def _auto_tree_mpo_plan(self, ints, *, max_bond):
+        """Choose a TreePlan from the operator support hypergraph.
+
+        This is a bounded workload-aware search, not a claim of global
+        optimality.  The selected finder is retained by ``TreeMPO`` so the
+        layout can be inspected and reused by later tree algorithms.
+        """
+        from ..optimizers.tree.layout import TreeLayoutFinder
+
+        base_plan, mapper = self._tree_plan_from_map_mode(None)
+        supports = tuple(
+            tuple(self._tree_site(base_plan, site, mapper=mapper) for site in support)
+            for support in self._raw_tree_term_supports(ints)
+        )
+        shape = (self.Lx, self.Ly) if self.Lz is None else (
+            self.Lx, self.Ly, self.Lz
+        )
+        map_inv = mapper.build()[1]
+
+        def lattice_site(*coordinate):
+            return map_inv[tuple(coordinate)]
+
+        finder = TreeLayoutFinder(
+            supports=supports,
+            n=self.L,
+            objective="hypergraph",
+            max_arity=(2, 3, 4),
+            chi=max_bond,
+            lattice_shape=shape,
+            lattice_site=lattice_site,
+        )
+        plan = finder.run(
+            chi=max_bond,
+            refine=None,
+            topology_refine=None,
+            search=None,
+        )
+        return plan, mapper, finder
+
+    def _tree_layout_finder_for_operator(self, plan, supports, *, mapper):
+        """Build display/search metadata matching a TreeMPO's lattice labels."""
+        from ..optimizers.tree.layout import TreeLayoutFinder
+
+        map_inv = mapper.build()[1]
+
+        def lattice_site(*coordinate):
+            return map_inv[tuple(coordinate)]
+
+        shape = (self.Lx, self.Ly) if self.Lz is None else (
+            self.Lx, self.Ly, self.Lz
+        )
+        order = plan.map_mode or mapper.mode
+        return TreeLayoutFinder(
+            supports=tuple(supports),
+            n=plan.n,
+            order=order,
+            lattice_shape=shape,
+            lattice_site=lattice_site,
+            root_qubit=getattr(plan, "root_qubit", None),
+        )
+
+    def _tree_peps_layout_finder_for_operator(self, plan, supports):
+        """Build layout metadata matching a native ``TreePepo`` plan."""
+        from ..optimizers.tree_peps.layout import TreePepsLayoutFinder
+
+        return TreePepsLayoutFinder(
+            plan,
+            supports=tuple(supports),
+            max_virtual_degree=plan.max_virtual_degree,
+            tree_order=plan.tree_order,
+        )
+
+    def _auto_tree_pepo_plan(self, ints, *, max_bond):
+        """Choose a TreePepsPlan from the term-support workload."""
+        from ..optimizers.tree_peps.layout import TreePepsLayoutFinder
+        from ..optimizers.tree_peps.plan import TreePepsPlan
+
+        shape = (self.Lx, self.Ly) if self.Lz is None else (
+            self.Lx, self.Ly, self.Lz
+        )
+        # The builder's map remains the logical coordinate convention.  The
+        # finder is then free to change only the retained physical tree.
+        source_plan = TreePepsPlan.from_shape(shape, order=self.map_mode)
+        supports = tuple(
+            tuple(source_plan.resolve_site(site) for site in support)
+            for support in self._raw_tree_term_supports(ints)
+        )
+        finder = TreePepsLayoutFinder(
+            source_plan,
+            supports=supports,
+            objective="hybrid",
+            max_virtual_degree=None,
+            # Keep the implicit conversion responsive.  The public finder
+            # still exposes larger ``max_iter``/refinement budgets when a
+            # deeper layout search is wanted.
+            max_iter=min(16, max(8, (self.L - 1) // 2)),
+        )
+        plan = finder.run(refine=True)
+        return plan, finder
+
+    def to_tree_mpo(
+        self,
+        plan=None,
+        ints=None,
+        *,
+        map_mode=None,
+        phys_dim=2,
+        max_bond=_DEFAULT_MAX_BOND,
+        chi=None,
+        cutoff=None,
+        data_type=None,
+        mode=None,
+        compress=_DEFAULT_COMPRESSION,
+        compress_opts=None,
+        compress_order="rank",
+        fermion=None,
+        edges=None,
+        fermionic=None,
+        charge_sectors=False,
+        to_backend=_DEFAULT_BACKEND,
+        progbar=False,
+        **model_params,
+    ):
+        """Convert interactions directly to a native :class:`TreeMPO`.
+
+        ``plan`` owns the tree geometry when supplied. Otherwise ``plan`` may
+        be omitted and the first positional argument is interpreted as the
+        terms; the automatic route chooses a workload-aware ``TreePlan`` from
+        their support graph, while explicit ``map_mode`` builds a default
+        binary plan from a geometric traversal. Ordinary dense terms are
+        factorized directly
+        over their TreePlan Steiner subtrees; no chain MPO is built or
+        attached. When ``fermion`` is supplied, its native
+        ``build_tree_operator`` route is used instead.
+
+        ``compress="term"`` (the default) builds one native operator per term
+        and compresses after every addition. ``True`` and ``compress="auto"``
+        select the workload-aware native state-diagram route for compatibility.
+        Automaton assembly is compressed once after the complete term
+        collection; term assembly is compressed after every added term. These
+        numerical compressions run only when an effective bond cap is set.
+        When the automatic route has no explicit ``plan`` or ``map_mode``, its
+        layout finder also adapts the TreePlan to the term supports.
+        ``compress="automaton"`` forces that full native assembly.
+        ``compress=False`` disables numerical compression, and
+        ``max_bond=None`` or ``False`` does the same.
+
+        ``mode=`` remains a compatibility alias for the older separate
+        strategy keyword; new code should put the strategy in ``compress=``.
+
+        ``compress_opts`` currently accepts the native TreeMPO compression
+        option ``order`` (``"rank"`` or ``"depth"``). The common
+        ``max_bond`` and ``cutoff`` defaults are inherited from ``ham_tn``.
+        ``progbar=True`` shows MPS-style term-construction progress with the
+        current ``chi`` and requested cap.
+        """
+        from ..optimizers.tree import TreeMPO, build_tree_operator
+        from ..tensors.symmetric import SymHamiltonian
+
+        from ..optimizers.tree.layout import TreePlan
+
+        if plan is not None and not isinstance(plan, TreePlan):
+            if ints is not None:
+                raise TypeError("Pass either a TreePlan or terms, not both as positional arguments.")
+            ints = plan
+            plan = None
+        default_term = compress is _DEFAULT_COMPRESSION and mode is None
+        build_mode, compress = _resolve_compression_request(
+            compress,
+            mode,
+            tree=True,
+        )
+        if chi is not None:
+            chi_limit = _normalize_optional_max_bond(chi, name="chi")
+            if (
+                max_bond is not _DEFAULT_MAX_BOND
+                and max_bond not in (None, False)
+                and _normalize_optional_max_bond(max_bond) != chi_limit
+            ):
+                raise TypeError("Pass only one of max_bond and chi, or use equal values.")
+            max_bond = chi
+        backend = self.to_backend if to_backend is _DEFAULT_BACKEND else to_backend
+        dtype = (
+            self._infer_backend_dtype(backend)
+            if data_type is None and backend is not None and not self._data_type_explicit
+            else self.data_type if data_type is None else np.dtype(data_type)
+        )
+        max_bond = _resolve_max_bond(max_bond, self.max_bond)
+        compression_enabled = compress and max_bond is not None
+        layout_max_bond = max_bond if max_bond is not None else 256
+        cutoff = self._resolve_cutoff(
+            self.cutoff if cutoff is None else cutoff,
+            dtype,
+        )
+
+        layout_finder = None
+        if plan is None:
+            if (
+                build_mode in {"analytic", "auto"}
+                and map_mode is None
+                and ints is not None
+                and fermion is None
+                and not isinstance(ints, SymHamiltonian)
+            ):
+                if not isinstance(ints, Mapping):
+                    ints = tuple(ints)
+                plan, mapper_use, layout_finder = self._auto_tree_mpo_plan(
+                    ints,
+                    max_bond=layout_max_bond,
+                )
+            else:
+                plan, mapper_use = self._tree_plan_from_map_mode(map_mode)
+        else:
+            mapper_use = (
+                self._tree_mapper_for_mode(map_mode)
+                if map_mode is not None else self.mapper
+            )
+        self._validate_tree_plan(plan)
+
+        if compress_opts is None:
+            compress_extra = {}
+        elif not isinstance(compress_opts, Mapping):
+            raise TypeError("compress_opts must be a mapping or None.")
+        else:
+            compress_extra = dict(compress_opts)
+        if "order" in compress_extra:
+            value = compress_extra.pop("order")
+            if compress_order != "rank" and compress_order != value:
+                raise TypeError("conflicting compression order values supplied.")
+            compress_order = value
+        if compress_extra:
+            names = ", ".join(sorted(compress_extra))
+            raise TypeError(
+                "TreeMPO compression supports only order='rank' or 'depth'; "
+                f"got unsupported options: {names}."
+            )
+        if compress_order not in {"rank", "depth"}:
+            raise ValueError("compress_order must be 'rank' or 'depth'.")
+
+        # Native fermion and SymHamiltonian builders do not expose the dense
+        # sequential factorization route. Keep their omitted-argument
+        # behavior analytic while the dense public default is term-wise.
+        if default_term and (fermion is not None or isinstance(ints, SymHamiltonian)):
+            build_mode = "analytic"
+
+        if fermion is not None:
+            if build_mode == "term":
+                raise ValueError(
+                    "mode='term' is only available for dense tree terms; "
+                    "native fermion construction uses its analytic builder."
+                )
+            if edges is not None:
+                if ints is not None:
+                    raise TypeError("Pass fermion terms through either ints or edges, not both.")
+                ints = edges
+            if ints is None and not isinstance(ints, SymHamiltonian):
+                raise ValueError("TreeMPO construction requires terms or an edge sequence.")
+            if model_params and isinstance(ints, SymHamiltonian):
+                names = ", ".join(sorted(model_params))
+                raise TypeError(
+                    "Model parameters cannot be supplied with an existing "
+                    f"SymHamiltonian: {names}."
+                )
+            fermionic_use = True if fermionic is None else bool(fermionic)
+            operator = fermion.build_tree_operator(
+                ints,
+                tree=plan,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                compress=compression_enabled,
+                dtype=dtype,
+                fermionic=fermionic_use,
+                charge_sectors=charge_sectors,
+                to_backend=backend,
+                **model_params,
+            )
+            supports = (
+                ints.terms.keys()
+                if isinstance(ints, SymHamiltonian)
+                else ints
+            )
+            operator.layout_finder = self._tree_layout_finder_for_operator(
+                plan,
+                supports,
+                mapper=mapper_use,
+            )
+            return operator
+
+        if edges is not None or model_params or fermionic is not None or charge_sectors:
+            raise TypeError(
+                "edges, fermion model parameters, fermionic encoding, and "
+                "charge_sectors are only valid with fermion=... ."
+            )
+        if ints is None:
+            raise ValueError("ints must be provided.")
+        if isinstance(ints, SymHamiltonian):
+            if build_mode == "term":
+                raise ValueError(
+                    "mode='term' is only available for dense tree terms; "
+                    "SymHamiltonian construction uses its analytic builder."
+                )
+            operator = build_tree_operator(
+                plan,
+                ints,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                compress=compression_enabled,
+                dtype=dtype,
+                fermionic=True,
+                to_backend=backend,
+            )
+            operator.layout_finder = self._tree_layout_finder_for_operator(
+                plan,
+                ints.terms,
+                mapper=mapper_use,
+            )
+            return operator
+        if not isinstance(phys_dim, Integral) or int(phys_dim) < 1:
+            raise ValueError("phys_dim must be an integer >= 1.")
+        terms = self._normalize_tree_terms(
+            plan,
+            ints,
+            phys_dim=int(phys_dim),
+            dtype=dtype,
+            mapper=mapper_use,
+        )
+        if layout_finder is None:
+            layout_finder = self._tree_layout_finder_for_operator(
+                plan,
+                terms,
+                mapper=mapper_use,
+            )
+        compress_options = {
+            "max_bond": max_bond,
+            "cutoff": cutoff,
+            "order": compress_order,
+        }
+        if build_mode in {"analytic", "auto"}:
+            progress_bar = _make_operator_progress(
+                progbar,
+                1,
+                desc="tree-mpo",
+            )
+            operator = TreeMPO.from_terms(
+                plan,
+                terms,
+                cutoff=cutoff,
+                dtype=dtype,
+                max_bond=max_bond,
+                compress=False,
+                layout_finder=layout_finder,
+            )
+            self._apply_tree_backend(operator, backend)
+            if compression_enabled:
+                operator.compress(**compress_options)
+            elif backend is None:
+                _structural_compress_tree(
+                    operator,
+                    root=operator.plan.root,
+                    parent=operator.plan.parent,
+                    children=operator.plan.children,
+                    nodes=operator.plan.nodes(),
+                    tensor_getter=operator.node_tensor,
+                    bond_getter=operator.bond,
+                    method="auto",
+                )
+            _advance_operator_progress(
+                progress_bar,
+                operator,
+                cap=max_bond,
+                peak=_operator_max_bond(operator),
+            )
+            if progress_bar is not None:
+                progress_bar.close()
+            return operator
+
+        operator = None
+        progress_bar = _make_operator_progress(
+            progbar,
+            len(terms),
+            desc="tree-mpo-term",
+        )
+        peak_bond = None
+        for support, term in terms.items():
+            term_operator = TreeMPO.from_terms(
+                plan,
+                {support: term},
+                cutoff=cutoff,
+                dtype=dtype,
+                max_bond=max_bond,
+                compress=False,
+                layout_finder=layout_finder,
+            )
+            self._apply_tree_backend(term_operator, backend)
+            if operator is None:
+                operator = term_operator
+                peak_bond = _operator_max_bond(operator)
+                if compression_enabled:
+                    operator.compress(**compress_options)
+            else:
+                operator = operator.add_TreeMPO(
+                    term_operator,
+                    compress=compression_enabled,
+                    **compress_options,
+                )
+                peak_bond = _operator_max_bond(operator)
+            _advance_operator_progress(
+                progress_bar,
+                operator,
+                cap=max_bond,
+                peak=peak_bond,
+            )
+        if backend is None and not compression_enabled:
+            _structural_compress_tree(
+                operator,
+                root=operator.plan.root,
+                parent=operator.plan.parent,
+                children=operator.plan.children,
+                nodes=operator.plan.nodes(),
+                tensor_getter=operator.node_tensor,
+                bond_getter=operator.bond,
+                method="auto",
+            )
+        _set_operator_progress_postfix(
+            progress_bar,
+            operator,
+            cap=max_bond,
+            peak=peak_bond,
+        )
+        if progress_bar is not None:
+            progress_bar.close()
+        return operator
+
+    to_treempo = to_tree_mpo
+
+    def to_tree_pepo(
+        self,
+        plan=None,
+        ints=None,
+        *,
+        map_mode=None,
+        tree_order=None,
+        phys_dim=2,
+        max_bond=_DEFAULT_MAX_BOND,
+        chi=None,
+        cutoff=None,
+        cutoff_mode=None,
+        data_type=None,
+        mode=None,
+        compress=_DEFAULT_COMPRESSION,
+        form=None,
+        center=None,
+        reduced=True,
+        compress_opts=None,
+        to_backend=_DEFAULT_BACKEND,
+        progbar=False,
+    ):
+        """Convert interactions directly to a native :class:`TreePEPO`.
+
+        ``plan`` may be omitted and the first positional argument is then
+        interpreted as the terms. For the canonical PEPO API, ``map_mode`` is
+        one ``span-*`` string: ``span-up``, ``span-down``, ``span-out``, or
+        ``span-middle``. It selects the retained physical spanning tree while
+        the builder's ordinary map remains the logical site order. The old
+        generic map spellings remain accepted as a compatibility route, with
+        ``tree_order`` available there when the two views must differ. The
+        returned operator is a complete ``TreePepsPlan`` network. Local terms
+        are factorized over their minimal tree spans and never pass through a
+        chain MPO or a full dense lattice operator.
+
+        ``compress="term"`` (the default) adds one factorized term at a time
+        and compresses after each addition. ``True`` and
+        ``compress="auto"`` select the workload-aware native state-diagram
+        route for compatibility. Automaton assembly is compressed once after
+        all terms are assembled; term assembly is compressed after every
+        added term. These numerical compressions run only when an effective
+        bond cap is set. When the automatic route has no explicit ``plan``,
+        retained-tree ``map_mode``, or ``tree_order``, its layout finder adapts
+        the spanning tree to the term supports. ``compress="automaton"``
+        forces the same full native assembly. ``compress=False`` disables
+        numerical compression, and ``max_bond=None`` or ``False`` does the
+        same.
+
+        ``mode=`` remains a compatibility alias for the older separate
+        strategy keyword; new code should put the strategy in ``compress=``.
+
+        ``compress_opts`` accepts the native PEPO options ``form``, ``center``,
+        ``reduced``, and ``order`` (``"rank"`` or ``"depth"``). The common
+        ``max_bond``, ``cutoff``, and ``cutoff_mode`` defaults are inherited
+        from ``ham_tn``.
+        ``progbar=True`` shows MPS-style term-construction progress with the
+        current ``chi`` and requested cap.
+        """
+        from ..optimizers.tree_peps import TreePepo
+
+        from ..optimizers.tree_peps.plan import TreePepsPlan
+
+        if plan is not None and not isinstance(plan, TreePepsPlan):
+            if ints is not None:
+                raise TypeError("Pass either a TreePepsPlan or terms, not both as positional arguments.")
+            ints = plan
+            plan = None
+        build_mode, compress = _resolve_compression_request(
+            compress,
+            mode,
+            tree=True,
+        )
+        if chi is not None:
+            chi_limit = _normalize_optional_max_bond(chi, name="chi")
+            if (
+                max_bond is not _DEFAULT_MAX_BOND
+                and max_bond not in (None, False)
+                and _normalize_optional_max_bond(max_bond) != chi_limit
+            ):
+                raise TypeError("Pass only one of max_bond and chi, or use equal values.")
+            max_bond = chi
+        backend = self.to_backend if to_backend is _DEFAULT_BACKEND else to_backend
+        dtype = (
+            self._infer_backend_dtype(backend)
+            if data_type is None and backend is not None and not self._data_type_explicit
+            else self.data_type if data_type is None else np.dtype(data_type)
+        )
+        max_bond = _resolve_max_bond(max_bond, self.max_bond)
+        compression_enabled = compress and max_bond is not None
+        layout_max_bond = max_bond if max_bond is not None else 256
+        cutoff = self._resolve_cutoff(
+            self.cutoff if cutoff is None else cutoff,
+            dtype,
+        )
+        if ints is None:
+            raise ValueError("ints must be provided.")
+
+        if plan is None:
+            from ..optimizers.tree_peps.plan import _normalize_span_mode
+
+            shape = (self.Lx, self.Ly) if self.Lz is None else (
+                self.Lx, self.Ly, self.Lz
+            )
+            if (
+                build_mode in {"analytic", "auto"}
+                and map_mode is None
+                and tree_order is None
+            ):
+                if not isinstance(ints, Mapping):
+                    ints = tuple(ints)
+                plan, _planning_finder = self._auto_tree_pepo_plan(
+                    ints,
+                    max_bond=layout_max_bond,
+                )
+            else:
+                requested_mode = self.map_mode if map_mode is None else map_mode
+                span_mode = _normalize_span_mode(requested_mode)
+                if span_mode is not None:
+                    if tree_order is not None:
+                        raise TypeError(
+                            "map_mode='span-*' and tree_order cannot both be "
+                            "supplied; use one retained-tree mode"
+                        )
+                    # A PEPO's logical ids retain the builder's chain map, while
+                    # its virtual geometry is selected independently by span-*.
+                    plan = TreePepsPlan.from_shape(
+                        shape,
+                        order=self.map_mode,
+                        map_mode=span_mode,
+                    )
+                else:
+                    # Compatibility route for the pre-span API: one generic
+                    # map_mode still controls both logical and retained orders.
+                    order = requested_mode
+                    tree_order_use = order if tree_order is None else tree_order
+                    plan = TreePepsPlan.from_shape(
+                        shape,
+                        order=order,
+                        tree_order=tree_order_use,
+                    )
+        self._validate_tree_plan(plan, tree_peps=True)
+        if compress_opts is None:
+            compress_extra = {}
+        elif not isinstance(compress_opts, Mapping):
+            raise TypeError("compress_opts must be a mapping or None.")
+        else:
+            compress_extra = dict(compress_opts)
+        for name, current in (("form", form), ("center", center)):
+            if name not in compress_extra:
+                continue
+            value = compress_extra.pop(name)
+            if current is not None and current != value:
+                raise TypeError(f"conflicting {name} values supplied.")
+            if name == "form":
+                form = value
+            else:
+                center = value
+        if "reduced" in compress_extra:
+            reduced = compress_extra.pop("reduced")
+        compress_order = compress_extra.pop("order", "rank")
+        if compress_order not in {"rank", "depth"}:
+            raise ValueError("TreePEPO compression order must be 'rank' or 'depth'.")
+        if compress_extra:
+            names = ", ".join(sorted(compress_extra))
+            raise TypeError(
+                "TreePEPO compression received unsupported options: "
+                f"{names}."
+            )
+        cutoff_mode = self._resolve_cutoff_mode(
+            (self.cutoff_mode if cutoff_mode is None else cutoff_mode)
+            or "rsum2",
+        )
+        if not isinstance(phys_dim, Integral) or int(phys_dim) < 1:
+            raise ValueError("phys_dim must be an integer >= 1.")
+        terms = self._normalize_tree_terms(
+            plan,
+            ints,
+            phys_dim=int(phys_dim),
+            dtype=dtype,
+        )
+        layout_finder = self._tree_peps_layout_finder_for_operator(
+            plan,
+            terms,
+        )
+        compress_options = {
+            "max_bond": max_bond,
+            "cutoff": cutoff,
+            "cutoff_mode": cutoff_mode,
+            "reduced": reduced,
+            "order": compress_order,
+        }
+        if form is not None:
+            compress_options["form"] = form
+        if center is not None:
+            compress_options["center"] = center
+        if build_mode in {"analytic", "auto"}:
+            progress_bar = _make_operator_progress(
+                progbar,
+                1,
+                desc="tree-pepo",
+            )
+            operator = TreePepo.from_terms(
+                plan,
+                terms,
+                dims=int(phys_dim),
+                dtype=dtype,
+                layout_finder=layout_finder,
+            )
+            self._apply_tree_backend(operator, backend)
+            if compression_enabled:
+                operator.compress(**compress_options)
+            elif backend is None:
+                _structural_compress_tree(
+                    operator,
+                    root=operator.plan.root,
+                    parent=operator.plan.parent,
+                    children=operator.plan.children,
+                    nodes=operator.sites,
+                    tensor_getter=operator.node_tensor,
+                    bond_getter=operator.bond,
+                    method="auto",
+                )
+            _advance_operator_progress(
+                progress_bar,
+                operator,
+                cap=max_bond,
+                peak=_operator_max_bond(operator),
+            )
+            if progress_bar is not None:
+                progress_bar.close()
+            return operator
+
+        operator = None
+        progress_bar = _make_operator_progress(
+            progbar,
+            len(terms),
+            desc="tree-pepo-term",
+        )
+        peak_bond = None
+        for support, term in terms.items():
+            term_operator = TreePepo.from_terms(
+                plan,
+                {support: term},
+                dims=int(phys_dim),
+                dtype=dtype,
+                layout_finder=layout_finder,
+            )
+            self._apply_tree_backend(term_operator, backend)
+            if operator is None:
+                operator = term_operator
+                peak_bond = _operator_max_bond(operator)
+                if compression_enabled:
+                    operator.compress(**compress_options)
+            else:
+                operator = operator.add_operator(
+                    term_operator,
+                    compress=compression_enabled,
+                    _validate=False,
+                    **compress_options,
+                )
+                peak_bond = _operator_max_bond(operator)
+            _advance_operator_progress(
+                progress_bar,
+                operator,
+                cap=max_bond,
+                peak=peak_bond,
+            )
+        if backend is None and not compression_enabled:
+            _structural_compress_tree(
+                operator,
+                root=operator.plan.root,
+                parent=operator.plan.parent,
+                children=operator.plan.children,
+                nodes=operator.sites,
+                tensor_getter=operator.node_tensor,
+                bond_getter=operator.bond,
+                method="auto",
+            )
+            operator.validate()
+        _set_operator_progress_postfix(
+            progress_bar,
+            operator,
+            cap=max_bond,
+            peak=peak_bond,
+        )
+        if progress_bar is not None:
+            progress_bar.close()
+        return operator
+
+    to_treepepsmpo = to_tree_pepo
 
     def mpo_itf(
         self,
@@ -1369,7 +2680,7 @@ class ham_tn:
             edges = tuple(qtn.edges_3d_cubic(self.L_x, self.L_y, self.L_z, cyclic=False))
 
         ints = self._itf_ints_from_edges(edges, J=J, field=field, dtype=dtype)
-        mpo = self.build_mpo(
+        mpo = self.to_mpo(
             ints,
             max_bond=max_bond,
             cutoff=cutoff,
@@ -1462,7 +2773,7 @@ class ham_tn:
 
         ints = self._itf_ints_from_edges(edges, J=J, field=field, dtype=dtype)
 
-        mpo = self.build_mpo(
+        mpo = self.to_mpo(
             ints,
             max_bond=max_bond,
             cutoff=cutoff,

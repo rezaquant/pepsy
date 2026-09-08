@@ -175,12 +175,18 @@ def test_deprecated_aliases_are_documented():
 
 def test_tree_optimizers_are_available_from_high_level_api():
     """Tree layout and execution helpers resolve from ``import pepsy as py``."""
-    from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer, TreePlan
+    from pepsy.optimizers.tree import TreeLayoutFinder, TreeMPO, TreeOptimizer, TreePlan
+    from pepsy.optimizers.tree_peps import TreePEPO, TreePepo, TreeSubPEPO, TreeSubPepo
     from pepsy.optimizers.tree_stabilizer import TreeStabOptimizer
 
     assert pepsy.TreeLayoutFinder is TreeLayoutFinder
     assert pepsy.TreeOptimizer is TreeOptimizer
     assert pepsy.TreePlan is TreePlan
+    assert pepsy.TreeMPO is TreeMPO
+    assert TreePEPO is TreePepo
+    assert TreeSubPEPO is TreeSubPepo
+    assert pepsy.TreePEPO is TreePepo
+    assert pepsy.TreeSubPEPO is TreeSubPepo
     assert pepsy.TreeStabOptimizer is TreeStabOptimizer
 
 
@@ -203,7 +209,7 @@ _EXPECTED_IN_ALL = [
     "SimulatorCandidate", "SimulatorPlan", "SimulatorPlanner", "recommend_simulator",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
-    "TreeMPO", "TreeOptimizer", "build_tree_operator",
+    "TreeMPO", "TreePEPO", "TreeSubPEPO", "TreeOptimizer", "build_tree_operator",
     "TreePlan",
     "TreeStabOptimizer",
     "TreeTensorNetwork",
@@ -281,7 +287,7 @@ _CALLABLE_EXPORTS = [
     "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "CoherentCrosstalkModel", "NoisyResult", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "TreeNoisy", "run_mpi_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stabilizer_tree_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
-    "TreeMPO", "TreeOptimizer", "build_tree_operator",
+    "TreeMPO", "TreePEPO", "TreeSubPEPO", "TreeOptimizer", "build_tree_operator",
     "TreePlan",
     "TreeStabOptimizer",
     "TreeTensorNetwork",

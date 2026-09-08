@@ -10,7 +10,7 @@ from ...tensors.maps import OneDMap
 
 __all__ = ["TreePepsPlan", "TreePepsGeometry"]
 
-_MAX_TREE_PEPS_VIRTUAL_DEGREE = 3
+_MAX_TREE_PEPS_VIRTUAL_DEGREE = 4
 _TOPOLOGY_ALIASES = {
     "tree": "tree",
     "branching": "tree",
@@ -20,6 +20,40 @@ _TOPOLOGY_ALIASES = {
     "chain": "path",
     "mps": "path",
 }
+
+# PEPS layouts retain a spanning tree of the physical lattice.  These names
+# therefore describe the span geometry, rather than the one-dimensional
+# coarsening/traversal vocabulary used by TreeMPO and TreeTensorNetwork.
+_SPAN_MODE_ALIASES = {
+    "span-up": "span-up",
+    "span-down": "span-down",
+    "span-out": "span-out",
+    "span-middle": "span-middle",
+    "span-mid": "span-middle",
+    "inside-out": "span-out",
+    "insideout": "span-out",
+    "center-out": "span-out",
+    "centerout": "span-out",
+    "center": "span-out",
+    "outward": "span-out",
+}
+
+
+def _normalize_span_mode(mode: str | None) -> str | None:
+    """Return the canonical PEPS spanning-tree mode, if ``mode`` is one."""
+
+    if mode is None:
+        return None
+    normalized = str(mode).strip().lower().replace("_", "-")
+    try:
+        return _SPAN_MODE_ALIASES[normalized]
+    except KeyError:
+        if normalized.startswith("span-"):
+            raise ValueError(
+                "unknown TreePeps map_mode; choose 'span-up', 'span-down', "
+                "'span-out', or 'span-middle'"
+            ) from None
+        return None
 
 
 def _normalize_topology(topology: str) -> str:
@@ -47,6 +81,67 @@ def _normalize_shape(shape: Sequence[int]) -> tuple[int, ...]:
     return tuple(int(size) for size in shape)
 
 
+def _coordinates_from_mode(shape, mode, *, coarse_grain=(2, 1)):
+    """Return lattice coordinates in a regular or coarse traversal order."""
+    normalized = str(mode).strip().lower().replace("_", "-")
+    if normalized.startswith("span-"):
+        raise ValueError(
+            "TreePeps 'span-*' modes describe the retained virtual tree; "
+            "pass them as map_mode= rather than order=."
+        )
+    if normalized.startswith("coarse-"):
+        from ..tree.layout import TreeLayoutFinder
+
+        if len(shape) == 2:
+            order = TreeLayoutFinder.lattice_order(
+                shape[0],
+                shape[1],
+                mode=normalized,
+                grain=coarse_grain,
+            )
+            return tuple(
+                (int(site) // shape[1], int(site) % shape[1])
+                for site in order
+            ), normalized
+
+        order = TreeLayoutFinder.lattice_order(
+            shape[0],
+            shape[1],
+            Lz=shape[2],
+            mode=normalized,
+            grain=coarse_grain,
+        )
+        plane = shape[1] * shape[2]
+        return tuple(
+            (
+                int(site) // plane,
+                (int(site) % plane) // shape[2],
+                int(site) % shape[2],
+            )
+            for site in order
+        ), normalized
+
+    mapper = OneDMap(
+        shape[0],
+        shape[1],
+        Lz=shape[2] if len(shape) == 3 else None,
+        mode=mode,
+    )
+    one_d_to_coord, _ = mapper.build()
+    return (
+        tuple(tuple(one_d_to_coord[q]) for q in range(len(one_d_to_coord))),
+        mapper.mode,
+    )
+
+
+def _normalize_tree_peps_coarse_grain(grain, ndim):
+    """Use the shared Tree lattice validation for PEPS traversal blocks."""
+
+    from ..tree.layout import _normalize_coarse_grain
+
+    return _normalize_coarse_grain(grain, ndim=ndim)
+
+
 class TreePepsPlan:
     """A regular-lattice geometry together with a legal virtual-bond tree.
 
@@ -70,14 +165,25 @@ class TreePepsPlan:
         max_virtual_degree: int = 3,
         order: str = "snake",
         tree_order: str = "explicit",
+        map_mode: str | None = None,
         topology: str = "tree",
         boundary: str = "open",
+        coarse_grain: int | Sequence[int] = (2, 1),
     ) -> None:
         self.shape = _normalize_shape(shape)
         self.ndim = len(self.shape)
         self.size = _product(self.shape)
+        self.coarse_grain = _normalize_tree_peps_coarse_grain(
+            coarse_grain,
+            self.ndim,
+        )
         self.order = str(order)
         self.tree_order = str(tree_order)
+        self._map_mode = (
+            None
+            if map_mode is None
+            else str(map_mode).strip().lower().replace("_", "-")
+        )
         self.topology = _normalize_topology(topology)
         self.boundary = str(boundary)
         if self.boundary != "open":
@@ -133,11 +239,13 @@ class TreePepsPlan:
         *,
         order: str = "snake",
         tree_order: str | None = None,
+        map_mode: str | None = None,
         tree_edges: Iterable[tuple[int, int]] | None = None,
         root: int | tuple[int, ...] | str | None = None,
-        max_virtual_degree: int = 3,
+        max_virtual_degree: int | None = None,
         topology: str = "tree",
         boundary: str = "open",
+        coarse_grain: int | Sequence[int] = (2, 1),
     ) -> "TreePepsPlan":
         """Build a plan from a 2D or 3D open regular lattice.
 
@@ -147,18 +255,66 @@ class TreePepsPlan:
         genuine branching site with three virtual bonds. ``topology='path'``
         is an explicit MPS-compatible mode for one-dimensional or otherwise
         non-branching geometries. Custom trees may be supplied with endpoints
-        expressed as logical ids or coordinates.
+        expressed as logical ids or coordinates. ``coarse-*`` modes use
+        ``coarse_grain`` for both logical order and retained-tree growth.
+        The canonical ``span-*`` modes are a separate retained-tree
+        vocabulary: ``span-up`` and ``span-down`` use a boundary-plane comb,
+        ``span-out`` grows from the lattice centre, and ``span-middle`` keeps
+        a central line/plane with branches above and below. ``map_mode`` is
+        the short spelling for selecting that retained tree. The old generic
+        ``map_mode`` spellings remain accepted as a compatibility route and
+        control both orders as before.
         """
 
         shape = _normalize_shape(shape)
         topology = _normalize_topology(topology)
+        requested_map_mode = None
+        span_mode = _normalize_span_mode(map_mode)
+        if map_mode is not None and span_mode is None:
+            normalized_map_mode = str(map_mode).strip().lower().replace("_", "-")
+            if tree_order is not None:
+                raise TypeError(
+                    "map_mode and tree_order cannot both be supplied; use "
+                    "map_mode for the retained PEPS tree"
+                )
+            # Before span-* was introduced, map_mode controlled both views.
+            # Retain that behavior for old callers while making the new
+            # spanning-tree contract explicit.
+            order = map_mode
+            tree_order = map_mode
+            requested_map_mode = normalized_map_mode
+        elif map_mode is not None:
+            if tree_order is not None:
+                raise TypeError(
+                    "map_mode and tree_order cannot both be supplied; use "
+                    "map_mode for the retained PEPS tree"
+                )
+            tree_order = span_mode
+            requested_map_mode = span_mode
         if tree_order is None:
             tree_order = "snake"
-        tree_mapper = OneDMap(*shape, mode=tree_order)
-        tree_order = tree_mapper.mode
-        mapper = OneDMap(*shape, mode=order)
-        one_d_to_coord_map, coord_to_one_d = mapper.build()
-        one_d_to_coord = tuple(tuple(one_d_to_coord_map[q]) for q in range(len(one_d_to_coord_map)))
+        one_d_to_coord, order_mode = _coordinates_from_mode(
+            shape,
+            order,
+            coarse_grain=coarse_grain,
+        )
+        coord_to_one_d = {
+            coord: q for q, coord in enumerate(one_d_to_coord)
+        }
+        span_mode = _normalize_span_mode(tree_order)
+        if max_virtual_degree is None:
+            max_virtual_degree = 4 if span_mode == "span-middle" else 3
+        if span_mode is None:
+            tree_coordinates, tree_order = _coordinates_from_mode(
+                shape,
+                tree_order,
+                coarse_grain=coarse_grain,
+            )
+            if requested_map_mode is not None:
+                requested_map_mode = tree_order
+        else:
+            tree_coordinates = None
+            tree_order = span_mode
 
         lattice_edges = []
         for coord in one_d_to_coord:
@@ -171,7 +327,9 @@ class TreePepsPlan:
 
         generated_tree = tree_edges is None
         if root is None:
-            if tree_order == "inside-out":
+            if span_mode is not None:
+                root_q = coord_to_one_d[_span_root_coordinate(shape, span_mode)]
+            elif tree_order == "inside-out":
                 center = tuple((extent - 1) // 2 for extent in shape)
                 root_q = coord_to_one_d[center]
             else:
@@ -187,20 +345,37 @@ class TreePepsPlan:
             root_q = _resolve_endpoint(root, coord_to_one_d, len(one_d_to_coord), len(shape))
 
         if tree_edges is None:
-            tree_map, _ = tree_mapper.build()
-            tree_order_q = tuple(
-                coord_to_one_d[tuple(tree_map[q])] for q in range(len(tree_map))
+            if span_mode is not None:
+                tree_edges = _span_tree_edges(
+                    shape,
+                    coord_to_one_d,
+                    lattice_edges,
+                    mode=span_mode,
+                    root=root_q,
+                    max_virtual_degree=max_virtual_degree,
+                )
+
+            tree_order_q = (
+                None
+                if tree_coordinates is None
+                else tuple(coord_to_one_d[coord] for coord in tree_coordinates)
             )
-            snake_map, _ = OneDMap(*shape, mode="snake").build()
+            snake_coordinates, _ = _coordinates_from_mode(shape, "snake")
             fallback_order_q = tuple(
-                coord_to_one_d[tuple(snake_map[q])] for q in range(len(snake_map))
+                coord_to_one_d[coord] for coord in snake_coordinates
             )
-            ordered_edges = tuple(
-                tuple(sorted((q0, q1)))
-                for q0, q1 in zip(tree_order_q, tree_order_q[1:])
+            ordered_edges = (
+                tuple(
+                    tuple(sorted((q0, q1)))
+                    for q0, q1 in zip(tree_order_q, tree_order_q[1:])
+                )
+                if tree_order_q is not None
+                else ()
             )
             lattice_edge_set = {tuple(sorted(edge)) for edge in lattice_edges}
-            if topology == "path":
+            if tree_edges is not None:
+                pass
+            elif topology == "path":
                 # A path is intentionally opt-in. Prefer the requested
                 # traversal when it is lattice adjacent, otherwise use the
                 # canonical snake path as a deterministic valid path.
@@ -248,10 +423,12 @@ class TreePepsPlan:
             tree_edges=tree_edges,
             root=root_q,
             max_virtual_degree=max_virtual_degree,
-            order=order,
+            order=order_mode,
             tree_order=(tree_order if generated_tree else "explicit"),
+            map_mode=(requested_map_mode if generated_tree else None),
             topology=topology,
             boundary=boundary,
+            coarse_grain=coarse_grain,
         )
 
     @property
@@ -259,6 +436,25 @@ class TreePepsPlan:
         """Coordinates indexed by logical site id."""
 
         return self.one_d_to_coord
+
+    @property
+    def map_mode(self) -> str | None:
+        """Canonical geometry mode used to build this plan, if known.
+
+        New PEPS plans report ``span-*`` for spanning-tree layouts. Legacy
+        ``coarse-*`` plans may report their old mode so existing metadata
+        remains inspectable.
+        """
+
+        if self._map_mode is not None:
+            span_mode = _normalize_span_mode(self._map_mode)
+            return span_mode if span_mode is not None else self._map_mode
+        span_mode = _normalize_span_mode(self.tree_order)
+        if span_mode is not None:
+            return span_mode
+        if self.tree_order.startswith("coarse-"):
+            return self.tree_order
+        return None
 
     @property
     def adjacency(self) -> dict[int, tuple[int, ...]]:
@@ -412,7 +608,7 @@ class TreePepsPlan:
         return (
             f"TreePepsPlan(shape={self.shape!r}, size={self.size}, "
             f"root={self.root}, max_degree={self.max_degree}, "
-            f"tree_order={self.tree_order!r}, topology={self.topology!r})"
+            f"map_mode={self.map_mode!r}, topology={self.topology!r})"
         )
 
 
@@ -424,6 +620,123 @@ def _product(values: Sequence[int]) -> int:
     for value in values:
         result *= int(value)
     return result
+
+
+def _span_plane_coordinates(shape):
+    """Return a nearest-neighbor path through the non-span axes."""
+
+    if len(shape) == 2:
+        return [(y,) for y in range(shape[1])]
+
+    # A snake through each y-row of the (y, z) plane is a path in both 2D and
+    # 3D, which leaves exactly one available virtual degree for an axial tooth.
+    return [
+        (y, z)
+        for y in range(shape[1])
+        for z in (
+            range(shape[2])
+            if y % 2 == 0
+            else range(shape[2] - 1, -1, -1)
+        )
+    ]
+
+
+def _span_root_coordinate(shape, mode):
+    """Return the deterministic root coordinate for a canonical span mode."""
+
+    plane = _span_plane_coordinates(shape)
+    if mode == "span-up":
+        return (0, *plane[0])
+    if mode == "span-down":
+        return (shape[0] - 1, *plane[0])
+    if mode == "span-middle":
+        return (
+            (shape[0] - 1) // 2,
+            *((extent - 1) // 2 for extent in shape[1:]),
+        )
+    if mode == "span-out":
+        return tuple((extent - 1) // 2 for extent in shape)
+    raise ValueError(f"unknown span mode {mode!r}")
+
+
+def _span_tree_edges(
+    shape,
+    coord_to_one_d,
+    lattice_edges,
+    *,
+    mode,
+    root,
+    max_virtual_degree,
+):
+    """Build a bounded-degree physical spanning tree for ``span-*`` modes."""
+
+    def add(edges, coord0, coord1):
+        edges.add(
+            tuple(
+                sorted(
+                    (
+                        coord_to_one_d[coord0],
+                        coord_to_one_d[coord1],
+                    )
+                )
+            )
+        )
+
+    if mode == "span-out":
+        center = _span_root_coordinate(shape, mode)
+        coordinates = tuple(
+            sorted(
+                (tuple(coord) for coord in coord_to_one_d),
+                key=lambda coord: (
+                    sum(abs(a - b) for a, b in zip(coord, center)),
+                    coord,
+                ),
+            )
+        )
+        return _tree_edges_from_order(
+            tuple(coord_to_one_d[coord] for coord in coordinates),
+            lattice_edges,
+            root=root,
+            max_virtual_degree=max_virtual_degree,
+        )
+
+    plane = _span_plane_coordinates(shape)
+    edges = set()
+    if mode in {"span-up", "span-down"}:
+        boundary = 0 if mode == "span-up" else shape[0] - 1
+        step = 1 if mode == "span-up" else -1
+        for coord0, coord1 in zip(plane, plane[1:]):
+            add(edges, (boundary, *coord0), (boundary, *coord1))
+        for plane_coord in plane:
+            for x in range(
+                boundary,
+                shape[0] - 1 if step > 0 else 0,
+                step,
+            ):
+                add(
+                    edges,
+                    (x, *plane_coord),
+                    (x + step, *plane_coord),
+                )
+    elif mode == "span-middle":
+        middle = (shape[0] - 1) // 2
+
+        # Keep one nearest-neighbour line through the middle as the complete
+        # transverse backbone. Every backbone site then starts one axial
+        # chain in each direction. In 2D this is the requested central
+        # horizontal row with vertical columns above and below; in 3D the
+        # same construction uses a snake through the central plane.
+        for coord0, coord1 in zip(plane, plane[1:]):
+            add(edges, (middle, *coord0), (middle, *coord1))
+        for plane_coord in plane:
+            for x in range(middle - 1, -1, -1):
+                add(edges, (x + 1, *plane_coord), (x, *plane_coord))
+            for x in range(middle + 1, shape[0]):
+                add(edges, (x - 1, *plane_coord), (x, *plane_coord))
+    else:  # pragma: no cover - normalized before reaching this helper
+        raise ValueError(f"unknown span mode {mode!r}")
+
+    return tuple(sorted(edges))
 
 
 def _comb_tree_edges(

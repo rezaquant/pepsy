@@ -29,7 +29,9 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from .layout import TreePlan
+from ...operators._structural_compression import _structural_compress_tree
+from .layout import TreeLayoutFinder, TreePlan
+from ._display import ascii_lattice, ascii_tree
 
 __all__ = ["TreeMPO", "build_tree_operator"]
 
@@ -146,6 +148,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         "symmetry",
         "cutoff",
         "compressed",
+        "_layout_finder",
     )
 
     def __init__(
@@ -165,6 +168,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         lower_ind_id="b{}",
         node_tag_id="N{}",
         operator_support=None,
+        layout_finder=None,
         virtual=True,
         deep=False,
     ):
@@ -187,6 +191,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             lower_ind_id = source.lower_ind_id
             node_tag_id = source.node_tag_id
             operator_support = source.operator_support
+            layout_finder = source.layout_finder
         elif tree_networks is None:
             raise TypeError("TreeMPO requires a tree operator network.")
         else:
@@ -235,6 +240,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                 )
             self._operator_support = normalized_support
         self.pepsy_tree_plan_signature = _tree_plan_signature(plan)
+        self.layout_finder = layout_finder
         for network in networks:
             # Native QR/SVD helpers need the structural tag format even when
             # callers choose a non-default ``node_tag_id``. Keep it on each
@@ -255,6 +261,42 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
     def plan(self):
         """The :class:`TreePlan` describing the operator geometry."""
         return self._plan
+
+    @property
+    def layout_finder(self):
+        """The optional layout finder carrying lattice and term metadata."""
+
+        return self._layout_finder
+
+    @layout_finder.setter
+    def layout_finder(self, finder):
+        if finder is not None:
+            if not isinstance(finder, TreeLayoutFinder):
+                raise TypeError("layout_finder must be a TreeLayoutFinder or None.")
+            if finder.n != self.plan.n:
+                raise ValueError(
+                    "layout_finder and TreeMPO must describe the same number "
+                    "of physical sites."
+                )
+            if (
+                finder.root_qubit is not None
+                and finder.root_qubit != self.plan.root_qubit
+            ):
+                raise ValueError(
+                    "layout_finder and TreeMPO must use the same root_qubit."
+                )
+            shape = finder.lattice_shape
+            if shape is not None and int(np.prod(shape, dtype=int)) != self.plan.n:
+                raise ValueError(
+                    "layout_finder lattice_shape must cover every TreeMPO site."
+                )
+        self._layout_finder = finder
+
+    @property
+    def map_mode(self):
+        """Canonical geometric label for the operator's tree layout."""
+
+        return self.plan.map_mode
 
     @property
     def node_tag_id(self):
@@ -331,6 +373,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         compress=True,
         dtype=None,
         fermionic=True,
+        layout_finder=None,
     ):
         """Construct a ``TreeMPO`` from a ``SymHamiltonian``."""
         from ...tensors.symmetric import SymHamiltonian
@@ -360,6 +403,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             symmetry=hamiltonian.symmetry,
             cutoff=cutoff,
             compressed=compress,
+            layout_finder=layout_finder,
         )
         if compress:
             operator.compress(max_bond=max_bond, cutoff=cutoff)
@@ -375,6 +419,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         dtype=None,
         max_bond=None,
         compress=True,
+        layout_finder=None,
     ):
         """Construct one ordinary dense TTNO from a term mapping.
 
@@ -426,6 +471,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             fermionic=False,
             cutoff=cutoff,
             compressed=compress,
+            layout_finder=layout_finder,
         )
         if compress:
             operator.compress(max_bond=max_bond, cutoff=cutoff)
@@ -449,6 +495,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         node_tag_id="N{}",
+        layout_finder=None,
     ):
         """Build a complete TreeMPO for a local gate support.
 
@@ -536,6 +583,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             lower_ind_id=lower_ind_id,
             node_tag_id=node_tag_id,
             operator_support=support,
+            layout_finder=layout_finder,
         )
         if compress:
             operator.compress(max_bond=max_bond, cutoff=cutoff)
@@ -554,6 +602,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         node_tag_id="N{}",
+        layout_finder=None,
     ):
         """Build a compact TreeMPO for a weighted Pauli-product sum.
 
@@ -584,6 +633,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             lower_ind_id=lower_ind_id,
             node_tag_id=node_tag_id,
             operator_support=support,
+            layout_finder=layout_finder,
         )
 
     @classmethod
@@ -600,6 +650,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         node_tag_id="N{}",
+        layout_finder=None,
         **split_opts,
     ):
         """Build an exact tree operator from a dense matrix.
@@ -663,6 +714,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
             node_tag_id=node_tag_id,
+            layout_finder=layout_finder,
         )
 
     @classmethod
@@ -680,6 +732,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         node_tag_id="N{}",
+        layout_finder=None,
     ):
         """Build a tree operator from a tensor filling function.
 
@@ -715,6 +768,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
             node_tag_id=node_tag_id,
+            layout_finder=layout_finder,
         )
 
     @classmethod
@@ -1131,6 +1185,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             node_tag_id=self.node_tag_id,
+            layout_finder=self.layout_finder,
         )
 
     def add_TreeMPO(
@@ -1245,6 +1300,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             # future rank-aware contraction proves those boundary channels
             # are bond one.
             operator_support=None,
+            layout_finder=self.layout_finder or other.layout_finder,
         )
         if compress:
             result.compress(
@@ -1261,6 +1317,160 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
     def add_MPO(self, other, **kwargs):
         """Compatibility wrapper for :meth:`add_TreeMPO`."""
         return self.add_TreeMPO(other, **kwargs)
+
+    def add_operator(
+        self,
+        other,
+        *,
+        inplace=False,
+        negate=False,
+        compress=False,
+        **compress_opts,
+    ):
+        """Add another matching tree operator.
+
+        Addition is exact by default.  Set ``compress=True`` to perform an
+        explicit native tree SVD after forming the direct-sum operator.
+        """
+        return self.add_TreeMPO(
+            other,
+            inplace=inplace,
+            negate=negate,
+            compress=compress,
+            **compress_opts,
+        )
+
+    def scale(self, factor, *, inplace=False):
+        """Multiply this tree operator by a scalar."""
+        if not np.isscalar(factor):
+            raise TypeError("TreeMPO.scale requires a scalar factor.")
+        target = self if inplace else self.copy(deep=True)
+        if not target.tree_networks:
+            raise ValueError("cannot scale a TreeMPO without stored networks.")
+        for network in target.tree_networks:
+            tensor = next(iter(network))
+            tensor.modify(data=tensor.data * factor, left_inds=tensor.left_inds)
+        if target.terms is not None:
+            target.terms = {
+                support: value * factor
+                for support, value in target.terms.items()
+            }
+        target.invalidate_canonical_form()
+        return target
+
+    def compose(
+        self,
+        other,
+        *,
+        inplace=False,
+        compress=False,
+        max_bond=None,
+        cutoff=None,
+        order="rank",
+    ):
+        """Compose two dense tree operators without densifying them.
+
+        The result represents ``self @ other``: ``other`` acts first.  The
+        local physical legs are contracted and each pair of operator bonds is
+        fused on the same TreePlan edge.  Compression is explicit because
+        composition can increase every virtual bond.  Charge-aware native
+        Symmray composition needs a graded Kronecker/fusion kernel and is
+        rejected until that kernel is available.
+        """
+        if not isinstance(other, TreeMPO):
+            raise TypeError("other must be a TreeMPO.")
+        if self.pepsy_tree_plan_signature != other.pepsy_tree_plan_signature:
+            raise ValueError("TreeMPOs must use the same TreePlan.")
+        if self.fermionic or other.fermionic:
+            raise NotImplementedError(
+                "TreeMPO composition for native fermionic operators requires "
+                "a graded fused-bond product; use addition or apply operators "
+                "sequentially for now."
+            )
+        if self.sites != other.sites:
+            raise ValueError("TreeMPOs must use matching logical site layouts.")
+        if (
+            self.upper_ind_id != other.upper_ind_id
+            or self.lower_ind_id != other.lower_ind_id
+            or self.node_tag_id != other.node_tag_id
+        ):
+            raise ValueError(
+                "TreeMPOs must use matching physical-index and node-tag layouts."
+            )
+        if len(self.tree_networks) != 1 or len(other.tree_networks) != 1:
+            raise NotImplementedError(
+                "TreeMPO composition currently requires one dense network per operator."
+            )
+
+        network = _compose_tree_operator_network(
+            self.tree_networks[0],
+            other.tree_networks[0],
+            nodes=tuple(self.plan.nodes()),
+            edges=tuple(
+                (node, child)
+                for node, children in self.plan.children.items()
+                for child in children
+            ),
+            node_tag=lambda node: self.node_tag(node),
+            site_of_node=lambda node: self.plan.qubit_of_node.get(node),
+            neighbors=lambda node: self.neighbors(node),
+            output_ind=lambda site: self.upper_ind(site),
+            input_ind=lambda site: self.lower_ind(site),
+            bond=lambda operator_network, node, neighbor: _network_bond(
+                operator_network,
+                self.node_tag(node),
+                self.node_tag(neighbor),
+            ),
+        )
+        left_support = self.operator_support
+        right_support = other.operator_support
+        support = (
+            None
+            if left_support is None or right_support is None
+            else frozenset(left_support) | frozenset(right_support)
+        )
+        result = type(self)(
+            self.plan,
+            network,
+            backend="dense",
+            fermionic=False,
+            cutoff=self.cutoff,
+            compressed=False,
+            sites=self.sites,
+            site_tag_id=self.site_tag_id,
+            upper_ind_id=self.upper_ind_id,
+            lower_ind_id=self.lower_ind_id,
+            node_tag_id=self.node_tag_id,
+            operator_support=support,
+            layout_finder=self.layout_finder,
+        )
+        if compress:
+            result.compress(max_bond=max_bond, cutoff=cutoff, order=order)
+        if inplace:
+            self.__dict__.clear()
+            self.__dict__.update(result.__dict__)
+            return self
+        return result
+
+    def __add__(self, other):
+        return self.add_operator(other)
+
+    def __sub__(self, other):
+        return self.add_operator(other, negate=True)
+
+    def __neg__(self):
+        return self.scale(-1)
+
+    def __mul__(self, factor):
+        if not np.isscalar(factor):
+            return NotImplemented
+        return self.scale(factor)
+
+    def __rmul__(self, factor):
+        return self.__mul__(factor)
+
+    def __matmul__(self, other):
+        return self.compose(other)
 
     add_TreeMPO_ = lambda self, other, **kwargs: self.add_TreeMPO(  # noqa: E731
         other, inplace=True, **kwargs,
@@ -1318,31 +1528,140 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
 
         return TreeTensorNetwork.rand(self.plan, D=bond_dim, **state_opts)
 
-    def show(self, *, bond_dims=True, node_ids=False, color=False):
-        """Print a compact top-down tree drawing for this operator."""
-        del color
+    def _layout_site_coords(self):
+        """Return physical-site coordinates carried by the layout finder."""
+        finder = self.layout_finder
+        if finder is None or finder.lattice_shape is None:
+            raise ValueError(
+                "TreeMPO has no 2D/3D layout metadata; pass a TreeLayoutFinder "
+                "with lattice_shape= when constructing it."
+            )
+        shape = finder.lattice_shape
+        site = finder.lattice_site
+        if site is None:
+            if len(shape) == 2:
+                site = lambda x, y: x * shape[1] + y
+            else:
+                site = lambda x, y, z: x * shape[1] * shape[2] + y * shape[2] + z
+        if len(shape) == 2:
+            coords = {
+                int(site(x, y)): (x, y)
+                for x in range(shape[0])
+                for y in range(shape[1])
+            }
+        else:
+            coords = {
+                int(site(x, y, z)): (x, y, z)
+                for x in range(shape[0])
+                for y in range(shape[1])
+                for z in range(shape[2])
+            }
+        if set(coords) != set(self.plan.node_of_qubit):
+            raise ValueError(
+                "layout_finder site coordinates do not match the TreeMPO plan."
+            )
+        return coords
 
-        def render(node, prefix="", is_last=True):
-            qubit = self.plan.qubit_of_node.get(node)
-            label = f"N{node}" if node_ids else "●"
-            if qubit is not None:
-                label += f" q{qubit}"
-            lines = [prefix + ("└─ " if is_last else "├─ ") + label]
-            children = tuple(self.plan.children[node])
-            for index, child in enumerate(children):
-                edge = self.bond_size(node, child) if bond_dims else None
-                edge_label = f" [{edge}]" if edge is not None else ""
-                child_lines = render(
-                    child,
-                    prefix + ("   " if is_last else "│  "),
-                    index == len(children) - 1,
+    def ascii_lattice(self, *, node_ids=False):
+        """Return the physical lattice view supplied by ``layout_finder``."""
+        finder = self.layout_finder
+        if finder is None:
+            raise ValueError(
+                "TreeMPO.ascii_lattice requires a TreeLayoutFinder; construct "
+                "the operator with layout_finder=."
+            )
+        return ascii_lattice(
+            self.plan,
+            finder.lattice_shape,
+            self._layout_site_coords(),
+            terms=(
+                self.terms
+                if self.terms is not None
+                else {support: None for support in finder.supports}
+            ),
+            node_ids=node_ids,
+        )
+
+    def plot_layout(self, **plot_opts):
+        """Plot the retained tree over the physical lattice and term graph."""
+        finder = self.layout_finder
+        if finder is None:
+            raise ValueError(
+                "TreeMPO.plot_layout requires a TreeLayoutFinder with lattice "
+                "metadata."
+            )
+        plot_opts.setdefault("show_site_labels", True)
+        plot_opts.setdefault("show_node_ids", False)
+        plot_opts.setdefault("show_gate_connectivity", bool(self.terms))
+        plot_opts.setdefault("site_coords", self._layout_site_coords())
+        return finder.plot(self.plan, **plot_opts)
+
+    def ascii_tree(self, *, bond_dims=True, node_ids=False, color=False):
+        """Return a compact Quimb-style drawing of the operator tree."""
+        return ascii_tree(
+            self.plan,
+            lambda node, child: self.bond_size(node, child),
+            bond_dims=bond_dims,
+            node_ids=node_ids,
+            color=color,
+            label_site=lambda site: f"q{site}",
+        )
+
+    def show(
+        self,
+        *,
+        bond_dims=True,
+        node_ids=False,
+        color=False,
+        layout="tree",
+    ):
+        """Show the clean native ASCII tree by default.
+
+        ``layout="lattice"`` or ``layout="both"`` opt into the physical
+        coordinate view supplied by a ``TreeLayoutFinder``. ``layout="auto"``
+        remains an explicit convenience alias that selects both views when
+        lattice metadata is available. ``layout="plot"`` returns and displays
+        the Matplotlib layout figure; use :meth:`plot_layout` directly when
+        further customization is needed.
+        """
+        layout = str(layout).strip().lower().replace("-", "_")
+        if layout == "auto":
+            layout = (
+                "both"
+                if (
+                    self.layout_finder is not None
+                    and self.layout_finder.lattice_shape is not None
                 )
-                child_lines[0] = child_lines[0] + edge_label
-                lines.extend(child_lines)
-            return lines
-
-        lines = render(self.plan.root, "", True)
-        print("\n".join(lines))
+                else "tree"
+            )
+        if layout in {"tree", "plan"}:
+            print(self.ascii_tree(
+                bond_dims=bond_dims,
+                node_ids=node_ids,
+                color=color,
+            ))
+            return None
+        if layout in {"lattice", "grid", "coordinates"}:
+            print(self.ascii_lattice(node_ids=node_ids))
+            return None
+        if layout in {"both", "all"}:
+            print(self.ascii_lattice(node_ids=node_ids))
+            print()
+            print(self.ascii_tree(
+                bond_dims=bond_dims,
+                node_ids=node_ids,
+                color=color,
+            ))
+            return None
+        if layout in {"plot", "figure", "tent"}:
+            figure, _axes = self.plot_layout(
+                show_node_ids=node_ids,
+            )
+            figure.show()
+            return figure
+        raise ValueError(
+            "layout must be 'tree', 'auto', 'lattice', 'both', or 'plot'."
+        )
 
     def canonicalize(self, center=None, *, inplace=True, info_c=None):
         """Canonicalize every stored TTNO around one TreePlan node.
@@ -1638,13 +1957,35 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         cutoff = float(cutoff)
         reports = []
         for network in self.tree_networks:
-            reports.append(_compress_tree_operator(
+            raw_bond = max(
+                (network.ind_size(index) for index in network.inner_inds()),
+                default=1,
+            )
+            structural_report = _structural_compress_tree(
+                network,
+                root=self.plan.root,
+                parent=self.plan.parent,
+                children=self.plan.children,
+                nodes=self.plan.nodes(),
+                tensor_getter=lambda node: _tree_operator_tensor(network, node),
+                bond_getter=lambda node, neighbor: _tree_operator_bond(
+                    network, self.plan, node, neighbor,
+                ),
+                method="auto",
+            )
+            report = _compress_tree_operator(
                 network,
                 self.plan,
                 max_bond=max_bond,
                 cutoff=cutoff,
                 order=order,
-            ))
+            )
+            report["structural"] = structural_report
+            # Report the pre-structural dimension as the raw dimension, so
+            # rank_reduced includes the exact pass as well as numerical SVD.
+            report["raw_max_bond"] = raw_bond
+            report["rank_reduced"] = report["final_max_bond"] < raw_bond
+            reports.append(report)
         self.cutoff = cutoff
         self.compressed = True
         self.pepsy_compression_report = reports[0] if len(reports) == 1 else reports
@@ -1678,6 +2019,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             lower_ind_id=self.lower_ind_id,
             node_tag_id=self.node_tag_id,
             operator_support=self.operator_support,
+            layout_finder=self.layout_finder,
         )
         if hasattr(self, "pepsy_compression_report"):
             copied.pepsy_compression_report = self.pepsy_compression_report
@@ -1758,6 +2100,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             lower_ind_id=self.lower_ind_id,
             node_tag_id=self.node_tag_id,
             operator_support=self.operator_support,
+            layout_finder=self.layout_finder,
         )
         if not mangle_inner and output_inds is None:
             result._canonical_region = self.canonical_region
@@ -1845,6 +2188,132 @@ def _term_support(where):
             f"tree MPO Hamiltonian term support {support!r} repeats a site."
         )
     return support
+
+
+def _network_bond(network, tag0, tag1):
+    """Return the unique bond joining two tagged operator tensors."""
+    tids0 = tuple(network.tag_map.get(tag0, ()))
+    tids1 = tuple(network.tag_map.get(tag1, ()))
+    if len(tids0) != 1 or len(tids1) != 1:
+        raise ValueError(
+            f"operator tags {tag0!r} and {tag1!r} must identify one tensor each."
+        )
+    shared = qtn.bonds(network.tensor_map[tids0[0]], network.tensor_map[tids1[0]])
+    if len(shared) != 1:
+        raise ValueError(
+            f"operator tensors {tag0!r} and {tag1!r} must share one bond."
+        )
+    return next(iter(shared))
+
+
+def _compose_tree_operator_network(
+    left,
+    right,
+    *,
+    nodes,
+    edges,
+    node_tag,
+    site_of_node,
+    neighbors,
+    output_ind,
+    input_ind,
+    bond,
+):
+    """Compose two dense operator networks over the same tree geometry."""
+    right_work = right.copy()
+    right_bond_map = {
+        bond(right, node, neighbor): qtn.rand_uuid()
+        for node, neighbor in edges
+    }
+    right_physical_map = {}
+    right_input_temps = {}
+    for node in nodes:
+        site = site_of_node(node)
+        if site is None:
+            continue
+        right_output = output_ind(site)
+        right_input = input_ind(site)
+        left_input = input_ind(site)
+        right_input_temp = qtn.rand_uuid()
+        right_physical_map[right_output] = left_input
+        right_physical_map[right_input] = right_input_temp
+        right_input_temps[node] = right_input_temp
+    right_work.reindex_({**right_bond_map, **right_physical_map})
+    fused_bonds = {
+        frozenset((node, neighbor)): qtn.rand_uuid()
+        for node, neighbor in edges
+    }
+
+    tensors = []
+    for node in nodes:
+        tag = node_tag(node)
+        left_tids = tuple(left.tag_map.get(tag, ()))
+        right_tids = tuple(right_work.tag_map.get(tag, ()))
+        if len(left_tids) != 1 or len(right_tids) != 1:
+            raise ValueError(f"operator node tag {tag!r} must identify one tensor.")
+        left_tensor = left.tensor_map[left_tids[0]]
+        right_tensor = right_work.tensor_map[right_tids[0]]
+        neighbors_node = tuple(neighbors(node))
+        left_bonds = tuple(bond(left, node, neighbor) for neighbor in neighbors_node)
+        right_bonds = tuple(
+            right_bond_map[bond(right, node, neighbor)]
+            for neighbor in neighbors_node
+        )
+        site = site_of_node(node)
+        physical_left_output = None if site is None else output_ind(site)
+        physical_right_input = None if site is None else right_input_temps[node]
+        raw_inds = tuple(
+            ind
+            for ind in (physical_left_output, physical_right_input)
+            if ind is not None
+        ) + left_bonds + right_bonds
+        joined = qtn.tensor_contract(
+            left_tensor,
+            right_tensor,
+            output_inds=raw_inds,
+        ).transpose(*raw_inds)
+        interleaved_inds = tuple(
+            ind
+            for left_bond, right_bond in zip(left_bonds, right_bonds)
+            for ind in (left_bond, right_bond)
+        )
+        joined = joined.transpose(
+            *tuple(
+                ind
+                for ind in (physical_left_output, physical_right_input)
+                if ind is not None
+            ),
+            *interleaved_inds,
+        )
+        fused_edge_names = tuple(
+            fused_bonds[frozenset((node, neighbor))]
+            for neighbor in neighbors_node
+        )
+        new_shape = tuple(
+            joined.ind_size(ind)
+            for ind in (physical_left_output, physical_right_input)
+            if ind is not None
+        ) + tuple(
+            joined.ind_size(left_bond) * joined.ind_size(right_bond)
+            for left_bond, right_bond in zip(left_bonds, right_bonds)
+        )
+        data = ar.do("reshape", joined.data, new_shape)
+        output_inds = tuple(
+            ind
+            for ind in (
+                physical_left_output,
+                None if site is None else input_ind(site),
+            )
+            if ind is not None
+        ) + fused_edge_names
+        tensors.append(
+            qtn.Tensor(
+                data=data,
+                inds=output_inds,
+                tags=left_tensor.tags,
+            )
+        )
+    return qtn.TensorNetwork(tensors)
 
 
 def _expanded_index_charges(index):

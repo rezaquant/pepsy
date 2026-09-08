@@ -138,3 +138,56 @@ to the user gate, never to internal routing SWAPs.
   compilation, and `git diff --check` clean. A full-suite attempt remains
   subject to the repository's known macOS Matplotlib `_macosx` abort in an
   unrelated Hamiltonian drawing test; the isolated headless test passes.
+
+## 2026-09-03 tree operator conversion and display audit
+
+- The active environment reports Quimb `1.15.1.dev39+g369d09b9d`. The concrete
+  `MatrixProductOperator.show` signature is `show(max_width=None)` and renders
+  the chain's bond dimensions together with its canonical-direction markers.
+  Quimb's generic operator surface does not provide a branched equivalent.
+- Decision: adopt the same plain-text visual vocabulary for Pepsy's native
+  `TreeMPO` and `TreePEPO` surfaces, with root-first branches, physical-site
+  labels, and live bond dimensions. `ascii_tree()` returns the drawing and
+  `.show()` prints it. `TreePEPO.show()` defaults to a Quimb-like coordinate
+  schematic that leaves removed lattice edges as gaps; `layout="tree"` keeps
+  the explicit root-first topology view. Coloring is opt-in so the returned
+  drawing stays copy/paste-friendly.
+- `ham_tn.to_mpo`, `to_tree_mpo`, and `to_tree_pepo` now share builder-level
+  dtype, cutoff, and bond defaults while accepting per-conversion `map_mode`
+  overrides. Native tree conversion is direct and does not create an
+  intermediate chain MPO. The native tree compressors remain SVD-based and
+  expose their geometry-specific options (`order` for `TreeMPO`, `form` /
+  `center` / `reduced` for `TreePEPO`) rather than pretending arbitrary-geometry
+  Quimb networks support the 1D `sdc`/`src` algorithms.
+- The conversion strategy is explicit across the `to_*` builder surface:
+  chain `to_mpo`/`to_pepo` retain `term`, `automaton`, and `auto`, with
+  `analytic` as an automaton alias; native tree conversions support
+  `mode="term"` for per-term compression and `mode="analytic"` for one final
+  compression after native direct-sum assembly.
+- Focused validation: 213 headless tests passed across Hamiltonian conversion,
+  TreeMPO, TreePEPS, and public API suites; the updated `tn_stab.ipynb` also
+  executes end to end. Documentation build was not completed because the
+  active environment is missing the optional `autoapi` Sphinx extension.
+
+## 2026-09-04 TreePeps / TreePEPO compression audit
+
+- The active environment reports Quimb `1.15.1.dev39+g369d09b9d`, Autoray
+  `0.11.1.dev1+gc56f64427`, Cotengra `0.8.3.dev6+g08fe1a3a1`, and Symmray
+  `0.3.2.dev6+ga17699db6`. Probes reconfirmed that generic arbitrary-geometry
+  compression exposes local `compress_between`/`canonize_between` only; the
+  environment compressors remain a path-only integration.
+- Native `TreePeps` and `TreePEPO` compression now use a fixed-topology,
+  live-rank leaf schedule by default. The scheduler scores current physical
+  and virtual dimensions after each legal leaf reduction, with a deterministic
+  `order="depth"` compatibility schedule. This is layout-aware through the
+  retained `TreePepsPlan` paths and never relayouts an entangled state.
+- Full TreePeps sweeps now defer the expensive whole-network validation until
+  the final canonicality check, matching the already-batched TreePEPO path;
+  standalone edge operations still validate by default. The public TreePEPO
+  application, composition, Hamiltonian builder, and TreePeps optimizer
+  surfaces forward the order selection.
+- Focused validation after the change: the TreePeps state/optimizer suite
+  passed `90` tests with one existing Quimb warning; Python compilation was
+  clean. The implementation remains SVD-based on arbitrary trees; Quimb's
+  path-only SDC/SRC/ZipUp and the paper's projected-Cholesky CBC algorithm are
+  unchanged.
