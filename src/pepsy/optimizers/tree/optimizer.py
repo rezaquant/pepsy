@@ -404,13 +404,17 @@ class TreeOptimizer:
         applies.
     cutoff : float | {"auto"}
         Singular-value cutoff for truncations, interpreted according to
-        ``cutoff_mode``. ``"auto"`` selects a dtype-aware value: ``1e-6``
-        for 32-bit data and ``1e-12`` for 64-bit data.
+        ``cutoff_mode``. ``"auto"`` selects the shared MPS dtype-aware value:
+        ``1e-3`` for 16-bit data, ``1e-6`` for 32-bit data, and ``1e-12``
+        for 64-bit data, resolved from the installed state at construction.
     cutoff_mode : str | None | {"auto"}
         Quimb singular-value cutoff mode. ``"auto"`` (and the compatibility
         spelling ``None``) selects Pepsy's relative discarded-squared-weight
-        convention, ``"rsum2"``. Use ``"rel"`` for a relative
-        largest-singular-value threshold.
+        convention, ``"rsum2"``, including for tree ``"dm"`` compression.
+        Its ``svd:eig`` kernel truncates singular values, so this matches
+        MPS MPO DM's ``"rsum1"`` rule on density-matrix eigenvalues.
+        Explicit modes are passed through unchanged; use ``"rel"`` for a
+        relative largest-singular-value threshold.
     mode : {"auto", "direct", "dm", "sdc", "src", "zipup", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"}
         Gate/operator route and state-compression method. Ordinary gate
         entries in ``"auto"``, ``"direct"``, ``"dm"``, ``"sdc"``,
@@ -726,7 +730,15 @@ class TreeOptimizer:
 
     @staticmethod
     def _resolve_cutoff_mode(value):
-        """Resolve ``cutoff_mode='auto'`` to Pepsy's default convention."""
+        """Resolve automatic tree cutoffs in the singular-value picture.
+
+        All tree splits, including DM's ``svd:eig``, interpret cutoff modes
+        on singular values. Thus ``rsum2`` has the same discarded-weight
+        meaning as MpsOptimizer's native MPO DM default, ``rsum1``, which
+        acts on density-matrix eigenvalues (squared singular values).
+        Do not copy that string or forward ``None`` to the tree split:
+        Quimb's generic tensor split defaults to ``rel`` instead.
+        """
         if value is None or (
             isinstance(value, str) and value.strip().lower() == "auto"
         ):

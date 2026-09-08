@@ -12,6 +12,14 @@ PePsY follows [Semantic Versioning](https://semver.org/):
 
 Changes for the next release should be added here before the version is bumped.
 
+### Documentation
+
+- Clarified TreeOptimizer's automatic cutoff parity with MpsOptimizer and
+  added numerical regressions for DM aliases, installed-state precision,
+  explicit overrides, and copies. Tree DM keeps `rsum2` on singular values,
+  equivalent to MPS MPO DM's `rsum1` on density-matrix eigenvalues; existing
+  truncation behavior is preserved.
+
 ### Added
 
 - Fixed conditional MPS gates to inherit the configured DMRG/FIT schedule,

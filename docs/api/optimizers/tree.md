@@ -892,9 +892,21 @@ for those states. This restriction applies to DMRG modes as well.
 
 `TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
 Tree-edge SVD. Its defaults, `cutoff="auto"` and `cutoff_mode="auto"`, resolve
-once from the live state dtype: `1e-6` for 32-bit data and `1e-12` for 64-bit
-data, with `"rsum2"` as the automatic cutoff mode. `"rel"` remains available
-as a relative largest-singular-value threshold.
+once at construction from the installed state dtype, using the shared MPS
+policy: `1e-3` for 16-bit data, `1e-6` for float32/complex64, and `1e-12` for
+float64/complex128. An explicit numeric cutoff, including zero, is preserved.
+
+`cutoff_mode="auto"` (or the compatibility spelling `None`) selects `"rsum2"`
+for every tree split, including `mode="dm"`, `mode="tree_mpo_dm"`, and
+`compression_mode="dm"`. This matches MPS DM's **numerical criterion**:
+tree DM's `svd:eig` kernel truncates singular values `s`, while MPS MPO DM
+truncates density-matrix eigenvalues `s**2` with its native `"rsum1"` mode.
+Both automatic rules bound the relative discarded squared weight
+`sum(s_discarded**2) / sum(s**2)` when the bond cap does not force more loss.
+Explicit modes pass through unchanged: tree `"rsum1"` instead bounds
+`sum(s_discarded) / sum(s)`, and `"rel"` uses a relative largest-singular-value
+threshold. Copies preserve the resolved cutoff and mode.
+
 The lower-level `TreeTensorNetwork.compress_edge_` API retains explicit
 numeric defaults (`1e-10` and `"rsum2"`); pass its cutoff controls directly
 when using that lower-level interface.

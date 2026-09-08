@@ -826,6 +826,85 @@ def test_tree_cutoff_defaults_are_dtype_aware():
     assert opt.copy().cutoff_mode == "rsum2"
 
 
+@pytest.mark.parametrize("tree_options", [
+    {"mode": "dm"},
+    {"mode": "tree-mpo-dm", "cutoff_mode": None},
+    {"compression_mode": "density_matrix", "cutoff_mode": " AUTO "},
+])
+def test_tree_dm_auto_cutoff_matches_mps_discarded_weight(tree_options):
+    """Tree singular-value rsum2 matches MPS DM's eigenvalue rsum1."""
+    small = 0.1
+    large = np.sqrt(1.0 - small**2)
+    gate = np.array([
+        [large, 0, 0, -small],
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+        [small, 0, 0, large],
+    ], dtype="complex128")
+    stream = [(gate, (0, 1))]
+    mps = pepsy.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        stream, chi=2, mode="quimb-dm",
+    )
+    mps.run(cutoff=0.05, progbar=False, stabilize_unitary=False)
+    tree = TreeOptimizer(
+        stream, n=2, chi=2, cutoff=0.05, **tree_options,
+    )
+
+    assert mps.p.max_bond() == tree.max_bond() == 1
+    np.testing.assert_allclose(tree.to_dense(), mps.to_dense().reshape(-1), atol=1e-12)
+    assert np.linalg.norm(tree.to_dense()) ** 2 == pytest.approx(0.99)
+    assert tree.copy().cutoff_mode == "rsum2"
+
+    # A literal rsum1 override must still act on tree singular values. The
+    # small branch carries 1% squared weight but over 5% singular-value sum.
+    explicit = TreeOptimizer(
+        stream, n=2, chi=2, cutoff=0.05,
+        **(tree_options | {"cutoff_mode": "rsum1"}),
+    )
+    assert explicit.max_bond() == 2
+    np.testing.assert_allclose(explicit.to_dense(), gate[:, 0], atol=1e-12)
+    copied = explicit.copy()
+    assert copied.cutoff == 0.05
+    assert copied.cutoff_mode == "rsum1"
+
+
+@pytest.mark.parametrize("dtype, expected_cutoff, expected_bond", [
+    ("complex64", 1e-6, 1),
+    ("complex128", 1e-12, 2),
+])
+def test_tree_dm_auto_cutoff_uses_installed_state_precision(
+    dtype, expected_cutoff, expected_bond,
+):
+    """Auto drops a 1e-7-weight branch only at single precision, like MPS."""
+    small = np.sqrt(1e-7)
+    large = np.sqrt(1 - small**2)
+    gate = np.array([
+        [large, 0, 0, -small],
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+        [small, 0, 0, large],
+    ], dtype=dtype)
+    stream = [(gate, (0, 1))]
+    plan = TreePlan.from_order(range(2), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan, dtype=dtype)
+    tree = TreeOptimizer(stream, state=state, chi=2, mode="dm")
+    mps = pepsy.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype=dtype),
+        stream, chi=2, mode="quimb-dm",
+    )
+    mps.run(progbar=False, stabilize_unitary=False)
+
+    assert tree.cutoff == pytest.approx(expected_cutoff)
+    assert tree.max_bond() == mps.p.max_bond() == expected_bond
+    np.testing.assert_allclose(tree.to_dense(), mps.to_dense().reshape(-1), atol=1e-6)
+
+    exact = TreeOptimizer(stream, state=state, chi=2, mode="dm", cutoff=0.0)
+    assert exact.cutoff == 0.0
+    assert exact.max_bond() == 2
+    np.testing.assert_allclose(exact.to_dense(), gate[:, 0], atol=1e-6)
+
+
 def test_tree_dm_compression_uses_the_fused_operator_state_network():
     """DM mode changes the local truncating decomposition, not routing."""
     plan = TreePlan.from_order(range(2), structure="balanced", top_arity=2)
