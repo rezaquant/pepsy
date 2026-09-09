@@ -56,10 +56,11 @@ Read this reference before changing `pepsy.fitting.TreeFIT` or its
   controlled by `fit_two_site_transition_sweeps` (one by default). Explicit
   budgets remain authoritative. Standalone TreeFIT keeps its fixed defaults
   and offers `two_site_transition_sweeps=0` on each run entry point.
-- `traversal="depth"` preserves depth ordering. Opt-in `"depth-first"` groups
+- TreeOptimizer defaults to `fit_traversal="depth-first"` for all DMRG modes;
+  standalone TreeFIT retains `traversal="depth"`. Depth-first groups
   connected blocks by branch of the region's medial hub using iterative DFS.
   Preserve the block set and reverse the order for the inward pass. Test
-  real center travel and finite-bond fidelity before changing the default.
+  real center travel and finite-bond fidelity; explicit `"depth"` restores legacy order.
   The optimizer forwards `fit_traversal` and copies preserve both policies.
 - A one-node active region uses one exact projection by default in
   `run_gate(single_node_fast_path=True)` / TreeOptimizer. Skip guess replay,

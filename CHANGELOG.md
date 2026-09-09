@@ -22,6 +22,12 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- TreeOptimizer now defaults to depth-first FIT traversal for `dmrg`,
+  `dmrg1`, `dmrg2`, and `dmrg3`, retaining automatic SRC guesses for dense
+  trees and direct guesses for native fermionic trees. Explicit
+  `fit_traversal="depth"` restores the previous update order; finite-sweep
+  results can change. Standalone TreeFIT keeps its existing default.
+
 - Cache up to 128 immutable SRC/SDC tree environment plans across calls.
   Keep numerical messages and consumption counters private to each call;
   test branch reuse, array release, in-place edits, and failure recovery.

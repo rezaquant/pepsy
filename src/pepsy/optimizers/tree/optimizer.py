@@ -538,9 +538,10 @@ class TreeOptimizer:
         Order of the two passes: ``"inward-outward"`` or ``"outward-inward"``.
         The legacy ``"RL"``/``"LR"`` and ``"INOUT"``/``"OUTIN"`` aliases
         remain accepted with identical traversal order.
-    fit_traversal : {"depth", "depth-first"}, default="depth"
-        Legacy depth ordering or branch-grouped FIT updates with less center
-        travel. Update order can affect finite-bond accuracy and convergence.
+    fit_traversal : {"depth", "depth-first"}, default="depth-first"
+        Group FIT updates by branch to reduce center travel. Explicit
+        ``"depth"`` restores legacy ordering. Update order can affect
+        finite-bond accuracy and convergence.
     fit_environment_strategy : {"default", "native-blockwise"}, default="default"
         Per-FIT native Symmray blockwise environment contractions. The opt-in
         path requires supported upstream APIs and native target/state arrays.
@@ -780,7 +781,7 @@ class TreeOptimizer:
                  fit_init_strategy="auto",
                  fit_init_rand_strength=0.0, fit_init_seed=0,
                  fit_sweep_sequence="inward-outward", fit_overlap_diagnostics=False,
-                 fit_traversal="depth", fit_environment_strategy="default",
+                 fit_traversal="depth-first", fit_environment_strategy="default",
                  fit_single_node_fast_path=True,
                  fit_finite_check=False,
                  two_site_mode=None,

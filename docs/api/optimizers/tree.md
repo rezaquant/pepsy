@@ -775,13 +775,16 @@ an existing center inside the block needs no preparatory QR. Local
 factorization still establishes the requested final center, including explicit
 endpoint centers for three-node `TreeFIT.fit_block` updates.
 
-`fit_traversal="depth-first"` groups updates by branch to reduce canonical
+`fit_traversal="depth-first"` is the TreeOptimizer default for `dmrg`,
+`dmrg1`, `dmrg2`, and `dmrg3`. It groups updates by branch to reduce canonical
 center travel and environment invalidation. It visits the same connected
-blocks as the default `"depth"` ordering; inward reverses outward. The medial
+blocks as the legacy `"depth"` ordering; inward reverses outward. The medial
 node anchors an iterative depth-first walk, and a multi-node block is ordered
-by its node nearest that hub. This is opt-in because update order can change
-finite-bond fidelity and convergence. Standalone TreeFIT calls this option
-`traversal`.
+by its node nearest that hub. Explicit `fit_traversal="depth"` restores the
+previous order; finite-bond fidelity and convergence can change with ordering.
+Automatic initialization remains SRC for dense trees and direct for native
+fermionic trees. Standalone TreeFIT calls this option `traversal` and retains
+its own `"depth"` default.
 
 For native Symmray states, `fit_environment_strategy="native-blockwise"`
 uses graded blockwise contractions for FIT messages and effective tensors,

@@ -5,10 +5,10 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
 
 ## Performance and stability
 
-- FIT offers opt-in `fit_traversal="depth-first"` for branch-grouped updates
-  and native `fit_environment_strategy="native-blockwise"` for local
-  contractions without charge-block fusion. Both retain legacy defaults;
-  the traversal can change truncated results and blockwise speed depends on
+- TreeOptimizer defaults to `fit_traversal="depth-first"` for branch-grouped
+  FIT updates. Native `fit_environment_strategy="native-blockwise"` remains
+  opt-in for local contractions without charge-block fusion.
+  The traversal can change truncated results and blockwise speed depends on
   sector structure. A truly one-node FIT region automatically uses one exact
   local projection. See `fit-environments.md` for the execution contract and
   `docs/development/notes/tree_fit_execution.md` for measured tradeoffs.

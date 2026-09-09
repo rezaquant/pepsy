@@ -159,7 +159,10 @@ def test_native_blockwise_fit_matches_default_without_global_dispatch(backend):
     )
 
 
-def test_fit_execution_options_validate_and_survive_optimizer_copy():
+@pytest.mark.parametrize("traversal,expected", [
+    ("depth_first", "depth-first"), ("depth", "depth"),
+])
+def test_fit_execution_options_validate_and_survive_optimizer_copy(traversal, expected):
     state = pepsy.ps_to_ttn(3)
     with pytest.raises(TypeError, match="native Symmray"):
         TreeFIT(state, state, environment_strategy="native-blockwise")
@@ -168,16 +171,16 @@ def test_fit_execution_options_validate_and_survive_optimizer_copy():
     with pytest.raises(ValueError, match="environment_strategy"):
         TreeFIT(state, state, environment_strategy="invalid")
     optimizer = TreeOptimizer(None, state=state, run=False,
-                              fit_traversal="depth_first",
+                              fit_traversal=traversal,
                               fit_single_node_fast_path=False)
     copied = optimizer.copy()
-    assert copied.fit_traversal == "depth-first"
+    assert copied.fit_traversal == expected
     assert copied.fit_environment_strategy == "default"
     assert copied.fit_single_node_fast_path is False
 
 
-@pytest.mark.parametrize("mode", ["dmrg2", "dmrg3"])
-def test_depth_first_lossless_gate_replay(mode):
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
+def test_default_depth_first_src_lossless_gate_replay(mode):
     plan = TreePlan.from_order(range(1, 6), root_qubit=0, structure="balanced",
                                max_arity=3)
     state = TreeTensorNetwork.rand(plan, D=2, seed=10)
@@ -185,10 +188,13 @@ def test_depth_first_lossless_gate_replay(mode):
     gate = np.linalg.qr(matrix)[0].astype(complex)
     stream = [(gate, (0, 3, 5)), (gate, (1, 2, 4))]
     exact = TreeOptimizer(stream, state=state, chi=64, cutoff=0., mode="direct")
-    fitted = TreeOptimizer(stream, state=state, chi=64, cutoff=0., mode=mode,
-                           fit_traversal="depth-first")
+    fitted = TreeOptimizer(stream, state=state, chi=64, cutoff=0., mode=mode)
     np.testing.assert_allclose(fitted.to_dense(), exact.to_dense(), atol=1e-10)
     assert fitted.get_fit_diagnostics()["traversal"] == "depth-first"
+    assert fitted.get_fit_diagnostics()["fit_init_strategy_requested"] == "auto"
+    assert fitted.get_fit_diagnostics()["fit_init_strategy"] == "guess_src"
+    assert fitted.get_fit_diagnostics()["guess_used"] is True
+    assert fitted.copy().fit_traversal == "depth-first"
     fitted.tn.validate(check_canonical=True)
 
 

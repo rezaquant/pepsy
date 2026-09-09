@@ -1,5 +1,9 @@
 # Tree FIT execution improvements — 2026-09-08
 
+The initial implementation and audits below retain their historical defaults.
+See [the adoption follow-up](#default-adoption-follow-up) for the current
+TreeOptimizer default.
+
 Implements the first three priorities from the [mode review](tree_modes_review.md):
 less tree travel, faster native environments, and an exact one-node local solve.
 The affected production paths are `pepsy.fitting.tree` and
@@ -135,3 +139,87 @@ tree skill validator, skill catalog validator, and `git diff --check` passed.
 The full repository suite was not rerun because this change is confined to
 tree FIT and its optimizer integration; shared tree consumers were checked
 explicitly instead. Benchmark harnesses and profiles remain under `/tmp`.
+
+## DMRG/direct timing audit (2026-09-08)
+
+A reported Torch table showed direct at 12.759 s and DMRG1/2/3 at
+89.363/107.652/145.302 s. The producing script, device, dtype, and iteration
+options were not supplied, so those exact measurements were not reproduced.
+The current default permits four iterations with two directional passes each,
+plus a disposable SRC guess. Named DMRG2/3 include larger-block factorization.
+
+A separate CPU probe used a balanced 12-qubit tree, initial random bond 8
+(seed 3), twelve long-range random two-qubit unitaries (NumPy RNG seed 4,
+QR of complex Gaussian 4x4 matrices, supports `(i, (i+5) % 12)`), cap 8,
+complex128, one Torch thread, and SRC guess seed 13. The untruncated reference
+used direct with cap 64 and zero cutoff. Median replay times over three
+sequential runs, without profiling or fidelity contractions inside the timer:
+
+| Mode | Traversal | Seconds | Final exact fidelity |
+| --- | --- | ---: | ---: |
+| direct | depth | 0.0328 | 0.258763168 |
+| dmrg1 | depth | 0.3799 | 0.255465384 |
+| dmrg1 | depth-first | 0.2464 | 0.259151942 |
+| dmrg2 | depth-first | 0.2507 | 0.262097701 |
+| dmrg3 | depth-first | 0.2932 | 0.263445759 |
+
+All DMRG fits consumed four iterations; block traces were `(1,1,1,1)`,
+`(2,2,1,1)`, and `(3,3,2,1)` respectively. Automatic complex128 rtol was
+1e-9. A separate depth-first DMRG1 run with rtol=1e-5 still used all four
+iterations and returned the same fidelity; its small timing difference is
+not evidence of tolerance-driven savings.
+
+A cProfile run of depth-ordered DMRG1 took 0.865 s: 0.679 s in `run_gate`,
+including 672 block updates, 0.346 s preparing canonical centers and 0.302 s
+building effective blocks. Profiling adds substantial Python overhead; these
+times must not be compared directly with the unprofiled medians above.
+Depth-first reduced unprofiled DMRG1 time by about 35% in this small probe,
+but traversal changes finite-sweep results. Keep it opt-in pending the user's
+actual workload. This establishes a traversal bottleneck and substantial
+scheduled work, not a correctness failure or a general GPU speed claim.
+
+Rechecked the required Quimb, Autoray, Cotengra, and Symmray sources; the
+Symmray Abelian HTML page remained unavailable. Installed versions were
+Quimb 1.15.1.dev39+g369d09b9d, Autoray 0.11.1.dev1+gc56f64427,
+Cotengra 0.8.3.dev6+g08fe1a3a1, and Symmray 0.3.2.dev6+ga17699db6.
+Probed actual `tensor_contract` and `tensor_split` signatures; no upstream
+API or numerical dispatch change was needed. Classification: retain the
+existing depth-first prototype; defer default changes and larger-rank/GPU
+claims until the reported workload is available. No runtime code changed.
+
+Validation: all 51 incremental-environment and execution-policy tests passed;
+whitespace checks passed. The full repository suite was not rerun for this
+documentation-only audit.
+
+## Default adoption follow-up
+
+At the user's request, TreeOptimizer now defaults to
+`fit_traversal="depth-first"` for generic `dmrg` and named `dmrg1/2/3`.
+Automatic initial guesses remain SRC for dense states and direct for native
+fermionic states. Explicit traversal/guess choices and each mode's iteration,
+rank-growth, and block-transition schedules remain authoritative. Copies
+preserve the selected policy. Standalone TreeFIT retains its `"depth"`
+default, so shared callers such as TreePeps do not implicitly change order.
+Finite-sweep results can change; explicit `fit_traversal="depth"` restores
+the former ordering.
+
+Rechecked the required upstream sources and actual public `tensor_contract`
+and `tensor_split` signatures in the active environment. Installed versions
+remain Quimb 1.15.1.dev39+g369d09b9d, Autoray 0.11.1.dev1+gc56f64427,
+Cotengra 0.8.3.dev6+g08fe1a3a1, and Symmray 0.3.2.dev6+ga17699db6.
+Symmray's Abelian HTML page remained unavailable. Classification: adopt the
+already validated traversal at the optimizer API boundary; no numerical
+driver, dependency, or compatibility shim change.
+
+The lossless replay regression now exercises all four modes with omitted
+traversal and initialization options, checks the actual SRC/DFS diagnostics,
+and validates the final canonical state. Explicit legacy traversal and alias
+normalization are covered through optimizer copies; native automatic-guess
+regressions retain their direct path.
+
+Validation: 54 focused tests passed; the broader tree/FIT/sampler/trajectory
+selection passed 617 tests, skipped 4, and deselected the independently
+reproduced upstream DM complex64 failure recorded in the SRC audit. Ruff,
+skill catalog validation, and whitespace checks passed. The full repository
+suite was not run; this default change is confined to TreeOptimizer and its
+replay callers, with standalone TreeFIT's default preserved.
