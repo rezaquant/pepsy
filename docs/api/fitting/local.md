@@ -42,6 +42,13 @@ classifies dense/native arrays in one pass and rejects layered targets from
 the one-tensor-per-site shortcut by tensor count before scanning site tags.
 Target index separation and native contraction ordering remain unchanged.
 
+Cached one-site sweeps retain the optimized site's QR isometry without
+absorbing R into the next tensor, which the next effective update replaces.
+This applies to NumPy, Torch, and JAX arrays with unchanged QR bond size,
+including one-site refinement after larger-block sweeps. Shape-reducing QR
+and native symmetry tensors retain ordinary canonicalization. The completed
+sweep's state, canonical center, and norm have the same semantics as before.
+
 Tree-shaped states use the companion `pepsy.fitting.TreeFIT` class. It keeps
 the same target/guess ownership model and `run`/`run_eff`/`run_gate` vocabulary,
 but caches a directed overlap environment for every tree edge and moves the

@@ -237,8 +237,11 @@ result = simulator.run(shots=10_000, strategy="auto", seed=7)
 Each trajectory starts from the constructor state, so repeated shot runs are
 independent. `strategy="independent"` stores one optimizer per shot, while
 `strategy="coalesced"` or `"auto"` shares deterministic prefixes and preserves
-branch multiplicities in the returned `NoisyResult`. Use `run_kwargs={...}` for
-ordinary single-trajectory replay options such as `progbar=False`.
+branch multiplicities in the returned `NoisyResult`. Ordinary replay options
+such as `n_iter`, `cutoff`, `fit_rtol`, and `timing` now apply to every shot
+when passed directly to `run`. `run_kwargs={...}` remains supported and its
+explicit values override the corresponding top-level per-trajectory options.
+Mode selection and the shot RNG remain parent-level controls.
 
 Use `retain="all"` (the default) for final states plus replay metadata,
 `retain="final"` for final states without concrete streams and records, or
@@ -608,11 +611,19 @@ unclipped ratio. `opt.norm_diagnostics()` exposes the latest local value as
 matching `*_infidelity` fields. These are compression fidelities measured from
 norms, not directional target-state fidelities.
 
-Measurement and reset Born weights refer to the state before collapse. Very
-small weights are contracted through the branch projector to avoid cancellation
-in `1 - <P>`; positive rare forced outcomes remain valid. Measurement norm
-accounting includes `p.exponent` on both sides, including the raw norm returned
-by DMRG FIT, so represented scale does not appear as compression loss.
+Measurement and reset Born weights refer to the state before collapse. Dense
+MPS probabilities use projected amplitudes rather than reduced-density-matrix
+subtraction, preserving rare X/Y as well as Z outcomes. For multiple sites,
+an untruncated disposable Clifford circuit collects parity on one qubit using
+only one- and two-qubit gates. Probability preparation therefore also avoids
+an exponentially sized Pauli matrix. The selected collapse still uses the
+requested compressor and bond-two projector described above.
+Measurement, reset, and Kraus norm accounting keeps `p.exponent` separate from
+the raw norms, including the norm returned by DMRG FIT. A common large positive
+or negative exponent cancels before forming compression ratios. Event fields
+`expected_norm_mantissa`, `expected_norm_exponent`, `observed_norm_mantissa`,
+and `observed_norm_exponent` preserve the scaled values; display norms outside
+float range become infinity or zero without invalidating the ratio.
 Canonical controls reuse tracked center norms; caps keep their raw contraction
 scale and establish a fresh baseline for subsequent unitary evolution.
 
@@ -621,6 +632,20 @@ live-MPS norm. `cumulative_norm` is different: it is the square root of the
 accumulated retained-norm survival proxy. Thus the local and cumulative
 fidelity fields describe compression survival, while `state_norm` describes
 the current tensor-network state scale.
+
+Canonical norm diagnostics use the tracked center tensor. For frequent polling,
+use `opt.norm_diagnostics(include_history=False)`: it incrementally updates
+summary statistics and omits the historical arrays. The default retains the
+full report for compatibility and necessarily scales with the history returned.
+Treat committed norm events as read-only when using incremental summaries.
+Mixed rollback and state replacement invalidate the summary cache.
+
+Repeated gates reuse unchanged immutable active-support snapshots. Internal
+dense trajectory clones preserve isometries in owned arrays without center
+discovery or recanonicalization. Append-only history prefixes are shared during
+coalesced construction, then detached before final leaves are exposed so their
+public records remain independently mutable. Native/unknown array copies keep
+the conservative isolation path.
 
 DMRG additionally reports `fit_overlap_fidelity` and
 `fit_overlap_infidelity` in `opt.get_fit_diagnostics()` only when

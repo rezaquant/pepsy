@@ -78,13 +78,8 @@ def _compression_method(mode):
     mode = _normalize_compression_mode(mode)
     if mode == "dm":
         return "svd:eig"
-    if mode == "src":
-        # A general tree cannot use Quimb's chain-only SRC environment sweep,
-        # but its local truncations can safely use the same randomized-SVD
-        # sketch. ``TreeOptimizer`` applies this successively over tree edges.
-        return "svd:rand"
-    # ``direct`` and ``sdc`` both use the tree-native successive edge sweep.
-    # The latter is the deterministic tree analogue of Quimb's 1D SDC.
+    if mode in {"src", "sdc"}:
+        raise ValueError("SRC/SDC require complementary environments, not a local split driver")
     return "svd"
 
 
@@ -2199,22 +2194,24 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         ``compression_mode="direct"`` uses the standard SVD, while
         ``compression_mode="dm"`` uses Quimb's density-matrix-equivalent
         ``svd:eig`` decomposition on the local canonical core. ``"sdc"``
-        selects the deterministic successive tree-edge sweep and ``"src"``
-        selects a successive randomized-SVD tree sweep. These tree modes are
-        distinct from Quimb's chain-only environment compressors; a full
-        Cholesky projected tree compressor remains a separate future method.
+        and ``"src"`` construct deterministic or random complementary
+        environments for this two-node region and then apply QR projectors.
+        Their whole-tree versions are available through :meth:`compress`.
         """
         compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode in {"src", "sdc"}:
+            if absorb not in {"left", "right"}:
+                raise ValueError("successive edge compression requires left or right absorption")
+            hub = b if absorb == "right" else a
+            source = a if absorb == "right" else b
+            return self._compress_successive_region(
+                [(source, hub)], hub, max_bond=max_bond, cutoff=cutoff,
+                cutoff_mode=cutoff_mode, method=compression_mode, seed=compression_seed,
+            )
         if compression_mode == "dm" and self.fermionic:
             raise NotImplementedError(
                 "compression_mode='dm' is currently available for dense "
                 "tree tensors only; use compression_mode='direct' for "
-                "native fermionic trees."
-            )
-        if compression_mode == "src" and self.fermionic:
-            raise NotImplementedError(
-                "compression_mode='src' is currently available for dense "
-                "tree tensors only; randomized SVD is not charge-safe for "
                 "native fermionic trees."
             )
 
@@ -2250,14 +2247,33 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 absorb=absorb,
                 reduced=reduced,
                 method=_compression_method(compression_mode),
-                **(
-                    {"seed": int(compression_seed)}
-                    if compression_mode == "src" and compression_seed is not None
-                    else {}
-                ),
             )
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
+        return self
+
+    def _compress_successive_region(self, order, hub, *, max_bond, cutoff,
+                                    cutoff_mode, method, seed):
+        from .compression import successive_tree_compress
+
+        nodes = {hub, *(u for u, _ in order)}
+        if self.fermionic:
+            raise NotImplementedError(
+                f"tree {method} environments require dense tensors; use direct or zipup"
+            )
+        self.canonize_subtree_(nodes)
+        local = {u: [self.tensor_map[self.node_tid(u)].copy()] for u in nodes}
+        result, _ = successive_tree_compress(
+            local, order, hub, method=method, max_bond=max_bond,
+            cutoff=cutoff, cutoff_mode=cutoff_mode, seed=seed,
+        )
+        for u, tensor in result.items():
+            self.tensor_map[self.node_tid(u)].modify(
+                data=tensor.data, inds=tensor.inds,
+                left_inds=None if u == hub else tensor.left_inds,
+            )
+        self._canonical_region = frozenset({hub})
+        self._invalidate_norm_cache()
         return self
 
     def compress(
@@ -2302,8 +2318,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         reduced : bool, optional
             Use the reduced two-sided edge compression path where available.
         compression_mode : {"direct", "dm", "sdc", "src"}, optional
-            Dense tree-edge decomposition. ``"sdc"`` uses the deterministic
-            successive tree sweep and ``"src"`` uses randomized SVD per edge.
+            ``direct``/``dm`` use canonical edge compression. ``sdc``/``src``
+            use deterministic/random complementary environments and a
+            successive projector sweep on the original target.
         compression_seed : int, optional
             Seed for ``compression_mode="src"``.
 
@@ -2328,6 +2345,18 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 center = self._plan.root
         if center not in self._plan.children:
             raise ValueError(f"{center!r} is not a node of the tree.")
+
+        compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode in {"src", "sdc"}:
+            order = sorted(
+                ((u, self._plan.node_path(u, center)[1])
+                 for u in self._plan.nodes() if u != center),
+                key=lambda edge: -len(self._plan.node_path(edge[0], center)),
+            )
+            return self._compress_successive_region(
+                order, center, max_bond=max_bond, cutoff=cutoff,
+                cutoff_mode=cutoff_mode, method=compression_mode, seed=compression_seed,
+            )
 
         # Establish a known centre once. The subsequent post-order traversal
         # then compresses each edge exactly after all of its outward branches

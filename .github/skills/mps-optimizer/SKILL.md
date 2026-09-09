@@ -126,10 +126,14 @@ before rebuilding an open MPS.
 - Pass the tracked range through Quimb `info` arguments and canonicalization.
 - Local Pauli expectations should use `local_expectation_canonical` when
   available and move the center from the tracked range to the support.
-- Canonical Kraus Gram expectations share that tracked-center path. Control
-  norms include the represented exponent, including raw FIT measurement norms.
-  Recontract small Born weights with the projector instead of subtracting
-  nearly equal scalars; positive rare branches are not impossible outcomes.
+- Canonical one-site dense Kraus probabilities and Pauli Born weights use
+  projected amplitudes, not cancellation-prone reduced-density-matrix Gram
+  forms. Multi-Pauli weights collect parity with an untruncated disposable
+  Clifford circuit; never form an exponential dense Pauli matrix for dense
+  MPS measurements. Native arrays retain their graded contraction route.
+- Keep control norms and exponents separate until forming their ratio,
+  including raw FIT measurement norms. Display overflow/underflow must not
+  corrupt Born weights or compression loss.
 - Norm diagnostics should canonicalize to one center and use its tensor norm;
   do not replace this with a global doubled-network contraction.
 - Local non-unitary scale control reuses an authoritative singleton center
@@ -142,6 +146,13 @@ before rebuilding an open MPS.
   insertion site.
 - Temporary target copies (`p.copy()`) must use isolated metadata and must not
   overwrite the live `info_c` dictionary.
+- Trusted internal dense branch clones own tensor arrays and preserve existing
+  isometries without constructor/canonicalization scans. Shared append-only
+  history records must be detached before publishing coalesced leaves.
+- Shot replay inherits ordinary numerical controls through one resolver;
+  explicit `run_kwargs` overrides win. Never serialize deprecated sentinels.
+- Validate run options before installing a transient layout. Every subsequent
+  exit must restore the original logical ordering.
 - Dense SRC/random FIT guesses own their active data, so rollback may retain
   the untouched original MPS. If the actual guess aliases the live state,
   isolate rollback before FIT; native warm-starts still copy before mutation.

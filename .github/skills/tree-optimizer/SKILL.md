@@ -232,8 +232,10 @@ TreeFIT rejects odd-parity fermionic tensors because their graded local
 projection is unsupported; use native `direct` or `zipup` for those states.
 
 - `direct` QR-routes the complete operator before canonical SVD compression.
-  `dm` changes the local split to `svd:eig`; `src` uses randomized edge SVD.
-  Tree `sdc` currently shares the deterministic SVD sweep with `direct`.
+  `dm` changes the local split to `svd:eig`. Dense `src` contracts product-noise
+  complementary environments; `sdc` builds deterministic low-rank environments.
+  Both construct nested QR projectors from the original layered target. Never
+  replace these algorithms with local randomized SVD or a `direct` alias.
 - `zipup` contracts node layers with arriving child messages and truncates
   each outgoing message immediately. Do not add a full-target materialization
   or canonical precompression. Its intermediate cuts have noncanonical

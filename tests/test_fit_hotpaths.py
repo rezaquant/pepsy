@@ -1,5 +1,7 @@
 """Cache, initialization, and scalar-read regressions for gate FIT."""
 
+import math
+
 import numpy as np
 import pytest
 import quimb as qu
@@ -7,6 +9,115 @@ import quimb.tensor as qtn
 
 import pepsy as py
 import pepsy.fitting.local as local
+
+
+def _full_one_site_gauge(psi, site, direction):
+    if direction == "R":
+        psi.left_canonize_site(site, bra=None)
+    else:
+        psi.right_canonize_site(site, bra=None)
+
+
+@pytest.mark.parametrize("backend,dtype,block_size,sequence,operator", [
+    ("numpy", "complex128", 1, "RL", False),
+    ("numpy", "complex64", 2, "LR", False),
+    ("numpy", "complex128", 3, "RRL", False),
+    ("torch", "complex128", 1, "LR", False),
+    ("torch", "complex64", 3, "RL", False),
+    ("jax", "complex64", 2, "LR", False),
+    ("numpy", "complex128", 1, "LR", True),
+    ("torch", "complex128", 3, "RL", True),
+])
+def test_one_site_qr_matches_full_gauge(
+    monkeypatch, backend, dtype, block_size, sequence, operator
+):
+    constructor = qtn.MPO_rand if operator else qtn.MPS_rand_state
+    state = constructor(6, 3, dtype=dtype, seed=712)
+    target = constructor(6, 4, dtype=dtype, seed=713)
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        for p in (state, target):
+            p.apply_to_arrays(lambda a: torch.as_tensor(a))
+    elif backend == "jax":
+        jax = pytest.importorskip("jax")
+        for p in (state, target):
+            p.apply_to_arrays(jax.numpy.asarray)
+    fast = py.FIT(target, p=state, range_int=[0, 5])
+    reference = py.FIT(target, p=state, range_int=[0, 5])
+    options = dict(n_iter=5, block_size=block_size, sweep_sequence=sequence,
+                   max_bond=4, cutoff=0, rtol=None, final_one_site_sweeps=1)
+    fast.run_gate(**options)
+    monkeypatch.setattr(py.FIT, "_isometrize_before_one_site_overwrite",
+                        staticmethod(_full_one_site_gauge))
+    reference.run_gate(**options)
+    tol = 2e-5 if dtype == "complex64" else 1e-11
+    np.testing.assert_allclose(local.ar.to_numpy(fast.p.to_dense()),
+                               local.ar.to_numpy(reference.p.to_dense()), atol=tol)
+    assert fast.final_center_site == reference.final_center_site
+    assert float(fast.final_norm) == pytest.approx(float(reference.final_norm), abs=tol)
+    for site in range(6):
+        tensor = fast.p[site]
+        assert tensor.inds == reference.p[site].inds
+        assert tensor.tags == reference.p[site].tags
+        assert tensor.left_inds == reference.p[site].left_inds
+        assert str(tensor.dtype) == str(reference.p[site].dtype)
+        if site != fast.final_center_site:
+            left = tensor.left_inds
+            right = tuple(ind for ind in tensor.inds if ind not in left)
+            data = local.ar.to_numpy(tensor.transpose(*left, *right).data)
+            matrix = data.reshape(-1, math.prod(tensor.ind_size(i) for i in right))
+            np.testing.assert_allclose(matrix.conj().T @ matrix,
+                                       np.eye(matrix.shape[1]), atol=tol)
+
+
+@pytest.mark.parametrize("direction", ["R", "L"])
+@pytest.mark.parametrize("bond_size", [2, 5])
+def test_one_site_qr_skips_neighbor_only_when_shape_is_preserved(direction, bond_size):
+    state = qtn.MPS_rand_state(3, bond_size, dtype="complex128", seed=71)
+    site = 0 if direction == "R" else 2
+    neighbor = state[1].data
+    reference = state.copy(deep=True)
+    _full_one_site_gauge(reference, site, direction)
+    py.FIT._isometrize_before_one_site_overwrite(state, site, direction)
+    np.testing.assert_allclose(state[site].data, reference[site].data, atol=1e-12)
+    if bond_size == 2:
+        assert state[1].data is neighbor
+    else:
+        assert state[1].data is not neighbor
+        assert state.bond_size(site, 1) == 2
+        np.testing.assert_allclose(state.to_dense(), reference.to_dense(), atol=1e-12)
+
+
+def test_one_site_qr_preserves_torch_target_gradient(monkeypatch):
+    torch = pytest.importorskip("torch")
+    state = qtn.MPS_rand_state(4, 2, dtype="complex128", seed=41)
+    target = qtn.MPS_rand_state(4, 2, dtype="complex128", seed=42)
+    for p in (state, target):
+        p.apply_to_arrays(lambda a: torch.as_tensor(a))
+    variable = target[2].data.requires_grad_()
+
+    def evaluate():
+        fit = py.FIT(target, p=state, range_int=[0, 3])
+        fit.run_gate(n_iter=2, block_size=1, sweep_sequence="RL", rtol=None)
+        value = fit.p.to_dense().real.sum()
+        return torch.autograd.grad(value, variable)[0]
+
+    fast = evaluate()
+    monkeypatch.setattr(py.FIT, "_isometrize_before_one_site_overwrite",
+                        staticmethod(_full_one_site_gauge))
+    reference = evaluate()
+    assert torch.isfinite(fast).all()
+    torch.testing.assert_close(fast, reference, atol=1e-11, rtol=1e-10)
+
+
+def test_one_site_qr_handles_structural_zero_columns():
+    state = qtn.MPS_rand_state(3, 2, dtype="complex128", seed=71)
+    state[0].modify(data=np.zeros_like(state[0].data))
+    reference = state.copy(deep=True)
+    _full_one_site_gauge(reference, 0, "R")
+    py.FIT._isometrize_before_one_site_overwrite(state, 0, "R")
+    assert np.isfinite(state[0].data).all()
+    np.testing.assert_allclose(state[0].data, reference[0].data, atol=1e-12)
 
 
 @pytest.mark.parametrize("backend,direction", [

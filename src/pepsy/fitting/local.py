@@ -2223,6 +2223,40 @@ class FIT:  # pylint: disable=too-many-instance-attributes
     # Active gate-window solver
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _isometrize_before_one_site_overwrite(psi, site, direction):
+        """QR the optimized site when the next effective tensor replaces its neighbor.
+
+        Cached environments exclude that neighbor from its own next update.
+        Thus absorbing R into it is dead work, provided the bond size stays
+        unchanged. This is deliberately not a general canonical-center move:
+        the intermediate network does not represent the previous state.
+        Native arrays and shape-changing QR keep Quimb's complete gauge move.
+        """
+        neighbor = site + (1 if direction == "R" else -1)
+        tensor = psi[site]
+        shared = tuple(ind for ind in tensor.inds if ind in psi[neighbor].inds)
+        if len(shared) == 1 and ar.infer_backend(tensor.data) in {
+            "numpy", "torch", "jax"
+        }:
+            bond, = shared
+            left_inds = tuple(ind for ind in tensor.inds if ind != bond)
+            # Reduced QR must not leave mismatched index sizes in the network.
+            # Numerical rank deficiency alone does not shrink a dense QR.
+            rows = math.prod(tensor.ind_size(ind) for ind in left_inds)
+            if rows >= tensor.ind_size(bond):
+                q, _ = tensor.split(
+                    left_inds=left_inds, right_inds=(bond,), method="qr",
+                    absorb="right", get="tensors",
+                )
+                q.transpose_like_(tensor)
+                tensor.modify(data=q.data, left_inds=left_inds)
+                return
+        if direction == "R":
+            psi.left_canonize_site(site, bra=None)
+        else:
+            psi.right_canonize_site(site, bra=None)
+
     def _run_gate_one_site_sweep(
         self,
         psi,
@@ -2340,7 +2374,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 moving_canonicalization_started = (
                     self._timing_mark() if timing_record is not None else None
                 )
-                psi.left_canonize_site(site, bra=None)
+                self._isometrize_before_one_site_overwrite(psi, site, "R")
                 moving_canonicalization_finished = (
                     self._timing_mark(psi[site])
                     if timing_record is not None
@@ -2367,7 +2401,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 moving_canonicalization_started = (
                     self._timing_mark() if timing_record is not None else None
                 )
-                psi.right_canonize_site(site, bra=None)
+                self._isometrize_before_one_site_overwrite(psi, site, "L")
                 moving_canonicalization_finished = (
                     self._timing_mark(psi[site])
                     if timing_record is not None

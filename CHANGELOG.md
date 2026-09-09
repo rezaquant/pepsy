@@ -22,6 +22,27 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Tree SRC and SDC now build directed complementary environments and project
+  the original layered target in a second tree sweep. This replaces local
+  randomized SVD and the former direct-sweep alias. Dense SRC uses seeded
+  product-noise sketches; SDC uses deterministic low-rank factors. Native
+  symmetry tensors reject these modes explicitly; native zipup remains a
+  streamed truncating algorithm. SRC warns that cutoff is ignored.
+
+- Cached dense one-site FIT sweeps skip the redundant QR-factor absorption
+  into the next tensor before its effective update overwrites it. NumPy,
+  Torch, and JAX use this shortcut when the bond shape is preserved; native
+  symmetry and shape-reducing QR retain the complete canonicalization path.
+
+- Fixed rare X/Y MPS measurement probabilities and false compression loss
+  using projected amplitudes; dense multi-Pauli probability preparation no
+  longer builds exponential matrices. Control and Kraus ratios preserve
+  extreme represented exponents. Invalid transient-layout options no longer
+  reorder the state, shot replay inherits top-level numerical controls, and
+  mode changes clear stale FIT diagnostics. Reduced branch-copy and support
+  history work; added `norm_diagnostics(include_history=False)` for incremental
+  summary polling with tracked-center norms.
+
 - Aligned `MpoOptimizer` with MPS replay: default `mode="direct"` with
   `"mpo"`/`"quimb"` aliases, dtype-aware FIT defaults, the DMRG3 two-site
   transition, and opt-in `finite_check` across modes. Corrected operator

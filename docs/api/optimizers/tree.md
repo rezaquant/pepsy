@@ -670,17 +670,33 @@ On a native fermionic tree, an overly small cap can remove every compatible
 charge path. Zipup raises before installing such an empty state; increase
 `chi` or choose `direct`, whose cuts see the complete operator environment.
 
-`compression_mode="sdc"` selects the deterministic successive tree-edge
-sweep already used by the tree canonical-compression machinery. It is the
-tree-safe analogue of Quimb's 1D SDC environment compressor, not a claim that
-the chain algorithm has been applied to a branching tree. `compression_mode="src"`
-selects a successive randomized-SVD split on each dense tree edge and accepts
-`compression_seed=...` for reproducible sketches. Native fermionic trees reject
-`src` because an ungraded randomized sketch cannot preserve Symmray charge
-sectors. These modes expose safe tree behavior; they do not yet implement the
-paper's full projected Cholesky (CBC) precomputation for general TTNs.
-At present, `sdc` and `direct` use the same deterministic SVD tree sweep;
-they are not independent algorithms to compare in a tree benchmark.
+`compression_mode="src"` contracts product-noise sketches of complementary
+branches, caching a directed environment on each tree edge. A second sweep
+forms QR projectors using those environments and the original layered target,
+then propagates the projected target toward the hub. `compression_seed=...`
+makes the sketches reproducible. As in Quimb SRC, the sample count is set by
+`chi`; nonzero `cutoff` is ignored with a warning. With `chi=None`, the sample
+count uses the largest original cut dimension to retain the full range.
+
+`compression_mode="sdc"` uses the same successive projection structure with
+deterministic low-rank complementary environments. Their factors are computed
+using direct truncated SVD, avoiding squared conditioning and a NumPy
+complex64 JIT failure in the installed Quimb eigendecomposition driver.
+`cutoff`, `cutoff_mode`, and `chi` control those environment factors.
+
+These are distinct environment algorithms, not randomized local SVD or aliases
+of `direct`. On a path they reproduce Quimb's SRC/SDC sweeps (SRC comparisons
+use identical sketches). On a branching tree, each retained node incorporates
+its already projected children and a cached complementary environment.
+They never materialize the complete operator-applied tree before compression.
+The final hub is canonical and retains the projected target norm.
+
+Both environment methods currently require dense arrays. Native symmetry
+trees reject them explicitly; use native `direct` or `zipup`. Edge records
+report dimensions, but do not invent discarded spectra or global error bounds
+from these approximate environments. TreeFIT guesses use these algorithms;
+its subsequent local refinement uses direct SVD. A Cholesky-based compressor
+is not implemented by either mode.
 
 ### Tree-native FIT / DMRG
 

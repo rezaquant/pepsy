@@ -3018,7 +3018,8 @@ def _trajectory_norm_squared(optimizer) -> float:
     """Read the represented state norm through the optimizer's public API."""
     norm = getattr(optimizer, "norm", None)
     if isinstance(optimizer, MpsOptimizer):
-        value = optimizer._control_state_norm()
+        # A common represented exponent cancels from every Born ratio.
+        value = optimizer._control_state_norm(include_exponent=False)
     elif callable(norm):
         value = _trajectory_real_scalar(norm(), label="trajectory state norm")
     else:
@@ -3043,6 +3044,16 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
     if not callable(compute):
         return None
     try:
+        if (isinstance(optimizer, MpsOptimizer)
+                and optimizer.mode not in {"exact", "su"}
+                and len(where) == 1 and not optimizer._replay_has_symmray_data(p)):
+            site = int(where[0])
+            optimizer.canonize_mps(p, site)
+            tensor = p[site]
+            normalized = tensor / tensor.norm()
+            projected = normalized.gate(matrix, p.site_ind(site))
+            amplitude = _trajectory_real_scalar(projected.norm(), label="local Kraus amplitude")
+            return amplitude * amplitude
         gram = matrix.conj().T @ matrix
         support = tuple(int(site) for site in where)
         canonical = getattr(p, "local_expectation_canonical", None)
@@ -3122,6 +3133,8 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
         physical_where[0] if len(physical_where) == 1 else physical_where,
         contract=True,
     )
+    if isinstance(optimizer, MpsOptimizer):
+        candidate.exponent = 0.0
     value = _trajectory_real_scalar(candidate.norm(), label="Kraus branch norm")
     if not np.isfinite(value) or value < 0.0:
         raise ValueError("Kraus branch produced an invalid MPS norm.")
@@ -3437,11 +3450,13 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
         )
     if isinstance(norm_event, dict) and "input_norm" in norm_event:
         probability = float(norm_event["branch_probability"])
-        projected_norm = optimizer._control_state_norm()
+        projected_norm = optimizer._control_state_norm(include_exponent=False)
         optimizer._record_norm_event(
             "trajectory_kraus",
             expected_norm=float(norm_event["input_norm"]) * np.sqrt(probability),
             observed_norm=projected_norm,
+            expected_exponent=norm_event.get("input_exponent", 0.0),
+            observed_exponent=optimizer._real_float(optimizer.p.exponent),
             where=_trajectory_where(where),
             branch_probability=probability,
             physical_boundary=True,
@@ -3795,7 +3810,8 @@ def _apply_trajectory_event(
         norm_event = {
             "kind": "trajectory_kraus",
             "branch_probability": float(probability),
-            "input_norm": optimizer._control_state_norm(),
+            "input_norm": optimizer._control_state_norm(include_exponent=False),
+            "input_exponent": optimizer._real_float(optimizer.p.exponent),
         }
     else:
         norm_event = None
@@ -4712,6 +4728,10 @@ def _coalesced_result(nodes, *, plan=None, retain="all") -> CoalescedTrajectoryR
             shot_count=shot_count,
             diagnostics=diagnostics,
         )
+    for node in nodes:
+        detach_histories = getattr(node.optimizer, "_detach_branch_histories", None)
+        if callable(detach_histories):
+            detach_histories()
     return CoalescedTrajectoryResult(
         tuple(
             CoalescedTrajectoryLeaf(
@@ -5426,7 +5446,8 @@ def _apply_coalesced_trajectory_outcome(
         norm_event = {
             "kind": "trajectory_kraus",
             "branch_probability": float(target_probability),
-            "input_norm": node.optimizer._control_state_norm(),
+            "input_norm": node.optimizer._control_state_norm(include_exponent=False),
+            "input_exponent": node.optimizer._real_float(node.optimizer.p.exponent),
         }
     else:
         norm_event = None

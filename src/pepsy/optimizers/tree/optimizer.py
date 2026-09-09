@@ -427,7 +427,7 @@ class TreeOptimizer:
         of explicit chain-MPO entries. Explicit sub-MPO entries are accepted
         in the other legacy modes for compatibility.
         ``"sdc"`` and ``"src"`` are shorthands for automatic routing with
-        deterministic or randomized successive tree-edge compression.
+        deterministic or randomized complementary-environment compression.
         ``"zipup"`` contracts one operator/state node with incoming child
         messages, then immediately truncates its outgoing message by SVD.
         Its intermediate cuts do not have a canonical right environment.
@@ -442,8 +442,9 @@ class TreeOptimizer:
         splits. ``"direct"`` uses SVD; ``"dm"`` uses Quimb's
         density-matrix-equivalent ``svd:eig`` decomposition on the local
         canonical compression core; ``"sdc"`` uses the deterministic
-        successive tree sweep and ``"src"`` uses randomized SVD per dense
-        tree edge. These modes do not build a global dense state.
+        low-rank complementary environments and ``"src"`` uses contracted
+        product-noise environments. Both then construct nested QR projectors
+        from the layered target. They do not build a global dense state.
     structure : {"quality", "balanced", "adaptive"}
         Tree-structure strategy used when ``tree`` is not supplied.
     max_arity : int, None, or iterable of ints
@@ -3165,7 +3166,7 @@ class TreeOptimizer:
         For a TreeMPO-backed gate, ``guess-src`` follows the requested
         ``sub_treempo @ tree`` route: the operator is applied to a private
         copy of the current tree and compressed with the tree-native SRC
-        edge sweep. The exact target is kept separate and is never reused as
+        environment sweep. The exact target is kept separate and is never reused as
         the FIT initial state.
         """
 
@@ -3263,7 +3264,11 @@ class TreeOptimizer:
             guess_backend = None
         else:
             guess, strategy, random_info, guess_backend = guess_result
-        split_method = "direct" if self.compression_mode == "sdc" else self.compression_mode
+        # SRC/SDC are complete environment algorithms, not local SVD drivers.
+        split_method = (
+            "direct" if self.compression_mode in {"src", "sdc"}
+            else self.compression_mode
+        )
         block_size = self._fit_block_size()
         fit = TreeFIT(
             target,
@@ -3760,15 +3765,15 @@ class TreeOptimizer:
             compatibility selectors for shared coefficient frontends.
             ``"dm"`` selects automatic gate routing with density-matrix
             compression. ``"sdc"`` and ``"src"`` select automatic routing
-            with deterministic or randomized successive tree-edge
+            with deterministic or randomized complementary-environment
             compression, respectively. ``"dmrg"`` selects TreeFIT with the
             configured adaptive block schedule. ``"dmrg1"`` and ``"dmrg2"``
             use two-node warm-up blocks, while ``"dmrg3"`` uses three-node
             warm-up blocks followed by its configured two-node transition;
             each named schedule then performs one-node refinement.
         compression_mode : {"direct", "dm", "sdc", "src"} | None, default=None
-            Persistent decomposition used for TreeMPO state truncation and
-            layered TreeFIT local splits.
+            Persistent TreeMPO compression algorithm. SRC/SDC use environment
+            sweeps for guesses; TreeFIT refinement retains direct local SVD.
         compression_seed : int | None, default=None
             Override the configured randomized-compression seed for this run.
         finite_check : bool, default=False
@@ -5422,6 +5427,11 @@ class TreeOptimizer:
         leaves the centre at ``path[0]``.  This is the re-orthonormalisation
         sweep of Seitz et al. (Fig. 6) applied along the gate geodesic.
         """
+        if self.compression_mode in {"src", "sdc"}:
+            return self._compress_subtree(
+                path, path[0], max_bond=max_bond, cutoff=cutoff,
+                preserve_subcap=preserve_subcap,
+            )
         # Every node before the destination was produced by the lossless QR
         # threading sweep.  Its ``left_inds`` therefore prove that it is
         # isometric toward the destination side of the next compression edge.
@@ -5457,6 +5467,18 @@ class TreeOptimizer:
         """
         snodes = frozenset(snodes)
         self._move_center(hub)
+        if self.compression_mode in {"src", "sdc"}:
+            order = sorted(
+                ((u, self.plan.node_path(u, hub)[1]) for u in snodes if u != hub),
+                key=lambda edge: -len(self.plan.node_path(edge[0], hub)),
+            )
+            local = {u: [self.tn.tensor_map[self._tid(u)].copy()] for u in snodes}
+            self._successive_subtree_messages(
+                local, order, hub,
+                max_bond=self.chi if max_bond is None else max_bond,
+                cutoff=self.cutoff if cutoff is None else cutoff,
+            )
+            return
 
         def edge_cutoff(node, child):
             """Keep existing sub-cap bonds lossless during subtree replay.
@@ -5645,6 +5667,26 @@ class TreeOptimizer:
         finally:
             if pool is not None:
                 pool.shutdown()
+
+    def _successive_subtree_messages(self, local, order, hub, *, max_bond, cutoff):
+        """Compress layered targets using actual complementary environments."""
+        from .compression import successive_tree_compress
+
+        result, records = successive_tree_compress(
+            local, order, hub, method=self.compression_mode,
+            max_bond=max_bond, cutoff=cutoff, cutoff_mode=self.cutoff_mode,
+            seed=self.compression_seed,
+        )
+        physical_map = {self._phys(q) + "*": self._phys(q) for q in range(self.n)}
+        for tensor in result.values():
+            tensor.reindex_(physical_map)
+        self._install_routed_subtree(result, frozenset(local), hub)
+        for u, v, before, after, bond in records:
+            self._record_truncation(
+                kind=self.compression_mode, edge=(u, v), before_bond=before,
+                after_bond=after, bond_ind=bond, max_bond=max_bond,
+                cutoff=0.0 if self.compression_mode == "src" else cutoff,
+            )
 
     def _zipup_subtree_messages(self, local, state_inds, order, hub, *, max_bond, cutoff):
         """Contract and truncate one layered tree node at a time toward a hub.
@@ -5966,7 +6008,7 @@ class TreeOptimizer:
                             lower: physical,
                             upper: physical + "*",
                         })
-                        if self.mode == "zipup":
+                        if self.mode == "zipup" or self.compression_mode in {"src", "sdc"}:
                             local[nid] = [state_t, op_t]
                             continue
                         try:
@@ -5981,7 +6023,7 @@ class TreeOptimizer:
                                 route="subtreempo",
                             )
                     else:
-                        if self.mode == "zipup":
+                        if self.mode == "zipup" or self.compression_mode in {"src", "sdc"}:
                             local[nid] = [state_t, op_t]
                             continue
                         try:
@@ -5997,6 +6039,13 @@ class TreeOptimizer:
                         set(local[nid].inds) - state_inds[nid]
                     )
 
+                if self.compression_mode in {"src", "sdc"}:
+                    self._successive_subtree_messages(
+                        local, order, hub, max_bond=max_bond, cutoff=cutoff,
+                    )
+                    if started:
+                        self._finish_update()
+                    return self
                 if self.mode == "zipup":
                     self._zipup_subtree_messages(
                         local, state_inds, order, hub,

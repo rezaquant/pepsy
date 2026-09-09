@@ -8014,6 +8014,7 @@ def test_mps_optimizer_multisite_measurement_uses_bond_two_submpo(
                 kwargs.get("method"),
                 tuple(kwargs.get("where", ())),
                 submpo.max_bond(),
+                kwargs.get("max_bond"),
             )
         )
         return original(self, submpo, *args, **kwargs)
@@ -8032,7 +8033,12 @@ def test_mps_optimizer_multisite_measurement_uses_bond_two_submpo(
     )
     opt.run(progbar=False, cutoff=0.0)
 
-    assert calls == [(expected_method, (1, 2, 3, 4, 5), 2)]
+    # Probability preparation is lossless; only the final physical projection
+    # consumes the requested compressor and chi.
+    assert calls == [
+        ("direct", (5, 3), 2, None), ("direct", (3, 1), 2, None),
+        (expected_method, (1, 2, 3, 4, 5), 2, 8),
+    ]
     assert _dense_pauli_expectation(opt.p, "XZY", (1, 3, 5)) == pytest.approx(
         1.0
     )
@@ -8068,7 +8074,7 @@ def test_mps_optimizer_dmrg_measurement_uses_lazy_submpo_and_src_guess(monkeypat
     )
 
     diagnostics = opt.get_fit_diagnostics()
-    assert methods == ["lazy", "src"]
+    assert methods == ["direct", "direct", "lazy", "src"]
     assert diagnostics["target_representation"] == "lazy_submpo"
     assert diagnostics["guess_method"] == "src"
     assert diagnostics["fallback"] is False
