@@ -22,6 +22,16 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Cache up to 128 immutable SRC/SDC tree environment plans across calls.
+  Keep numerical messages and consumption counters private to each call;
+  test branch reuse, array release, in-place edits, and failure recovery.
+
+- Audited tree SRC against the paper and unmodified Quimb on layered paths.
+  Reuse one backend random generator, omit unused directed environments,
+  release consumed messages, drop intermediate tags, avoid internal preparatory
+  center moves, and request Q-only QR. Seeded path outputs now
+  match Quimb; seeded tree results change from the earlier seed-offset scheme.
+
 - Tree SRC and SDC now build directed complementary environments and project
   the original layered target in a second tree sweep. This replaces local
   randomized SVD and the former direct-sweep alias. Dense SRC uses seeded

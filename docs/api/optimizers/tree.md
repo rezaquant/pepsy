@@ -677,6 +677,26 @@ then propagates the projected target toward the hub. `compression_seed=...`
 makes the sketches reproducible. As in Quimb SRC, the sample count is set by
 `chi`; nonzero `cutoff` is ignored with a warning. With `chi=None`, the sample
 count uses the largest original cut dimension to retain the full range.
+The implementation follows the Khatri–Rao sketches, QR range extraction,
+and target projection in [SRC, Algorithm 1](https://arxiv.org/html/2504.06475v2#S3).
+The paper defines a chain algorithm; the tree route extends its QB construction
+to directed branch environments without claiming the paper proves that
+extension. On layered paths, the same seed now matches unmodified Quimb SRC
+in both directions. This changes seeded results relative to the earlier
+per-node seed-offset implementation.
+
+Only required environments and their dependencies are built. Path targets
+therefore use one fixed environment per edge, matching Quimb. Each environment
+is released after its last consumer, and projector QR requests only Q.
+Numerical environments are cached within one compression call and shared by
+its dependent branches. Across calls, a bounded cache (128 plans) reuses only
+immutable tree traversal and dependency information, keyed by edge order and
+hub. Arrays, dimensions, sketches, and consumption counters are always fresh:
+in-place edits, new operators, ranks, seeds, backends, and failed retries cannot
+reuse stale numerical environments.
+Intermediate contractions drop tags; final tensors retain their local tags.
+Only the exterior is canonicalized before SRC/SDC; the active tensors are
+replaced by the projector sweep without an initial internal center move.
 
 `compression_mode="sdc"` uses the same successive projection structure with
 deterministic low-rank complementary environments. Their factors are computed

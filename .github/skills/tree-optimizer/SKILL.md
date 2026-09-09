@@ -236,6 +236,9 @@ projection is unsupported; use native `direct` or `zipup` for those states.
   complementary environments; `sdc` builds deterministic low-rank environments.
   Both construct nested QR projectors from the original layered target. Never
   replace these algorithms with local randomized SVD or a `direct` alias.
+  Build only required directed environments, release them after last use,
+  and request Q-only QR. Check seeded layered paths against unmodified Quimb SRC.
+  Cache only bounded immutable geometry across calls; keep numerical messages local.
 - `zipup` contracts node layers with arriving child messages and truncates
   each outgoing message immediately. Do not add a full-target materialization
   or canonical precompression. Its intermediate cuts have noncanonical

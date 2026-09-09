@@ -5466,8 +5466,8 @@ class TreeOptimizer:
         compressed exactly once.
         """
         snodes = frozenset(snodes)
-        self._move_center(hub)
         if self.compression_mode in {"src", "sdc"}:
+            self.tn.canonize_subtree_(snodes)
             order = sorted(
                 ((u, self.plan.node_path(u, hub)[1]) for u in snodes if u != hub),
                 key=lambda edge: -len(self.plan.node_path(edge[0], hub)),
@@ -5479,6 +5479,7 @@ class TreeOptimizer:
                 cutoff=self.cutoff if cutoff is None else cutoff,
             )
             return
+        self._move_center(hub)
 
         def edge_cutoff(node, child):
             """Keep existing sub-cap bonds lossless during subtree replay.
@@ -5965,7 +5966,13 @@ class TreeOptimizer:
                         message_edges=len(order),
                         hub=hub,
                     )
-                self._move_center(hub)
+                if self.compression_mode in {"src", "sdc"}:
+                    # Only exterior isometries are needed: the environment
+                    # algorithm replaces the entire active region. Moving
+                    # a center through that region would perform dead QRs.
+                    self.tn.canonize_subtree_(snodes)
+                else:
+                    self._move_center(hub)
                 local = {}
                 state_inds = {}
                 operator_inds = {}

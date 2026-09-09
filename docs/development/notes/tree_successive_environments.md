@@ -121,3 +121,102 @@ suite passed 128 tests. Ruff, skill/catalog validation, and whitespace checks
 passed. The full repository suite was not run: validation covered the changed
 tree subsystem and its callers, and the known upstream DM failure remains
 unresolved.
+
+## Follow-up: paper and Quimb parity
+
+Rechecked [the paper, v2, Sections 2.2 and 3](https://arxiv.org/html/2504.06475v2#S3)
+and the installed `quimb.tensor.tn1d.compress.tensor_network_1d_compress_src`.
+The core operations agree: reusable Khatri–Rao/product-state sketches, QR
+range extraction, and projection of the original target. The paper treats
+chains; our directed-environment, nested-QB construction for branching trees
+is an extension, not a published tree algorithm or a claim of its error bounds.
+Its dense reference test independently builds the complementary Khatri–Rao
+columns and leaf QB projections of a three-branch tensor.
+
+The follow-up removes avoidable work:
+
+- Build only the dependency closure of complementary messages consumed by
+  the projection sweep. A length-L path uses L-1 fixed environments instead
+  of 2(L-1). Branching trees generally require both directions on more edges.
+- Use one backend-native random generator and draw in first-use environment
+  order. Seeded layered path results match the unmodified Quimb implementation
+  in both directions; NumPy, Torch, and JAX are covered. This intentionally
+  changes the earlier per-node seed-offset sequence.
+- Use `Tensor.split(method='qr', absorb='lorthog')` so QR returns only Q.
+- Release environments and projected messages after their final consumers.
+- Drop intermediate tensor tags, as Quimb does, and restore only each output
+  node's local tags. This avoids growing complementary-component tag unions.
+- Prepare only exterior isometries. No center-moving QRs are needed inside
+  the active subtree that the environment algorithm will replace.
+
+Probed `autoray.get_namespace(like=None, device=None, dtype=None,
+submodule=None)`, the namespace's `random.default_rng`, existing
+`random.array` dispatch, and Quimb's Q-only split result `(Q, None)` in the
+active environment. Dependency versions and the independently reproduced DM
+complex64 failure are unchanged. Rechecked the upstream sources listed above;
+Symmray's Abelian HTML retrieval still failed. Classification: adopt the
+existing public RNG and Q-only QR interfaces; no compatibility shim or
+dependency modification.
+
+Serial Torch CPU kernel comparisons against commit `fe1f8ef`, using one Torch
+thread and eight alternating post-warmup samples:
+
+| Target | Previous median | Updated median | Quimb SRC |
+| --- | ---: | ---: | ---: |
+| 24-site layered path, MPS bond 16, MPO bond 4, output cap 16, complex64 | 7.393 ms | 5.273 ms | 5.378 ms |
+| 12-site branching tree, 22 nodes/21 edges, state bond 8, six ZZ terms, output cap 8, complex64 | 5.528 ms | 5.364 ms | Not applicable |
+
+These are compressor-kernel timings with target construction excluded. The
+path result improves about 29%; the branching improvement is about 3% in this
+small case. The Quimb comparison disables output array permutation; its call
+includes segmentation/output assembly that the prepared tree kernel excludes,
+so the close timings establish comparable scale rather than a speed advantage
+over Quimb. Exterior-only preparation is outside these timed kernels.
+RNG sequencing changed, so these compare equal shapes
+and policies rather than claiming identical old/new random approximations.
+No GPU or full replay speedup is established.
+
+Final follow-up validation: 24 dedicated algorithm tests passed. The broader
+tree/FIT/trajectory/sampler run passed 611 tests, skipped 4, and deselected the
+one known DM complex64 case after reproducing its upstream failure in the
+preceding runs. Default smoke passed 128 tests. Ruff, skill/catalog validation,
+and whitespace checks passed. The final tag-only change was rechecked with
+all 24 focused tests and Ruff. The full repository suite was not rerun; the
+known upstream DM failure remains separate and unresolved.
+
+## Follow-up: safe environment caching (2026-09-08)
+
+SRC and SDC now share a bounded 128-entry LRU of immutable traversal plans,
+keyed by the ordered directed edges and hub. Plans contain only neighbor
+tuples, the required environment schedule, and read-only consumer counts.
+Each invocation copies those counts and recomputes live tensor indices,
+dimensions, sketches, and numerical messages. Numerical environments are
+built once per required direction, reused by all dependent branch contractions,
+and removed after their last consumer. No input tensor or backend array is
+retained by the persistent plan cache. Failed calls cannot mutate shared plans.
+
+Cross-call numerical caching is deferred: tensor identity is not a reliable
+version because callers can edit arrays in place. Reusing such messages would
+require versioned target tensors and sketch/rank policies, with invalidation
+of every dependent directed environment. The structural cache needs none of
+those numerical invalidation rules and safely survives changes in indices,
+dimensions, operators, seeds, ranks, and backends.
+
+Rechecked the required Quimb, Autoray, Cotengra, and Symmray sources in the
+same environment; Symmray's Abelian HTML retrieval again failed. Installed
+versions are unchanged from the audit above. Reprobed the public
+`tensor_contract` and `Tensor.split` signatures, including `drop_tags` and
+`absorb`. Classification: adopt immutable structural caching; defer persistent
+numerical caching. No upstream dispatch, dependency, or shim changes.
+
+Regression checks exercise immutable plans, cache bounds, changed sweep
+direction, malformed orders, actual branch environment reuse, array release,
+in-place input edits, changed dimensions/indices/ranks/seeds, and recovery
+after an injected QR failure. Warm-plan results match fresh-plan results.
+
+Validation: 27 focused algorithm tests passed; the broader tree/FIT/sampler/
+trajectory selection passed 614 tests, skipped 4, and deselected the known
+independently reproduced upstream DM complex64 failure described above.
+Ruff, skill/catalog validation, and whitespace checks passed. The full
+repository suite was not run because this follow-up is confined to tree
+compression and validation covered its callers.
