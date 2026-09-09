@@ -94,6 +94,7 @@ _register(
     "tn_norm",
 )
 _register(".observables", "measure_obs", "tn_fidelity")
+_register(".mps_transfer", "MpsTransferSpectrum", "mps_transfer_spectrum", "mps_correlation_length")
 _register(".conversions", "mps_to_ttn")
 _register(".validation", "validate_tensor_network_tags")
 _register(
@@ -133,6 +134,7 @@ _SUBMODULES = (
     "contractions",
     "maps",
     "observables",
+    "mps_transfer",
     "symmetric",
     "symm_fermions",
     "validation",

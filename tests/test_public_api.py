@@ -26,6 +26,16 @@ def test_package_version_available():
     assert pepsy.__version__
 
 
+def test_mps_transfer_diagnostics_have_tensor_namespace_exports():
+    from pepsy.tensors import MpsTransferSpectrum, mps_correlation_length, mps_transfer_spectrum
+    from pepsy.tensors import mps_transfer
+
+    assert MpsTransferSpectrum is mps_transfer.MpsTransferSpectrum
+    assert mps_correlation_length is mps_transfer.mps_correlation_length
+    assert mps_transfer_spectrum is mps_transfer.mps_transfer_spectrum
+    assert "mps_correlation_length" not in pepsy.__all__
+
+
 def test_namespace_exports_have_clear_core_and_advanced_groups():
     """Core and advanced namespaces remain discoverable and distinct."""
     core = {

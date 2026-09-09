@@ -13,6 +13,15 @@ opt.run()
 The previous constructor default was `"dmrg"`. Specify `mode="dmrg"` (or a
 named `dmrg1`/`dmrg2`/`dmrg3` schedule) to retain variational FIT replay.
 
+For correlation lengths of repeating unit cells or local MPS tensor windows,
+see the [MPS transfer diagnostics](../tensors/observables.md).
+These measurements live in `pepsy.tensors` and do not change optimizer state.
+For example, `mps_correlation_length(opt.p, i)` left-canonicalizes a private
+copy and estimates the bulk correlation length at site `i`.
+`mps_transfer_spectrum(opt.p, i, canonicalize="right", k=6)` uses the opposite
+canonical direction and returns several mode lengths. These estimates assume
+approximately repeating bulk tensors; the optimizer state is preserved.
+
 For finite-temperature preparation from Hamiltonian terms, see the dedicated
 [`GibbsMps` guide](gibbs_mps.md). It uses an interleaved physical/ancilla MPS
 and delegates non-unitary gate replay to this optimizer.

@@ -15,6 +15,14 @@ top-level `pepsy` exports rather than old flat modules.
   `tn_fidelity`, and alignment helpers.
 - `maps.py`: facade for `OneDMap`.
 - `observables.py`: facade for observable and MPO expectation helpers.
+- `mps_transfer.py`: repeating-cell and site-selected local transfer actions,
+  dense and bosonic Symmray sector adapters, backend-preserving Arnoldi,
+  transfer gaps, momenta, degeneracy, and correlation lengths. Local windows
+  default to bulk estimates from a private left-canonicalized open-MPS copy,
+  with optional right canonicalization. Supplied-gauge windows require
+  `canonicalize=None, allow_local=True`; caller input is preserved. Small unresolved
+  gaps are distinct from numerical peripheral modes, and Arnoldi can grow
+  its basis within an explicit memory cap.
 - `symmetric.py`: Symmray-backed `SymMPS`, `SymPEPS`, symmetric Hamiltonian,
   gate-stream, charge-sector, and dense-operator conversion helpers.
 - `validation.py`: shared PEPS tag and physical-index validation helpers.

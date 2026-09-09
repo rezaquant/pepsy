@@ -81,6 +81,34 @@ Changes for the next release should be added here before the version is bumped.
   compression loss. Added mixed-length coalesced terminal samples with `-1`
   padding and aligned per-row `lengths`, preserving uniform output behavior.
 
+- Added `pepsy.tensors.mps_transfer_spectrum` and `mps_correlation_length`
+  for explicit repeating MPS unit cells and cyclic MPS, with matrix-free
+  non-Hermitian eigensolves, residual checks, and NumPy/Torch/CuPy support.
+  Sparse bosonic Symmray cells support individual neutral and charged sectors
+  without densification. CuPy can use a warned, capability-gated NumPy solve
+  for only the small projected matrix; `projected_solver="native"` forbids it.
+  Site-based open-MPS calls now left-canonicalize a private copy by default
+  before extracting a bulk estimate; `canonicalize="right"` selects the
+  opposite direction. Original arrays, backend/device, and metadata are
+  preserved. Results record the canonical form and report each mode's length.
+  These estimates assume approximately repeating bulk tensors. Supplied-gauge
+  windows use `canonicalize=None, allow_local=True`.
+  Complete cyclic cells also accept a chosen starting site without the opt-in.
+  Spectrum
+  results expose normalized modes, transfer gaps, momenta, mode lengths, and
+  leading degeneracy. GHZ's degenerate modes are retained with infinite
+  length; `mode` selects further scalar lengths. Clustering tolerances no
+  longer close resolved finite gaps; unresolved small gaps return NaN with a
+  mask. Arnoldi grows its basis within `max_ncv` to address restart stagnation;
+  an explicit `ncv` retains a fixed memory budget unless growth is requested.
+  `maxiter=None` uses separate ARPACK/native iteration budgets. ARPACK starts
+  in the working complex precision, seeds its additional RNG when supported,
+  and reports failures without returning partial spectra. Native Arnoldi
+  rechecks accepted residuals against fresh transfer applications. Whole-MPS
+  dtype/backend/device and finiteness checks precede canonicalization.
+  Fermionic parity channels
+  and flat Symmray input remain explicitly unsupported.
+
 - Reduced MpsOptimizer metadata overhead with replay-scoped physical rank
   ceilings and weak network classification caches, one mixed FIT-window
   preparation per transaction, and reuse of validated maximum bonds.
